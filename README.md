@@ -96,6 +96,8 @@ GOST password: value_from_kharej
 Port mappings: 2052:2052
 ```
 
+`Port mappings` is required for every Iran tunnel. Empty values, invalid formats, invalid ports, and duplicate Iran listen ports are rejected before any files are written.
+
 Traffic flow:
 
 ```text
@@ -139,16 +141,15 @@ Use the menu:
 9) Clean old/broken GOST configs
 ```
 
-Examples:
+For delete, status, logs, and restart, the manager now shows a numbered tunnel selector. You no longer need to type `iran` or `kharej` manually.
 
 ```text
-Tunnel side: iran
-Tunnel number: 1
-```
+Available GOST tunnels:
 
-```text
-Tunnel side: kharej
-Tunnel number: 1
+1) gost-iran-1.service      active/running    /etc/gost/iran-1.env
+2) gost-kharej-1.service    active/running    /etc/gost/kharej-1.env
+
+Select tunnel number:
 ```
 
 Each numbered tunnel is independent. Deleting `iran-2` does not affect `iran-1`; deleting `kharej-2` does not affect `kharej-1`.

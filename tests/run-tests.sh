@@ -58,10 +58,19 @@ assert_failure "invalid port check zero" is_valid_port 0
 assert_failure "invalid port check too high" is_valid_port 65536
 assert_success "valid tunnel number" is_positive_integer 12
 assert_failure "invalid tunnel number" is_positive_integer 0
+assert_failure "parse_mapping requires non-empty mappings" parse_mapping "" 1
 assert_success "valid single mapping" validate_mappings "2052:2052" 1
 assert_success "valid multi mapping" validate_mappings "80:80,8080:8080,8880:8880" 1
+assert_success "parse_mapping accepts single mapping" parse_mapping "2052:2052" 1
+assert_success "parse_mapping accepts multi mapping" parse_mapping "80:80,8080:8080,8880:8880" 1
+assert_failure "parse_mapping rejects empty value" parse_mapping "" 1
+assert_failure "parse_mapping rejects invalid format" parse_mapping "80,8080:8080" 1
+assert_failure "parse_mapping rejects duplicate listen ports" parse_mapping "80:80,80:8080" 1
 assert_failure "invalid mapping" validate_mappings "80,8080:8080" 1
 assert_success "duplicate listen port detection" has_duplicate_listen_ports "80:80,80:8080"
+assert_eq "tunnel selector parses iran service" "iran 1" "$(parse_tunnel_service_name gost-iran-1.service)"
+assert_eq "tunnel selector parses kharej service" "kharej 2" "$(parse_tunnel_service_name gost-kharej-2.service)"
+assert_failure "old manual side helper removed" declare -F ask_side_and_number
 assert_eq "iran service name generation" "gost-iran-2.service" "$(service_name iran 2)"
 assert_eq "kharej service name generation" "gost-kharej-1.service" "$(service_name kharej 1)"
 assert_eq "iran env path generation" "/etc/gost/iran-2.env" "$(env_path iran 2)"

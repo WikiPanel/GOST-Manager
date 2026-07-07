@@ -60,3 +60,14 @@ Scope:
 - Operations docs
 - Security docs
 - Development docs
+
+## Task #6 - Fix Iran mappings prompt and tunnel selector UX
+Status: Done
+
+Scope:
+- Require `Port mappings` during Iran tunnel creation
+- Reject empty, invalid, out-of-range, and duplicate listen port mappings
+- Abort before writing files when Iran listen ports are busy
+- Replace manual `Tunnel side: iran/kharej` prompts with a numbered tunnel selector
+- Include orphan service/env entries in tunnel discovery
+- Update tests and documentation for the new UX

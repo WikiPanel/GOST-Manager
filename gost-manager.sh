@@ -186,6 +186,30 @@ validate_mappings() {
   done
 }
 
+parse_mapping() {
+  validate_mappings "$@"
+}
+
+parse_tunnel_service_name() {
+  local service="$1"
+  if [[ "${service}" =~ ^gost-(iran|kharej)-([1-9][0-9]*)\.service$ ]]; then
+    printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+parse_tunnel_env_name() {
+  local env_file="$1"
+  local base
+  base="$(basename "${env_file}")"
+  if [[ "${base}" =~ ^(iran|kharej)-([1-9][0-9]*)\.env$ ]]; then
+    printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
 env_get() {
   local key="$1"
   local file="$2"
@@ -583,7 +607,7 @@ check_mapping_ports_free_or_die() {
   done
 
   if [[ -n "${busy_output}" ]]; then
-    printf 'Cannot create tunnel. These listen ports are already in use:\n%s\nNo files were changed.\n' "${busy_output}" >&2
+    printf 'Cannot create Iran tunnel. These listen ports are already in use:\n%s\nNo files were changed.\n' "${busy_output}" >&2
     exit 1
   fi
 }
@@ -704,7 +728,8 @@ create_iran_tunnel() {
   validate_token_or_die "GOST username" "${user}"
   password="$(prompt_required "GOST password from Kharej side")"
   validate_token_or_die "GOST password" "${password}"
-  mappings="$(prompt_required "Port mappings, e.g. 80:80,8080:8080,8880:8880")"
+  info "Port mappings format: 2052:2052 or 80:80,8080:8080,8880:8880"
+  mappings="$(prompt_required "Port mappings")"
   validate_mappings "${mappings}" || exit 1
   check_mapping_ports_free_or_die "${mappings}"
 
@@ -732,26 +757,112 @@ create_iran_tunnel() {
   print_iran_success "${number}" "${env_file}" "${kharej_ip}" "${socks_port}" "${mappings}"
 }
 
-ask_side_and_number() {
-  local side number
-  side="$(prompt_required "Tunnel side: iran/kharej")"
-  validate_side "${side}" || die "side must be iran or kharej."
-  number="$(prompt_required "Tunnel number")"
-  validate_tunnel_number_or_die "${number}"
-  printf '%s %s\n' "${side}" "${number}"
+discover_existing_tunnels() {
+  local output_file="$1"
+  local service_file env_file base service identity side number
+  local tmp_file
+  tmp_file="$(mktemp)"
+  : > "${tmp_file}"
+
+  for service_file in "${SYSTEMD_DIR}"/gost-iran-*.service "${SYSTEMD_DIR}"/gost-kharej-*.service; do
+    [[ -e "${service_file}" ]] || continue
+    base="$(basename "${service_file}")"
+    identity="$(parse_tunnel_service_name "${base}" || true)"
+    [[ -n "${identity}" ]] || continue
+    side="${identity%% *}"
+    number="${identity#* }"
+    service="$(service_name "${side}" "${number}")"
+    env_file="$(env_path "${side}" "${number}")"
+    printf '%s|%s|%s|%s|%s\n' "${side}" "${number}" "${service}" "${service_file}" "${env_file}" >> "${tmp_file}"
+  done
+
+  for env_file in "${GOST_ETC_DIR}"/iran-*.env "${GOST_ETC_DIR}"/kharej-*.env; do
+    [[ -e "${env_file}" ]] || continue
+    identity="$(parse_tunnel_env_name "${env_file}" || true)"
+    [[ -n "${identity}" ]] || continue
+    side="${identity%% *}"
+    number="${identity#* }"
+    service="$(service_name "${side}" "${number}")"
+    service_file="$(service_path "${side}" "${number}")"
+    printf '%s|%s|%s|%s|%s\n' "${side}" "${number}" "${service}" "${service_file}" "${env_file}" >> "${tmp_file}"
+  done
+
+  sort -t '|' -k1,1 -k2,2n -u "${tmp_file}" > "${output_file}"
+  rm -f "${tmp_file}"
+}
+
+tunnel_count() {
+  local tunnel_file="$1"
+  if [[ ! -s "${tunnel_file}" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  wc -l < "${tunnel_file}" | tr -d ' '
+}
+
+print_tunnel_selector() {
+  local tunnel_file="$1"
+  local index=0
+  local _side _number service service_file env_file status
+  printf 'Available GOST tunnels:\n\n'
+  while IFS='|' read -r _side _number service service_file env_file; do
+    index=$((index + 1))
+    status="$(service_status_summary "${service}")"
+    printf '%d) %-24s %-16s %s\n' "${index}" "${service}" "${status}" "${env_file}"
+    if [[ ! -e "${service_file}" ]]; then
+      printf '   %-24s %-16s %s\n' "" "" "(service file missing)"
+    elif [[ ! -e "${env_file}" ]]; then
+      printf '   %-24s %-16s %s\n' "" "" "(env file missing)"
+    fi
+  done < "${tunnel_file}"
+  printf '\n'
+}
+
+select_existing_tunnel() {
+  local tunnel_file choice count selected
+  tunnel_file="$(mktemp)"
+  discover_existing_tunnels "${tunnel_file}"
+  count="$(tunnel_count "${tunnel_file}")"
+  if [[ "${count}" -eq 0 ]]; then
+    rm -f "${tunnel_file}"
+    die "no managed GOST tunnels were found."
+  fi
+
+  print_tunnel_selector "${tunnel_file}"
+  while true; do
+    read -r -p "Select tunnel number: " choice
+    if is_positive_integer "${choice}" && [[ "${choice}" -ge 1 && "${choice}" -le "${count}" ]]; then
+      break
+    fi
+    info "Select a number between 1 and ${count}."
+  done
+
+  selected="$(sed -n "${choice}p" "${tunnel_file}")"
+  rm -f "${tunnel_file}"
+
+  SELECTED_TUNNEL_SIDE="${selected%%|*}"
+  selected="${selected#*|}"
+  SELECTED_TUNNEL_NUMBER="${selected%%|*}"
+  selected="${selected#*|}"
+  SELECTED_TUNNEL_SERVICE="${selected%%|*}"
+  selected="${selected#*|}"
+  SELECTED_TUNNEL_SERVICE_FILE="${selected%%|*}"
+  SELECTED_TUNNEL_ENV_FILE="${selected#*|}"
 }
 
 delete_tunnel() {
   require_root
   ensure_commands systemctl
 
-  local selection side number service svc_file env_file
-  selection="$(ask_side_and_number)"
-  side="${selection%% *}"
-  number="${selection#* }"
-  service="$(service_name "${side}" "${number}")"
-  svc_file="$(service_path "${side}" "${number}")"
-  env_file="$(env_path "${side}" "${number}")"
+  local side number service svc_file env_file
+  select_existing_tunnel
+  side="${SELECTED_TUNNEL_SIDE}"
+  number="${SELECTED_TUNNEL_NUMBER}"
+  service="${SELECTED_TUNNEL_SERVICE}"
+  svc_file="${SELECTED_TUNNEL_SERVICE_FILE}"
+  env_file="${SELECTED_TUNNEL_ENV_FILE}"
+
+  confirm "Delete ${service} and its managed files?" || die "delete aborted."
 
   if [[ "${side}" == "kharej" ]]; then
     delete_kharej_firewall_rules "${number}" "${env_file}"
@@ -765,23 +876,59 @@ delete_tunnel() {
   info "Deleted ${service} and ${env_file}."
 }
 
+show_related_listen_ports() {
+  local side="$1"
+  local env_file="$2"
+  local mappings port pair listen
+  local pairs=()
+
+  if ! command -v ss >/dev/null 2>&1; then
+    info "ss is not available; cannot show listen ports."
+    return 0
+  fi
+
+  if [[ ! -f "${env_file}" ]]; then
+    ss -lntp 2>/dev/null | grep gost || true
+    return 0
+  fi
+
+  if [[ "${side}" == "iran" ]]; then
+    mappings="$(env_get MAPPINGS "${env_file}")"
+    if [[ -z "${mappings}" ]]; then
+      ss -lntp 2>/dev/null | grep gost || true
+      return 0
+    fi
+    IFS=',' read -r -a pairs <<< "${mappings}"
+    for pair in "${pairs[@]}"; do
+      listen="${pair%%:*}"
+      ss -lntp "sport = :${listen}" 2>/dev/null || true
+    done
+    return 0
+  fi
+
+  port="$(env_get TUNNEL_PORT "${env_file}")"
+  if [[ -n "${port}" ]]; then
+    ss -lntp "sport = :${port}" 2>/dev/null || true
+  else
+    ss -lntp 2>/dev/null | grep gost || true
+  fi
+}
+
 show_status() {
-  local selection side number service
-  selection="$(ask_side_and_number)"
-  side="${selection%% *}"
-  number="${selection#* }"
-  service="$(service_name "${side}" "${number}")"
+  local side service env_file
+  select_existing_tunnel
+  side="${SELECTED_TUNNEL_SIDE}"
+  service="${SELECTED_TUNNEL_SERVICE}"
+  env_file="${SELECTED_TUNNEL_ENV_FILE}"
   systemctl status "${service}" --no-pager || true
-  printf '\nListening GOST sockets:\n'
-  ss -lntp 2>/dev/null | grep gost || true
+  printf '\nRelated listen ports:\n'
+  show_related_listen_ports "${side}" "${env_file}"
 }
 
 show_logs() {
-  local selection side number service
-  selection="$(ask_side_and_number)"
-  side="${selection%% *}"
-  number="${selection#* }"
-  service="$(service_name "${side}" "${number}")"
+  local service
+  select_existing_tunnel
+  service="${SELECTED_TUNNEL_SERVICE}"
   journalctl -u "${service}" -n 100 --no-pager
 }
 
@@ -789,11 +936,9 @@ restart_tunnel() {
   require_root
   ensure_commands systemctl
 
-  local selection side number service
-  selection="$(ask_side_and_number)"
-  side="${selection%% *}"
-  number="${selection#* }"
-  service="$(service_name "${side}" "${number}")"
+  local service
+  select_existing_tunnel
+  service="${SELECTED_TUNNEL_SERVICE}"
   systemctl restart "${service}"
   systemctl status "${service}" --no-pager --lines=20 || true
 }
@@ -838,6 +983,10 @@ summarize_kharej_env() {
 service_status_summary() {
   local service="$1"
   local active substate
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf 'unknown\n'
+    return 0
+  fi
   active="$(systemctl is-active "${service}" 2>/dev/null || true)"
   substate="$(systemctl show -p SubState --value "${service}" 2>/dev/null || true)"
   if [[ -n "${active}" && -n "${substate}" ]]; then

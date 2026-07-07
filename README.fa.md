@@ -90,6 +90,8 @@ GOST password: پسورد ساخته‌شده در سمت خارج
 Port mappings: 2052:2052
 ```
 
+ورودی `Port mappings` برای هر تونل سمت ایران اجباری است. مقدار خالی، فرمت اشتباه، پورت نامعتبر و پورت listen تکراری قبل از ساخت فایل‌ها رد می‌شود.
+
 ## مثال پورت 2052
 
 ```text
@@ -123,11 +125,15 @@ Iran :8880 -> Kharej 127.0.0.1:8880
 5) Show status
 ```
 
-سپس سمت و شماره تونل را وارد کنید:
+برای مشاهده وضعیت، لاگ، ری‌استارت و حذف، برنامه یک فهرست شماره‌دار از تونل‌های موجود نشان می‌دهد. دیگر لازم نیست `iran` یا `kharej` را دستی تایپ کنید.
 
 ```text
-Tunnel side: iran
-Tunnel number: 1
+Available GOST tunnels:
+
+1) gost-iran-1.service      active/running    /etc/gost/iran-1.env
+2) gost-kharej-1.service    active/running    /etc/gost/kharej-1.env
+
+Select tunnel number:
 ```
 
 ## مشاهده لاگ

@@ -62,6 +62,8 @@ GOST password: value_from_kharej
 Port mappings: 2052:2052
 ```
 
+The `Port mappings` prompt is required. Use `Iran listen port:Kharej local target port`.
+
 Multi-port example:
 
 ```text
@@ -97,24 +99,21 @@ curl -v --max-time 10 http://YOUR_DOMAIN_OR_IP:80/
 
 ## Restart
 
-Use menu option `7) Restart tunnel`, then enter:
+Use menu option `7) Restart tunnel`. The manager shows a numbered selector, so choose the tunnel from the list instead of typing `iran` or `kharej`.
 
 ```text
-Tunnel side: iran
-Tunnel number: 1
-```
+Available GOST tunnels:
 
-or:
+1) gost-iran-1.service      active/running    /etc/gost/iran-1.env
+2) gost-kharej-1.service    active/running    /etc/gost/kharej-1.env
 
-```text
-Tunnel side: kharej
-Tunnel number: 1
+Select tunnel number:
 ```
 
 ## Recovery If Service Fails
 
-1. Use menu option `5) Show status`.
-2. Use menu option `6) Show logs`.
+1. Use menu option `5) Show status` and select the tunnel from the numbered list.
+2. Use menu option `6) Show logs` and select the tunnel from the numbered list.
 3. Verify `/etc/gost/<side>-<number>.env` exists and is permission `600`.
 4. Verify `/usr/local/bin/gost -V` works.
 5. On Iran, check whether public listen ports are already owned by another process.

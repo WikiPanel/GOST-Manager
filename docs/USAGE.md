@@ -73,23 +73,27 @@ Examples:
 80:80,8080:8080,8880:8880
 ```
 
-Before writing files, the manager validates mapping format, duplicate listen ports, and busy listen ports.
+`Port mappings` is required. Before writing files, the manager rejects empty mappings, invalid formats, non-numeric ports, ports outside `1..65535`, duplicate Iran listen ports, and busy listen ports.
+
+If a listen port is busy, the manager prints the owning process from `ss -lntp` and aborts without writing env or service files.
 
 ## 4) Delete tunnel
 
-Stops and disables only the selected numbered service, removes its env and service file, reloads systemd, and removes matching Kharej firewall rules by comment.
+Shows a numbered list of existing managed tunnels, including broken or orphaned service/env pairs. Select one item from the list; you do not type `iran` or `kharej` manually.
+
+After confirmation, the manager stops and disables only the selected numbered service, removes its env and service file, reloads systemd, and removes matching Kharej firewall rules by comment.
 
 ## 5) Show status
 
-Runs `systemctl status` for the selected tunnel and prints current GOST listening sockets from `ss`.
+Shows the same numbered tunnel selector, then runs `systemctl status` for the selected tunnel and prints related listening ports from `ss` when possible.
 
 ## 6) Show logs
 
-Runs `journalctl -u <service> -n 100 --no-pager` for the selected tunnel.
+Shows the numbered tunnel selector, then runs `journalctl -u <service> -n 100 --no-pager` for the selected tunnel.
 
 ## 7) Restart tunnel
 
-Restarts the selected service and prints a short status view.
+Shows the numbered tunnel selector, restarts the selected service, and prints a short status view.
 
 ## 8) List active GOST services
 
