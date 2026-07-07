@@ -43,4 +43,4 @@ make lint
 2. Update `CHANGELOG.md`.
 3. Tag the repository with the release version.
 4. Push the tag and repository to GitHub.
-5. Confirm GitHub Actions passes.
+5. Confirm local validation passes on the release branch.

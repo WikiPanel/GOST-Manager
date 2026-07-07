@@ -11,7 +11,7 @@ Scope:
 - Add examples
 - Add docs
 - Add tests
-- Add GitHub Actions
+- Add local validation commands
 
 Validation:
 - bash syntax check

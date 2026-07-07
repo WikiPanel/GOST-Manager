@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.2
+- Removed GitHub Actions workflow because validation is handled locally.
+
 ## 0.1.1
 - Fixed Iran tunnel creation to always require `Port mappings`.
 - Added stricter mapping tests for empty values, invalid formats, and duplicate listen ports.
@@ -15,4 +18,4 @@
 - Added numbered systemd services.
 - Added env-based configuration.
 - Added status, logs, restart, delete, list, and cleanup options.
-- Added documentation, examples, tests, and GitHub Actions.
+- Added documentation, examples, tests, and local validation.
