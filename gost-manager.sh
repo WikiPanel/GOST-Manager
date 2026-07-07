@@ -1,0 +1,1021 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+GOST_BIN="/usr/local/bin/gost"
+LIB_DIR="/usr/local/lib/gost-manager"
+RUNNER_IRAN="${LIB_DIR}/gost-run-iran.sh"
+RUNNER_KHAREJ="${LIB_DIR}/gost-run-kharej.sh"
+GOST_ETC_DIR="/etc/gost"
+SYSTEMD_DIR="/etc/systemd/system"
+GITHUB_RELEASES_API="https://api.github.com/repos/go-gost/gost/releases?per_page=100"
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "this action must be run as root. Try: sudo bash gost-manager.sh"
+  fi
+}
+
+confirm() {
+  local prompt="${1:-Continue?}"
+  local answer
+  read -r -p "${prompt} [y/N]: " answer
+  case "${answer}" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+prompt_default() {
+  local prompt="$1"
+  local default_value="$2"
+  local value
+  read -r -p "${prompt} [${default_value}]: " value
+  if [[ -z "${value}" ]]; then
+    printf '%s\n' "${default_value}"
+  else
+    printf '%s\n' "${value}"
+  fi
+}
+
+prompt_required() {
+  local prompt="$1"
+  local value
+  while true; do
+    read -r -p "${prompt}: " value
+    if [[ -n "${value}" ]]; then
+      printf '%s\n' "${value}"
+      return 0
+    fi
+    info "Value is required."
+  done
+}
+
+is_positive_integer() {
+  local value="$1"
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_valid_port() {
+  local value="$1"
+  is_positive_integer "${value}" && [[ "${value}" -ge 1 && "${value}" -le 65535 ]]
+}
+
+normalize_arch() {
+  local arch="$1"
+  case "${arch}" in
+    x86_64|amd64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_side() {
+  local side="$1"
+  [[ "${side}" == "iran" || "${side}" == "kharej" ]]
+}
+
+service_name() {
+  local side="$1"
+  local number="$2"
+  printf 'gost-%s-%s.service\n' "${side}" "${number}"
+}
+
+service_path() {
+  local side="$1"
+  local number="$2"
+  printf '%s/%s\n' "${SYSTEMD_DIR}" "$(service_name "${side}" "${number}")"
+}
+
+env_path() {
+  local side="$1"
+  local number="$2"
+  printf '%s/%s-%s.env\n' "${GOST_ETC_DIR}" "${side}" "${number}"
+}
+
+validate_tunnel_number_or_die() {
+  local number="$1"
+  is_positive_integer "${number}" || die "tunnel number must be a positive integer."
+}
+
+validate_port_or_die() {
+  local port="$1"
+  is_valid_port "${port}" || die "port must be between 1 and 65535: ${port}"
+}
+
+validate_token_or_die() {
+  local label="$1"
+  local value="$2"
+  [[ "${value}" =~ ^[A-Za-z0-9._~-]+$ ]] || die "${label} may contain only letters, numbers, dot, underscore, tilde, or hyphen."
+}
+
+validate_host_or_die() {
+  local label="$1"
+  local value="$2"
+  [[ "${value}" =~ ^[A-Za-z0-9.-]+$ ]] || die "${label} must be an IPv4 address or DNS name without spaces."
+}
+
+validate_iptables_source_or_die() {
+  local value="$1"
+  [[ "${value}" =~ ^[0-9./]+$ ]] || die "Iran IP must be an IPv4 address or CIDR value."
+}
+
+has_duplicate_listen_ports() {
+  local mappings="$1"
+  local IFS=','
+  local pairs=()
+  local pair listen target
+  local seen=","
+  read -r -a pairs <<< "${mappings}"
+  for pair in "${pairs[@]}"; do
+    listen="${pair%%:*}"
+    target="${pair#*:}"
+    if [[ -z "${listen}" || -z "${target}" ]]; then
+      return 1
+    fi
+    if [[ "${seen}" == *",${listen},"* ]]; then
+      return 0
+    fi
+    seen="${seen}${listen},"
+  done
+  return 1
+}
+
+validate_mappings() {
+  local mappings="$1"
+  local quiet="${2:-0}"
+  local IFS=','
+  local pairs=()
+  local pair listen target
+  local seen=","
+
+  if [[ -z "${mappings}" || "${mappings}" == *, || "${mappings}" == ,* || "${mappings}" == *,,* ]]; then
+    [[ "${quiet}" == "1" ]] || printf 'Invalid mapping format. Use listen_port:target_port, for example 80:80,8080:8080.\n' >&2
+    return 1
+  fi
+
+  read -r -a pairs <<< "${mappings}"
+  for pair in "${pairs[@]}"; do
+    if [[ ! "${pair}" =~ ^[0-9]+:[0-9]+$ ]]; then
+      [[ "${quiet}" == "1" ]] || printf 'Invalid mapping: %s\n' "${pair}" >&2
+      return 1
+    fi
+    listen="${pair%%:*}"
+    target="${pair#*:}"
+    if ! is_valid_port "${listen}"; then
+      [[ "${quiet}" == "1" ]] || printf 'Invalid listen port in mapping: %s\n' "${listen}" >&2
+      return 1
+    fi
+    if ! is_valid_port "${target}"; then
+      [[ "${quiet}" == "1" ]] || printf 'Invalid target port in mapping: %s\n' "${target}" >&2
+      return 1
+    fi
+    if [[ "${seen}" == *",${listen},"* ]]; then
+      [[ "${quiet}" == "1" ]] || printf 'Duplicate listen port in mappings: %s\n' "${listen}" >&2
+      return 1
+    fi
+    seen="${seen}${listen},"
+  done
+}
+
+env_get() {
+  local key="$1"
+  local file="$2"
+  awk -F= -v key="${key}" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "${file}" 2>/dev/null || true
+}
+
+package_for_command() {
+  case "$1" in
+    curl) printf 'curl ca-certificates\n' ;;
+    tar) printf 'tar\n' ;;
+    gzip) printf 'gzip\n' ;;
+    sha256sum) printf 'coreutils\n' ;;
+    python3) printf 'python3\n' ;;
+    ss) printf 'iproute2\n' ;;
+    iptables) printf 'iptables\n' ;;
+    systemctl) printf 'systemd\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+ensure_commands() {
+  local missing=()
+  local packages=()
+  local command_name
+
+  for command_name in "$@"; do
+    if ! command -v "${command_name}" >/dev/null 2>&1; then
+      missing+=("${command_name}")
+      case "${command_name}" in
+        curl) packages+=("curl" "ca-certificates") ;;
+        tar) packages+=("tar") ;;
+        gzip) packages+=("gzip") ;;
+        sha256sum) packages+=("coreutils") ;;
+        python3) packages+=("python3") ;;
+        ss) packages+=("iproute2") ;;
+        iptables) packages+=("iptables") ;;
+        systemctl) packages+=("systemd") ;;
+        *) packages+=("$(package_for_command "${command_name}")") ;;
+      esac
+    fi
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  info "Missing required commands: ${missing[*]}"
+  if command -v apt-get >/dev/null 2>&1; then
+    info "Packages to install: ${packages[*]}"
+    if confirm "Install missing packages with apt-get now?"; then
+      apt-get update
+      apt-get install -y "${packages[@]}"
+      return 0
+    fi
+  fi
+
+  die "missing required commands: ${missing[*]}"
+}
+
+backup_existing_file() {
+  local path="$1"
+  local timestamp backup
+  if [[ -e "${path}" ]]; then
+    timestamp="$(date +%Y%m%d%H%M%S)"
+    backup="${path}.bak.${timestamp}"
+    cp -a "${path}" "${backup}"
+    info "Backup created: ${backup}"
+  fi
+}
+
+confirm_overwrite_file() {
+  local path="$1"
+  if [[ -e "${path}" ]]; then
+    confirm "File exists: ${path}. Overwrite it?" || die "aborted by user."
+  fi
+}
+
+write_secure_env_file() {
+  local path="$1"
+  shift
+  local tmp
+  tmp="$(mktemp)"
+  chmod 600 "${tmp}"
+  while [[ "$#" -gt 0 ]]; do
+    printf '%s=%s\n' "$1" "$2" >> "${tmp}"
+    shift 2
+  done
+  backup_existing_file "${path}"
+  install -m 600 -o root -g root "${tmp}" "${path}"
+  rm -f "${tmp}"
+}
+
+write_service_file() {
+  local path="$1"
+  local description="$2"
+  local env_file="$3"
+  local runner="$4"
+  local tmp
+  tmp="$(mktemp)"
+  cat > "${tmp}" <<SERVICE_EOF
+[Unit]
+Description=${description}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=${env_file}
+ExecStart=${runner}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+  backup_existing_file "${path}"
+  install -m 644 -o root -g root "${tmp}" "${path}"
+  rm -f "${tmp}"
+}
+
+install_or_update_gost() {
+  require_root
+  ensure_commands curl tar gzip sha256sum python3
+
+  local arch normalized_arch current_version answer tmpdir api_json release_info
+  local tag asset_name asset_url checksum_name checksum_url archive checksum_file extract_dir extracted_gost
+  arch="$(uname -m)"
+  normalized_arch="$(normalize_arch "${arch}")" || die "unsupported architecture: ${arch}. Supported: x86_64, aarch64."
+
+  if [[ -x "${GOST_BIN}" ]]; then
+    current_version="$("${GOST_BIN}" -V 2>&1 || true)"
+    info "Current GOST:"
+    info "${current_version}"
+    read -r -p "Update GOST from official go-gost/gost GitHub Releases? [y/N]: " answer
+    case "${answer}" in
+      y|Y|yes|YES|Yes) ;;
+      *) info "GOST update skipped."; return 0 ;;
+    esac
+  else
+    info "GOST is not installed at ${GOST_BIN}. Installing."
+  fi
+
+  tmpdir="$(mktemp -d)"
+  api_json="${tmpdir}/releases.json"
+  archive="${tmpdir}/gost.tar.gz"
+  checksum_file="${tmpdir}/checksums.txt"
+  extract_dir="${tmpdir}/extract"
+  mkdir -p "${extract_dir}"
+
+  info "Fetching official release metadata from go-gost/gost..."
+  curl -fsSL "${GITHUB_RELEASES_API}" -o "${api_json}" || die "failed to fetch GitHub release metadata."
+
+  release_info="$(python3 - "${normalized_arch}" "${api_json}" <<'PY'
+import json
+import re
+import sys
+
+arch = sys.argv[1]
+path = sys.argv[2]
+with open(path, "r", encoding="utf-8") as handle:
+    releases = json.load(handle)
+
+pattern = re.compile(r"^gost_.*_linux_%s\.tar\.gz$" % re.escape(arch))
+for release in releases:
+    if release.get("draft") or release.get("prerelease"):
+        continue
+    assets = release.get("assets", [])
+    target = None
+    for asset in assets:
+        name = asset.get("name", "")
+        if pattern.match(name) and "amd64v3" not in name:
+            target = (name, asset.get("browser_download_url", ""))
+            break
+    if not target:
+        continue
+    checksum_assets = []
+    for asset in assets:
+        name = asset.get("name", "")
+        if re.search(r"(checksums?|sha256|sha256sums?)", name, re.IGNORECASE):
+            checksum_assets.append((name, asset.get("browser_download_url", "")))
+    checksum = ("", "")
+    for candidate in checksum_assets:
+        if target[0] in candidate[0]:
+            checksum = candidate
+            break
+    if checksum == ("", ""):
+        for candidate in checksum_assets:
+            if arch in candidate[0]:
+                checksum = candidate
+                break
+    if checksum == ("", "") and checksum_assets:
+        checksum = checksum_assets[0]
+    print(release.get("tag_name", ""))
+    print(target[0])
+    print(target[1])
+    print(checksum[0])
+    print(checksum[1])
+    sys.exit(0)
+
+sys.exit("No stable Linux %s release asset found." % arch)
+PY
+)" || die "failed to select a stable Linux ${normalized_arch} release asset."
+
+  tag="$(printf '%s\n' "${release_info}" | sed -n '1p')"
+  asset_name="$(printf '%s\n' "${release_info}" | sed -n '2p')"
+  asset_url="$(printf '%s\n' "${release_info}" | sed -n '3p')"
+  checksum_name="$(printf '%s\n' "${release_info}" | sed -n '4p')"
+  checksum_url="$(printf '%s\n' "${release_info}" | sed -n '5p')"
+
+  [[ -n "${asset_url}" ]] || die "release asset URL was empty."
+  case "${asset_url}" in
+    https://github.com/go-gost/gost/releases/download/*) ;;
+    *) die "release asset URL is not an official go-gost/gost GitHub Release URL." ;;
+  esac
+  if [[ -n "${checksum_url}" ]]; then
+    case "${checksum_url}" in
+      https://github.com/go-gost/gost/releases/download/*) ;;
+      *) die "checksum URL is not an official go-gost/gost GitHub Release URL." ;;
+    esac
+  fi
+  info "Selected release: ${tag}"
+  info "Selected asset: ${asset_name}"
+  curl -fL --retry 3 "${asset_url}" -o "${archive}" || die "failed to download ${asset_name}."
+
+  if [[ -n "${checksum_url}" ]]; then
+    info "Downloading checksum file: ${checksum_name}"
+    curl -fL --retry 3 "${checksum_url}" -o "${checksum_file}" || die "failed to download checksum file."
+    verify_sha256_or_die "${archive}" "${checksum_file}" "${asset_name}"
+  else
+    info "No checksum asset was found for this release."
+    confirm "Install without SHA256 verification?" || die "aborted because checksum verification is unavailable."
+  fi
+
+  tar -xzf "${archive}" -C "${extract_dir}" || die "failed to extract ${asset_name}."
+  extracted_gost="$(find "${extract_dir}" -type f -name gost -print | head -n 1 || true)"
+  [[ -n "${extracted_gost}" ]] || die "extracted archive did not contain a gost binary."
+
+  if [[ -e "${GOST_BIN}" ]]; then
+    backup_existing_file "${GOST_BIN}"
+  fi
+  install -m 755 -o root -g root "${extracted_gost}" "${GOST_BIN}"
+  info "Installed ${GOST_BIN}"
+  "${GOST_BIN}" -V
+  rm -rf "${tmpdir}"
+}
+
+verify_sha256_or_die() {
+  local archive="$1"
+  local checksum_file="$2"
+  local asset_name="$3"
+  local line expected actual expected_lower actual_lower
+
+  line="$(grep -F "${asset_name}" "${checksum_file}" 2>/dev/null | head -n 1 || true)"
+  expected="$(printf '%s\n' "${line}" | grep -Eo '[A-Fa-f0-9]{64}' | head -n 1 || true)"
+  if [[ -z "${expected}" ]]; then
+    expected="$(grep -Eo '[A-Fa-f0-9]{64}' "${checksum_file}" | head -n 1 || true)"
+  fi
+  [[ -n "${expected}" ]] || die "checksum file did not contain a SHA256 hash for ${asset_name}."
+
+  actual="$(sha256sum "${archive}" | awk '{print $1}')"
+  expected_lower="$(printf '%s' "${expected}" | tr 'A-F' 'a-f')"
+  actual_lower="$(printf '%s' "${actual}" | tr 'A-F' 'a-f')"
+  if [[ "${expected_lower}" != "${actual_lower}" ]]; then
+    die "SHA256 verification failed for ${asset_name}."
+  fi
+  info "SHA256 verified."
+}
+
+generate_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 18
+    return 0
+  fi
+  od -An -N18 -tx1 /dev/urandom | tr -d ' \n'
+  printf '\n'
+}
+
+add_kharej_firewall_rules() {
+  local number="$1"
+  local iran_ip="$2"
+  local port="$3"
+  local allow_comment="gost-manager:kharej-${number}:allow"
+  local drop_comment="gost-manager:kharej-${number}:drop"
+
+  ensure_commands iptables
+
+  if ! iptables -C INPUT -p tcp -s "${iran_ip}" --dport "${port}" -m comment --comment "${allow_comment}" -j ACCEPT >/dev/null 2>&1; then
+    iptables -I INPUT 1 -p tcp -s "${iran_ip}" --dport "${port}" -m comment --comment "${allow_comment}" -j ACCEPT
+  fi
+  if ! iptables -C INPUT -p tcp --dport "${port}" -m comment --comment "${drop_comment}" -j DROP >/dev/null 2>&1; then
+    iptables -I INPUT 2 -p tcp --dport "${port}" -m comment --comment "${drop_comment}" -j DROP
+  fi
+
+  cat <<'WARN'
+Warning: iptables rules are not persistent by default.
+They may be lost after reboot unless saved with netfilter-persistent or your server firewall system.
+WARN
+}
+
+delete_iptables_rule_loop() {
+  local args=("$@")
+  while iptables "${args[@]}" >/dev/null 2>&1; do
+    :
+  done
+}
+
+delete_iptables_rules_by_comment() {
+  local comment="$1"
+  if ! command -v iptables >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "${comment}" <<'PY' || true
+import shlex
+import subprocess
+import sys
+
+comment = sys.argv[1]
+for _ in range(50):
+    result = subprocess.run(["iptables", "-S", "INPUT"], text=True, capture_output=True, check=False)
+    line = None
+    for candidate in result.stdout.splitlines():
+        if "--comment" in candidate and comment in candidate:
+            line = candidate
+            break
+    if not line:
+        break
+    args = shlex.split(line)
+    if not args or args[0] != "-A":
+        break
+    args[0] = "-D"
+    subprocess.run(["iptables"] + args, check=False)
+PY
+  fi
+}
+
+delete_kharej_firewall_rules() {
+  local number="$1"
+  local env_file="$2"
+  local iran_ip port
+  local allow_comment="gost-manager:kharej-${number}:allow"
+  local drop_comment="gost-manager:kharej-${number}:drop"
+
+  if ! command -v iptables >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -f "${env_file}" ]]; then
+    iran_ip="$(env_get IRAN_IP "${env_file}")"
+    port="$(env_get TUNNEL_PORT "${env_file}")"
+    if [[ -n "${iran_ip}" && -n "${port}" ]]; then
+      delete_iptables_rule_loop -D INPUT -p tcp -s "${iran_ip}" --dport "${port}" -m comment --comment "${allow_comment}" -j ACCEPT
+      delete_iptables_rule_loop -D INPUT -p tcp --dport "${port}" -m comment --comment "${drop_comment}" -j DROP
+    fi
+  fi
+
+  delete_iptables_rules_by_comment "${allow_comment}"
+  delete_iptables_rules_by_comment "${drop_comment}"
+}
+
+port_busy_detail() {
+  local port="$1"
+  local detail
+  if ! command -v ss >/dev/null 2>&1; then
+    return 1
+  fi
+  detail="$(ss -H -lntp "sport = :${port}" 2>/dev/null || true)"
+  if [[ -z "${detail}" ]]; then
+    detail="$(ss -lntp 2>/dev/null | awk -v port=":${port}" '$0 ~ port {print}' || true)"
+  fi
+  if [[ -n "${detail}" ]]; then
+    printf '%s\n' "${detail}"
+    return 0
+  fi
+  return 1
+}
+
+check_mapping_ports_free_or_die() {
+  local mappings="$1"
+  local IFS=','
+  local pairs=()
+  local pair listen busy_output detail
+  read -r -a pairs <<< "${mappings}"
+
+  ensure_commands ss
+
+  busy_output=""
+  for pair in "${pairs[@]}"; do
+    listen="${pair%%:*}"
+    detail="$(port_busy_detail "${listen}" || true)"
+    if [[ -n "${detail}" ]]; then
+      busy_output="${busy_output}"$'\n'"Port ${listen}:"$'\n'"${detail}"$'\n'
+    fi
+  done
+
+  if [[ -n "${busy_output}" ]]; then
+    printf 'Cannot create tunnel. These listen ports are already in use:\n%s\nNo files were changed.\n' "${busy_output}" >&2
+    exit 1
+  fi
+}
+
+create_kharej_tunnel() {
+  require_root
+  ensure_commands systemctl
+
+  local number port user password iran_ip firewall_answer firewall_enabled env_file svc_file service
+  number="$(prompt_required "Tunnel number, e.g. 1")"
+  validate_tunnel_number_or_die "${number}"
+  port="$(prompt_default "SOCKS listen port" "28420")"
+  validate_port_or_die "${port}"
+  user="$(prompt_default "GOST username" "maya")"
+  validate_token_or_die "GOST username" "${user}"
+  read -r -p "GOST password (leave empty to generate random): " password
+  if [[ -z "${password}" ]]; then
+    password="$(generate_password)"
+  fi
+  validate_token_or_die "GOST password" "${password}"
+  iran_ip="$(prompt_required "Iran IP allowed, e.g. 88.218.18.13")"
+  validate_iptables_source_or_die "${iran_ip}"
+  read -r -p "Apply iptables firewall rule? [y/N]: " firewall_answer
+  case "${firewall_answer}" in
+    y|Y|yes|YES|Yes) firewall_enabled=1 ;;
+    *) firewall_enabled=0 ;;
+  esac
+
+  mkdir -p "${GOST_ETC_DIR}"
+  chmod 700 "${GOST_ETC_DIR}"
+
+  env_file="$(env_path kharej "${number}")"
+  svc_file="$(service_path kharej "${number}")"
+  service="$(service_name kharej "${number}")"
+  confirm_overwrite_file "${env_file}"
+  confirm_overwrite_file "${svc_file}"
+
+  write_secure_env_file "${env_file}" \
+    GOST_USER "${user}" \
+    GOST_PASS "${password}" \
+    TUNNEL_PORT "${port}" \
+    IRAN_IP "${iran_ip}" \
+    FIREWALL_ENABLED "${firewall_enabled}"
+
+  write_service_file "${svc_file}" "GOST Kharej Tunnel ${number}" "${env_file}" "${RUNNER_KHAREJ}"
+
+  if [[ "${firewall_enabled}" == "1" ]]; then
+    add_kharej_firewall_rules "${number}" "${iran_ip}" "${port}"
+  fi
+
+  systemctl daemon-reload
+  systemctl enable --now "${service}"
+
+  cat <<EOF_OUT
+Kharej tunnel created successfully.
+
+Service: ${service}
+Env: ${env_file}
+SOCKS: 0.0.0.0:${port}
+GOST_USER=${user}
+GOST_PASS=${password}
+Allowed Iran IP: ${iran_ip}
+Firewall: $(if [[ "${firewall_enabled}" == "1" ]]; then printf 'enabled'; else printf 'disabled'; fi)
+EOF_OUT
+}
+
+print_iran_success() {
+  local number="$1"
+  local env_file="$2"
+  local kharej_ip="$3"
+  local socks_port="$4"
+  local mappings="$5"
+  local service
+  local IFS=','
+  local pairs=()
+  local pair listen target
+  service="$(service_name iran "${number}")"
+  read -r -a pairs <<< "${mappings}"
+
+  cat <<EOF_OUT
+Iran tunnel created successfully.
+
+Service: ${service}
+Env: ${env_file}
+Kharej SOCKS: ${kharej_ip}:${socks_port}
+
+Mappings:
+EOF_OUT
+  for pair in "${pairs[@]}"; do
+    listen="${pair%%:*}"
+    target="${pair#*:}"
+    printf '  Iran :%-5s -> Kharej 127.0.0.1:%s\n' "${listen}" "${target}"
+  done
+  printf '\nLocal test examples:\n'
+  for pair in "${pairs[@]}"; do
+    listen="${pair%%:*}"
+    printf '  curl -v --max-time 10 http://127.0.0.1:%s/\n' "${listen}"
+  done
+  printf '\nPublic/CDN test example:\n'
+  if [[ "${#pairs[@]}" -gt 0 ]]; then
+    listen="${pairs[0]%%:*}"
+    printf '  curl -v --max-time 10 http://YOUR_DOMAIN_OR_IP:%s/\n' "${listen}"
+  fi
+}
+
+create_iran_tunnel() {
+  require_root
+  ensure_commands systemctl ss
+
+  local number kharej_ip socks_port user password mappings env_file svc_file service
+  number="$(prompt_required "Tunnel number, e.g. 1")"
+  validate_tunnel_number_or_die "${number}"
+  kharej_ip="$(prompt_required "Kharej IP, e.g. 37.252.4.65")"
+  validate_host_or_die "Kharej IP" "${kharej_ip}"
+  socks_port="$(prompt_default "Kharej SOCKS port" "28420")"
+  validate_port_or_die "${socks_port}"
+  user="$(prompt_default "GOST username" "maya")"
+  validate_token_or_die "GOST username" "${user}"
+  password="$(prompt_required "GOST password from Kharej side")"
+  validate_token_or_die "GOST password" "${password}"
+  mappings="$(prompt_required "Port mappings, e.g. 80:80,8080:8080,8880:8880")"
+  validate_mappings "${mappings}" || exit 1
+  check_mapping_ports_free_or_die "${mappings}"
+
+  mkdir -p "${GOST_ETC_DIR}"
+  chmod 700 "${GOST_ETC_DIR}"
+
+  env_file="$(env_path iran "${number}")"
+  svc_file="$(service_path iran "${number}")"
+  service="$(service_name iran "${number}")"
+  confirm_overwrite_file "${env_file}"
+  confirm_overwrite_file "${svc_file}"
+
+  write_secure_env_file "${env_file}" \
+    GOST_USER "${user}" \
+    GOST_PASS "${password}" \
+    KHAREJ_IP "${kharej_ip}" \
+    TUNNEL_PORT "${socks_port}" \
+    MAPPINGS "${mappings}"
+
+  write_service_file "${svc_file}" "GOST Iran Tunnel ${number}" "${env_file}" "${RUNNER_IRAN}"
+
+  systemctl daemon-reload
+  systemctl enable --now "${service}"
+
+  print_iran_success "${number}" "${env_file}" "${kharej_ip}" "${socks_port}" "${mappings}"
+}
+
+ask_side_and_number() {
+  local side number
+  side="$(prompt_required "Tunnel side: iran/kharej")"
+  validate_side "${side}" || die "side must be iran or kharej."
+  number="$(prompt_required "Tunnel number")"
+  validate_tunnel_number_or_die "${number}"
+  printf '%s %s\n' "${side}" "${number}"
+}
+
+delete_tunnel() {
+  require_root
+  ensure_commands systemctl
+
+  local selection side number service svc_file env_file
+  selection="$(ask_side_and_number)"
+  side="${selection%% *}"
+  number="${selection#* }"
+  service="$(service_name "${side}" "${number}")"
+  svc_file="$(service_path "${side}" "${number}")"
+  env_file="$(env_path "${side}" "${number}")"
+
+  if [[ "${side}" == "kharej" ]]; then
+    delete_kharej_firewall_rules "${number}" "${env_file}"
+  fi
+
+  systemctl disable --now "${service}" || true
+  rm -f "${svc_file}"
+  rm -f "${env_file}"
+  systemctl daemon-reload
+  systemctl reset-failed
+  info "Deleted ${service} and ${env_file}."
+}
+
+show_status() {
+  local selection side number service
+  selection="$(ask_side_and_number)"
+  side="${selection%% *}"
+  number="${selection#* }"
+  service="$(service_name "${side}" "${number}")"
+  systemctl status "${service}" --no-pager || true
+  printf '\nListening GOST sockets:\n'
+  ss -lntp 2>/dev/null | grep gost || true
+}
+
+show_logs() {
+  local selection side number service
+  selection="$(ask_side_and_number)"
+  side="${selection%% *}"
+  number="${selection#* }"
+  service="$(service_name "${side}" "${number}")"
+  journalctl -u "${service}" -n 100 --no-pager
+}
+
+restart_tunnel() {
+  require_root
+  ensure_commands systemctl
+
+  local selection side number service
+  selection="$(ask_side_and_number)"
+  side="${selection%% *}"
+  number="${selection#* }"
+  service="$(service_name "${side}" "${number}")"
+  systemctl restart "${service}"
+  systemctl status "${service}" --no-pager --lines=20 || true
+}
+
+summarize_iran_env() {
+  local file="$1"
+  local number="$2"
+  local service status mappings kharej_ip socks_port ports IFS pair pairs
+  service="$(service_name iran "${number}")"
+  status="$(service_status_summary "${service}")"
+  mappings="$(env_get MAPPINGS "${file}")"
+  kharej_ip="$(env_get KHAREJ_IP "${file}")"
+  socks_port="$(env_get TUNNEL_PORT "${file}")"
+  IFS=','
+  read -r -a pairs <<< "${mappings}"
+  ports=""
+  for pair in "${pairs[@]}"; do
+    if [[ -z "${ports}" ]]; then
+      ports="${pair%%:*}"
+    else
+      ports="${ports}/${pair%%:*}"
+    fi
+  done
+  if [[ "${#pairs[@]}" -eq 1 ]]; then
+    printf '%-24s %-16s Port %s -> 127.0.0.1:%s via %s:%s\n' "${service}" "${status:-unknown}" "${pairs[0]%%:*}" "${pairs[0]#*:}" "${kharej_ip}" "${socks_port}"
+  else
+    printf '%-24s %-16s Ports %s via %s:%s\n' "${service}" "${status:-unknown}" "${ports}" "${kharej_ip}" "${socks_port}"
+  fi
+}
+
+summarize_kharej_env() {
+  local file="$1"
+  local number="$2"
+  local service status port iran_ip
+  service="$(service_name kharej "${number}")"
+  status="$(service_status_summary "${service}")"
+  port="$(env_get TUNNEL_PORT "${file}")"
+  iran_ip="$(env_get IRAN_IP "${file}")"
+  printf '%-24s %-16s SOCKS 0.0.0.0:%s, allowed IP %s\n' "${service}" "${status:-unknown}" "${port:-unknown}" "${iran_ip:-unknown}"
+}
+
+service_status_summary() {
+  local service="$1"
+  local active substate
+  active="$(systemctl is-active "${service}" 2>/dev/null || true)"
+  substate="$(systemctl show -p SubState --value "${service}" 2>/dev/null || true)"
+  if [[ -n "${active}" && -n "${substate}" ]]; then
+    printf '%s/%s\n' "${active}" "${substate}"
+  elif [[ -n "${active}" ]]; then
+    printf '%s\n' "${active}"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+list_active_gost_services() {
+  local file base number found=0
+
+  systemctl list-units --type=service --all 'gost-*' || true
+  printf '\n%-24s %-16s %s\n' "SERVICE" "STATUS" "DETAILS"
+
+  for file in "${GOST_ETC_DIR}"/iran-*.env; do
+    [[ -e "${file}" ]] || continue
+    found=1
+    base="$(basename "${file}")"
+    number="${base#iran-}"
+    number="${number%.env}"
+    summarize_iran_env "${file}" "${number}"
+  done
+
+  for file in "${GOST_ETC_DIR}"/kharej-*.env; do
+    [[ -e "${file}" ]] || continue
+    found=1
+    base="$(basename "${file}")"
+    number="${base#kharej-}"
+    number="${number%.env}"
+    summarize_kharej_env "${file}" "${number}"
+  done
+
+  if [[ "${found}" -eq 0 ]]; then
+    info "No managed GOST tunnels found."
+  fi
+}
+
+collect_cleanup_candidates() {
+  local tmp="$1"
+  local file base side number env_file svc_file service state enabled
+  : > "${tmp}"
+
+  for file in "${SYSTEMD_DIR}"/gost-iran-*.service "${SYSTEMD_DIR}"/gost-kharej-*.service; do
+    [[ -e "${file}" ]] || continue
+    base="$(basename "${file}")"
+    side="${base#gost-}"
+    side="${side%-*.service}"
+    number="${base%.service}"
+    number="${number##*-}"
+    env_file="$(env_path "${side}" "${number}")"
+    service="$(service_name "${side}" "${number}")"
+    if [[ ! -f "${env_file}" ]]; then
+      printf 'service-with-missing-env|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
+    fi
+    state="$(systemctl is-failed "${service}" 2>/dev/null || true)"
+    if [[ "${state}" == "failed" ]]; then
+      printf 'failed-service|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
+    fi
+    enabled="$(systemctl is-enabled "${service}" 2>/dev/null || true)"
+    state="$(systemctl is-active "${service}" 2>/dev/null || true)"
+    if [[ "${enabled}" == "disabled" && "${state}" != "active" ]]; then
+      printf 'disabled-orphan-service|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
+    fi
+  done
+
+  for file in "${GOST_ETC_DIR}"/iran-*.env "${GOST_ETC_DIR}"/kharej-*.env; do
+    [[ -e "${file}" ]] || continue
+    base="$(basename "${file}")"
+    side="${base%-*.env}"
+    number="${base%.env}"
+    number="${number##*-}"
+    svc_file="$(service_path "${side}" "${number}")"
+    if [[ ! -f "${svc_file}" ]]; then
+      printf 'env-with-missing-service|%s|%s\n' "${file}" "${svc_file}" >> "${tmp}"
+    fi
+  done
+
+  for file in "${GOST_ETC_DIR}"/*.bak.* "${SYSTEMD_DIR}"/gost-iran-*.service.bak.* "${SYSTEMD_DIR}"/gost-kharej-*.service.bak.*; do
+    [[ -e "${file}" ]] || continue
+    printf 'old-backup|%s|\n' "${file}" >> "${tmp}"
+  done
+}
+
+clean_old_broken_configs() {
+  require_root
+  ensure_commands systemctl
+
+  local tmp reason primary secondary
+  tmp="$(mktemp)"
+  collect_cleanup_candidates "${tmp}"
+  if [[ ! -s "${tmp}" ]]; then
+    info "No old or broken managed GOST configs found."
+    rm -f "${tmp}"
+    return 0
+  fi
+
+  info "Cleanup candidates:"
+  while IFS='|' read -r reason primary secondary; do
+    case "${reason}" in
+      service-with-missing-env) printf '  service exists but env is missing: %s (missing %s)\n' "${primary}" "${secondary}" ;;
+      failed-service) printf '  failed managed service: %s\n' "${primary}" ;;
+      disabled-orphan-service) printf '  disabled orphan managed service: %s\n' "${primary}" ;;
+      env-with-missing-service) printf '  env exists but service is missing: %s (missing %s)\n' "${primary}" "${secondary}" ;;
+      old-backup) printf '  old backup file: %s\n' "${primary}" ;;
+    esac
+  done < "${tmp}"
+
+  info "Only files matching managed patterns will be deleted."
+  info "Unrelated services such as gost.service or gost-old.service are not touched."
+  confirm "Delete these cleanup candidates?" || { rm -f "${tmp}"; die "cleanup aborted."; }
+
+  while IFS='|' read -r reason primary secondary; do
+    case "${reason}" in
+      service-with-missing-env|failed-service|disabled-orphan-service)
+        if [[ "${primary}" == "${SYSTEMD_DIR}"/gost-iran-*.service || "${primary}" == "${SYSTEMD_DIR}"/gost-kharej-*.service ]]; then
+          rm -f "${primary}"
+        fi
+        if [[ -n "${secondary}" && -e "${secondary}" && ( "${secondary}" == "${GOST_ETC_DIR}"/iran-*.env || "${secondary}" == "${GOST_ETC_DIR}"/kharej-*.env ) ]]; then
+          rm -f "${secondary}"
+        fi
+        ;;
+      env-with-missing-service|old-backup)
+        if [[ "${primary}" == "${GOST_ETC_DIR}"/iran-*.env || "${primary}" == "${GOST_ETC_DIR}"/kharej-*.env || "${primary}" == "${GOST_ETC_DIR}"/*.bak.* || "${primary}" == "${SYSTEMD_DIR}"/gost-iran-*.service.bak.* || "${primary}" == "${SYSTEMD_DIR}"/gost-kharej-*.service.bak.* ]]; then
+          rm -f "${primary}"
+        fi
+        ;;
+    esac
+  done < "${tmp}"
+
+  systemctl daemon-reload
+  systemctl reset-failed
+  rm -f "${tmp}"
+  info "Cleanup complete."
+}
+
+show_menu() {
+  cat <<'MENU'
+GOST Manager
+============
+
+1) Install / Update GOST
+2) Create Kharej tunnel
+3) Create Iran tunnel
+4) Delete tunnel
+5) Show status
+6) Show logs
+7) Restart tunnel
+8) List active GOST services
+9) Clean old/broken GOST configs
+0) Exit
+MENU
+}
+
+main_menu() {
+  local choice
+  while true; do
+    show_menu
+    read -r -p "Choose an option: " choice
+    case "${choice}" in
+      1) install_or_update_gost ;;
+      2) create_kharej_tunnel ;;
+      3) create_iran_tunnel ;;
+      4) delete_tunnel ;;
+      5) show_status ;;
+      6) show_logs ;;
+      7) restart_tunnel ;;
+      8) list_active_gost_services ;;
+      9) clean_old_broken_configs ;;
+      0) exit 0 ;;
+      *) info "Invalid option." ;;
+    esac
+    printf '\n'
+  done
+}
+
+if [[ "${GOST_MANAGER_TESTING:-0}" != "1" ]]; then
+  main_menu "$@"
+fi
