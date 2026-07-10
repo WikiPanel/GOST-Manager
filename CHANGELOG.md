@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Hardened the monitoring collector core for the issue #8 compatibility contract: production `MAPPINGS`/`TUNNEL_PORT` env parsing, SQLite WAL/busy-timeout storage, versioned v1-to-v2 migrations, quality-labelled metrics, structured events, bounded retention, incremental minute rollups, and deterministic collector tests.
+
 ## 0.1.2
 - Removed GitHub Actions workflow because validation is handled locally.
 
