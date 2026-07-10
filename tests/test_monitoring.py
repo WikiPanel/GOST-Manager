@@ -329,3 +329,125 @@ class MonitoringIssue13Tests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+class MonitoringReviewP0Tests(unittest.TestCase):
+    def test_metrics_view_is_one_row_per_point(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn=init_db(str(Path(td)/'m.sqlite3'))
+            cid=conn.execute("INSERT INTO sample_cycles(collected_at,monotonic_started,monotonic_finished,duration_seconds,success,overrun) VALUES(500,0,1,1,1,0)").lastrowid
+            sid=insert_sample(conn,MetricSample(None,500,1,1,0,0,0,0),cid)
+            insert_metric(conn,sid,Metric('host','load1',1,'load','exact',entity_type='host',entity_id='local'),cid,500)
+            for i in range(3):
+                t=Tunnel('iran',i+1,f'gost-iran-{i+1}.service','x',(80+i,),(80+i,))
+                upsert_tunnel(conn,t,500)
+                sid=insert_sample(conn,MetricSample(t.tunnel_id,500,1,1,0,1,1,1),cid)
+                insert_metric(conn,sid,Metric(f'tunnel.{t.tunnel_id}','listen_ports_up',1,'count','exact',entity_type='tunnel',entity_id=t.tunnel_id),cid,500)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM metrics').fetchone()[0], conn.execute('SELECT COUNT(*) FROM metric_points').fetchone()[0])
+            self.assertEqual(conn.execute("SELECT SUM(value) FROM metrics WHERE name='listen_ports_up'").fetchone()[0],3)
+
+    def test_post_commit_maintenance_failures_do_not_fail_collection(self):
+        failures = [
+            {'checkpoint': lambda path: (_ for _ in ()).throw(RuntimeError('checkpoint'))},
+            {'maintenance_conn_factory': lambda path: (_ for _ in ()).throw(RuntimeError('open'))},
+            {'maintenance_conn_factory': lambda path: BrokenBegin(init_db(path))},
+            {'checkpoint_event_writer': lambda conn,event: (_ for _ in ()).throw(RuntimeError('event'))},
+            {'maintenance_conn_factory': lambda path: BrokenCommit(init_db(path))},
+        ]
+        for idx, kwargs in enumerate(failures):
+            with tempfile.TemporaryDirectory() as td:
+                db=str(Path(td)/'m.sqlite3')
+                collect_once(db,td,600+idx,lambda cmd:'',maintenance=True,**kwargs)
+                conn=init_db(db)
+                self.assertEqual(conn.execute('SELECT success FROM sample_cycles WHERE collected_at=?',(600+idx,)).fetchone()[0],1)
+                self.assertGreater(conn.execute('SELECT COUNT(*) FROM metric_points').fetchone()[0],0)
+
+    def test_v2_migration_preserves_label_entity_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3'); c=sqlite3.connect(db)
+            c.executescript('''
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL); INSERT INTO schema_migrations VALUES(2,2);
+            CREATE TABLE tunnels(tunnel_id TEXT PRIMARY KEY, side TEXT NOT NULL CHECK(side IN('iran','kharej')), tunnel_number INTEGER NOT NULL, service_name TEXT NOT NULL UNIQUE, env_path TEXT NOT NULL, listen_ports_json TEXT NOT NULL DEFAULT '[]', target_ports_json TEXT NOT NULL DEFAULT '[]', updated_at INTEGER NOT NULL, UNIQUE(side,tunnel_number));
+            CREATE TABLE metric_samples(sample_id INTEGER PRIMARY KEY AUTOINCREMENT, tunnel_id TEXT REFERENCES tunnels(tunnel_id) ON DELETE CASCADE, collected_at INTEGER NOT NULL, service_state INTEGER NOT NULL DEFAULT 0, service_substate INTEGER NOT NULL DEFAULT 0, restart_count INTEGER NOT NULL DEFAULT 0, listen_ports_total INTEGER NOT NULL DEFAULT 0, listen_ports_up INTEGER NOT NULL DEFAULT 0, configured_mappings_total INTEGER NOT NULL DEFAULT 0, rx_bytes INTEGER, tx_bytes INTEGER, UNIQUE(tunnel_id,collected_at));
+            CREATE TABLE metrics(sample_id INTEGER NOT NULL REFERENCES metric_samples(sample_id) ON DELETE CASCADE, scope TEXT NOT NULL, name TEXT NOT NULL, value REAL, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), labels_json TEXT NOT NULL DEFAULT '{}');
+            CREATE TABLE minute_rollups(scope TEXT NOT NULL, name TEXT NOT NULL, minute_start INTEGER NOT NULL, samples INTEGER NOT NULL, min_value REAL, avg_value REAL, max_value REAL, unavailable_count INTEGER NOT NULL, reset_count INTEGER NOT NULL DEFAULT 0, gap_count INTEGER NOT NULL DEFAULT 0, coverage REAL NOT NULL, unit TEXT NOT NULL, quality TEXT NOT NULL, PRIMARY KEY(scope,name,minute_start));
+            CREATE TABLE events(event_id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, severity TEXT NOT NULL, code TEXT NOT NULL, message TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}');
+            CREATE TABLE collector_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO metric_samples(sample_id,tunnel_id,collected_at) VALUES(1,NULL,100);
+            INSERT INTO metrics VALUES(1,'net.external','rx_bytes',10,'bytes','exact','{"interface":"eth0"}');
+            INSERT INTO metrics VALUES(1,'net.external','rx_bytes',20,'bytes','exact','{"interface":"eth1"}');
+            INSERT INTO metrics VALUES(1,'fs','free_bytes',30,'bytes','exact','{"path":"/"}');
+            INSERT INTO metrics VALUES(1,'fs','free_bytes',40,'bytes','exact','{"path":"/var/lib/gost-manager"}');
+            '''); c.commit(); c.close()
+            conn=init_db(db)
+            ids={r[0] for r in conn.execute('SELECT entity_id FROM entities')}
+            self.assertTrue({'interface:eth0','interface:eth1','fs:/','fs:/var/lib/gost-manager'}.issubset(ids))
+            self.assertEqual(conn.execute('SELECT SUM(numeric_value) FROM metric_points').fetchone()[0],100)
+
+    def test_old_v3_metric_points_precede_metrics_and_host_dedupe(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3'); c=sqlite3.connect(db)
+            c.executescript('''
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL); INSERT INTO schema_migrations VALUES(3,3);
+            CREATE TABLE sample_cycles(cycle_id INTEGER PRIMARY KEY AUTOINCREMENT, collected_at INTEGER NOT NULL UNIQUE, monotonic_started REAL NOT NULL, monotonic_finished REAL NOT NULL, duration_seconds REAL NOT NULL, success INTEGER NOT NULL, overrun INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE entities(entity_pk INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, display_name TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', updated_at INTEGER NOT NULL, UNIQUE(entity_type,entity_id));
+            CREATE TABLE metric_samples(sample_id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL REFERENCES sample_cycles(cycle_id) ON DELETE CASCADE, tunnel_id TEXT REFERENCES tunnels(tunnel_id) ON DELETE CASCADE, collected_at INTEGER NOT NULL, service_state INTEGER NOT NULL DEFAULT 0, service_substate INTEGER NOT NULL DEFAULT 0, restart_count INTEGER NOT NULL DEFAULT 0, listen_ports_total INTEGER NOT NULL DEFAULT 0, listen_ports_up INTEGER NOT NULL DEFAULT 0, configured_mappings_total INTEGER NOT NULL DEFAULT 0, rx_bytes INTEGER, tx_bytes INTEGER, UNIQUE(cycle_id,tunnel_id));
+            CREATE TABLE tunnels(tunnel_id TEXT PRIMARY KEY, entity_pk INTEGER REFERENCES entities(entity_pk) ON DELETE SET NULL, side TEXT NOT NULL CHECK(side IN('iran','kharej')), tunnel_number INTEGER NOT NULL, service_name TEXT NOT NULL UNIQUE, env_path TEXT NOT NULL, listen_ports_json TEXT NOT NULL DEFAULT '[]', target_ports_json TEXT NOT NULL DEFAULT '[]', updated_at INTEGER NOT NULL, UNIQUE(side,tunnel_number));
+            CREATE TABLE metric_points(point_id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL REFERENCES sample_cycles(cycle_id) ON DELETE CASCADE, entity_pk INTEGER NOT NULL REFERENCES entities(entity_pk) ON DELETE CASCADE, metric_name TEXT NOT NULL, ts INTEGER NOT NULL, numeric_value REAL, text_value TEXT, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), reset INTEGER NOT NULL DEFAULT 0, gap INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE metrics(sample_id INTEGER NOT NULL REFERENCES metric_samples(sample_id) ON DELETE CASCADE, scope TEXT NOT NULL, name TEXT NOT NULL, value REAL, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), labels_json TEXT NOT NULL DEFAULT '{}');
+            CREATE TABLE minute_rollups(entity_pk INTEGER NOT NULL REFERENCES entities(entity_pk) ON DELETE CASCADE, metric_name TEXT NOT NULL, minute_start INTEGER NOT NULL, samples INTEGER NOT NULL, expected_samples INTEGER NOT NULL, min_value REAL, avg_value REAL, max_value REAL, unavailable_count INTEGER NOT NULL, reset_count INTEGER NOT NULL DEFAULT 0, gap_count INTEGER NOT NULL DEFAULT 0, coverage REAL NOT NULL, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), PRIMARY KEY(entity_pk,metric_name,minute_start));
+            CREATE TABLE events(event_id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, severity TEXT NOT NULL, code TEXT NOT NULL, message TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}'); CREATE TABLE collector_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO sample_cycles VALUES(1,100,0,12,12,1,0); INSERT INTO entities VALUES(1,'collector','local','local','{}',100);
+            INSERT INTO metric_samples(sample_id,cycle_id,tunnel_id,collected_at) VALUES(1,1,NULL,100); INSERT INTO metric_samples(sample_id,cycle_id,tunnel_id,collected_at) VALUES(2,1,NULL,100);
+            INSERT INTO metric_points(cycle_id,entity_pk,metric_name,ts,numeric_value,unit,quality) VALUES(1,1,'duration_seconds',100,12,'seconds','derived');
+            INSERT INTO metrics VALUES(2,'collector','duration_seconds',99,'seconds','derived','{}');
+            '''); c.commit(); c.close()
+            conn=init_db(db)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM metric_points WHERE metric_name='duration_seconds'").fetchone()[0],1)
+            self.assertEqual(conn.execute("SELECT numeric_value FROM metric_points WHERE metric_name='duration_seconds'").fetchone()[0],12)
+            self.assertFalse(conn.execute("SELECT 1 FROM entities WHERE entity_type='collector' AND entity_id='collector'").fetchone())
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM metric_samples WHERE cycle_id=1 AND sample_identity="host"').fetchone()[0],1)
+            self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
+
+    def test_legacy_minute_rollups_are_archived(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3'); c=sqlite3.connect(db)
+            c.executescript('''
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL); INSERT INTO schema_migrations VALUES(2,2);
+            CREATE TABLE minute_rollups(scope TEXT NOT NULL, name TEXT NOT NULL, minute_start INTEGER NOT NULL, samples INTEGER NOT NULL, min_value REAL, avg_value REAL, max_value REAL, unavailable_count INTEGER NOT NULL, reset_count INTEGER NOT NULL DEFAULT 0, gap_count INTEGER NOT NULL DEFAULT 0, coverage REAL NOT NULL, unit TEXT NOT NULL, quality TEXT NOT NULL, PRIMARY KEY(scope,name,minute_start));
+            INSERT INTO minute_rollups VALUES('collector','x',60,1,1,1,1,0,0,0,1,'count','exact');
+            '''); c.commit(); c.close()
+            conn=init_db(db)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM minute_rollups_archive').fetchone()[0],1)
+
+    def test_failed_overrun_cycle_records_timing(self):
+        import monitoring.gost_monitoring as gm
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3'); mono=[0.0]; wall=[1000.0]; stop=[False]
+            clock=gm.Clock(lambda: wall[0], lambda: mono[0])
+            def bad_collect(*args, **kwargs):
+                conn=init_db(db); conn.execute('BEGIN IMMEDIATE'); gm._cycle(conn,1000,0,12,12,False,False); conn.commit(); conn.close()
+                mono[0]=12; wall[0]=1012
+                raise gm.CollectionCycleError(1000,'boom')
+            old=gm.collect_once; gm.collect_once=bad_collect
+            try:
+                gm.run_daemon(db,td,interval=5,clock=clock,sleeper=lambda s: mono.__setitem__(0,mono[0]+s),stop_requested=lambda: mono[0]>=12)
+            finally:
+                gm.collect_once=old
+            conn=init_db(db)
+            row=conn.execute('SELECT success,overrun,missed_deadlines,overrun_seconds FROM sample_cycles WHERE collected_at=1000').fetchone()
+            self.assertEqual(row[0],0); self.assertEqual(row[1],1); self.assertEqual(row[2],2); self.assertEqual(row[3],7.0)
+
+class BrokenBegin:
+    def __init__(self, conn): self.conn=conn
+    def execute(self, sql, *args):
+        if sql == 'BEGIN IMMEDIATE': raise RuntimeError('begin')
+        return self.conn.execute(sql,*args)
+    def rollback(self): return self.conn.rollback()
+    def close(self): return self.conn.close()
+
+class BrokenCommit:
+    def __init__(self, conn): self.conn=conn
+    def execute(self, sql, *args): return self.conn.execute(sql,*args)
+    def commit(self): raise RuntimeError('commit')
+    def rollback(self): return self.conn.rollback()
+    def close(self): return self.conn.close()

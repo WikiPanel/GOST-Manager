@@ -203,11 +203,10 @@ def _ensure_metrics_view(conn: sqlite3.Connection) -> None:
         conn.execute("DROP VIEW metrics")
     conn.execute(
         "CREATE VIEW metrics AS "
-        "SELECT ms.sample_id, e.entity_type AS scope, p.metric_name AS name, "
+        "SELECT NULL AS sample_id, e.entity_type AS scope, p.metric_name AS name, "
         "p.numeric_value AS value, p.unit, p.quality, e.metadata_json AS labels_json "
         "FROM metric_points p "
-        "JOIN entities e ON e.entity_pk = p.entity_pk "
-        "LEFT JOIN metric_samples ms ON ms.cycle_id = p.cycle_id"
+        "JOIN entities e ON e.entity_pk = p.entity_pk"
     )
 
 
@@ -218,6 +217,42 @@ def _ensure_entity(conn: sqlite3.Connection, entity_type: str, entity_id: str, d
         (entity_type, entity_id, display, json.dumps(metadata, sort_keys=True), now),
     )
     return int(conn.execute("SELECT entity_pk FROM entities WHERE entity_type=? AND entity_id=?", (entity_type, entity_id)).fetchone()[0])
+
+
+def _legacy_metric_entity(scope: str, labels: dict[str, object]) -> tuple[str, str]:
+    if "interface" in labels:
+        iface = str(labels["interface"])
+        return "interface", f"interface:{iface}"
+    if "path" in labels:
+        path = str(labels["path"])
+        return "filesystem", f"fs:{path}"
+    for key in ("tunnel_id", "tunnel", "service"):
+        if key in labels:
+            value = str(labels[key])
+            if value.startswith("gost-"):
+                match = SERVICE_RE.match(value)
+                if match:
+                    return "tunnel", f"{match.group(1)}-{match.group(2)}"
+                return "service", value
+            return "tunnel", value
+    if scope == "collector":
+        return "collector", "local"
+    if scope == "host":
+        return "host", "local"
+    canonical = json.dumps(labels, sort_keys=True, separators=(",", ":"))
+    return scope, f"{scope}:{canonical}"
+
+
+def _dedupe_sample_identities(conn: sqlite3.Connection) -> None:
+    if "metrics_legacy" in _tables(conn) and {"sample_id"}.issubset(_columns(conn, "metrics_legacy")):
+        for cycle_id, identity, keep in conn.execute("SELECT cycle_id,sample_identity,MIN(sample_id) FROM metric_samples GROUP BY cycle_id,sample_identity HAVING COUNT(*)>1"):
+            dupes = [r[0] for r in conn.execute("SELECT sample_id FROM metric_samples WHERE cycle_id=? AND sample_identity=? AND sample_id<>?", (cycle_id, identity, keep))]
+            for sample_id in dupes:
+                conn.execute("UPDATE metrics_legacy SET sample_id=? WHERE sample_id=?", (keep, sample_id))
+    conn.execute(
+        "DELETE FROM metric_samples WHERE sample_id NOT IN "
+        "(SELECT MIN(sample_id) FROM metric_samples GROUP BY cycle_id,sample_identity)"
+    )
 
 
 def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -> sqlite3.Connection:
@@ -282,7 +317,14 @@ def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -
                     if not sample:
                         continue
                     labels = json.loads(row[6] or "{}")
-                    entity_pk = _ensure_entity(conn, str(row[1]), str(row[1]), str(row[1]), labels, int(sample[1]))
+                    entity_type, entity_id = _legacy_metric_entity(str(row[1]), labels)
+                    entity_pk = _ensure_entity(conn, entity_type, entity_id, entity_id, labels, int(sample[1]))
+                    exists = conn.execute(
+                        "SELECT 1 FROM metric_points WHERE cycle_id=? AND entity_pk=? AND metric_name=?",
+                        (sample[0], entity_pk, row[2]),
+                    ).fetchone()
+                    if exists:
+                        continue
                     conn.execute(
                         "INSERT INTO metric_points(cycle_id,entity_pk,metric_name,ts,numeric_value,text_value,unit,quality,reset,gap) VALUES(?,?,?,?,?,?,?,?,0,0) "
                         "ON CONFLICT(cycle_id,entity_pk,metric_name) DO UPDATE SET ts=excluded.ts,numeric_value=excluded.numeric_value,unit=excluded.unit,quality=excluded.quality",
@@ -294,17 +336,16 @@ def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -
         if "tunnels_legacy" in _tables(conn):
             conn.execute("DROP TABLE tunnels_legacy")
         if "minute_rollups_legacy" in _tables(conn):
-            conn.execute("DROP TABLE minute_rollups_legacy")
+            conn.execute("ALTER TABLE minute_rollups_legacy RENAME TO minute_rollups_archive")
         _ensure_metrics_view(conn)
         conn.execute("INSERT OR REPLACE INTO schema_migrations(version,applied_at) VALUES(?,?)", (SCHEMA_VERSION, now))
+        _dedupe_sample_identities(conn)
         _ensure_indexes(conn)
         if inject_failure == "after_indexes":
             raise RuntimeError("injected migration failure")
         post_counts = {name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] for name in {"tunnels", "metric_samples", "metric_points", "sample_cycles"}}
         if pre_counts.get("tunnels", 0) and post_counts["tunnels"] < pre_counts["tunnels"]:
             raise RuntimeError("tunnel migration row count decreased")
-        if pre_counts.get("metric_samples", 0) and post_counts["metric_samples"] < pre_counts["metric_samples"]:
-            raise RuntimeError("sample migration row count decreased")
         legacy_left = {name for name in _tables(conn) if name.endswith("_legacy")}
         if legacy_left:
             raise RuntimeError(f"stale legacy tables remain: {sorted(legacy_left)}")
@@ -660,7 +701,31 @@ def record_cycle_overrun(db_path: str, ts: int, finished: float, deadline: float
         conn.close()
 
 
-def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Callable[[Sequence[str]], str] = _run, proc: Path = Path("/proc"), clock: Clock = Clock(), maintenance: bool = False, overrun: bool = False, missed_deadlines: int = 0, overrun_seconds: float = 0.0, checkpoint: Callable[[str], tuple[int, int, int]] = checkpoint_wal) -> int:
+class CollectionCycleError(RuntimeError):
+    def __init__(self, ts: int, message: str):
+        super().__init__(message)
+        self.ts = ts
+
+
+def _record_checkpoint_result(db_path: str, ts: int, cycle_id: int, sample_id: int, result: tuple[int, int, int] | None, error: Exception | None, conn_factory: Callable[[str], sqlite3.Connection], event_writer: Callable[[sqlite3.Connection, Event], None], metric_writer: Callable[[sqlite3.Connection, int, Metric, int | None, int | None], None]) -> None:
+    conn = conn_factory(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if error is None and result is not None:
+            event_writer(conn, Event(ts, "info", "wal_checkpoint", "WAL checkpoint completed", {"busy": result[0], "log": result[1], "checkpointed": result[2]}))
+            metric_writer(conn, sample_id, Metric("collector", "checkpoint_success", 1, "count", "exact", entity_type="collector", entity_id="local"), cycle_id, ts)
+        else:
+            event_writer(conn, Event(ts, "warning", "wal_checkpoint_failed", "WAL checkpoint failed after collection commit", {"error": str(error)}))
+            metric_writer(conn, sample_id, Metric("collector", "checkpoint_success", 0, "count", "exact", entity_type="collector", entity_id="local"), cycle_id, ts)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Callable[[Sequence[str]], str] = _run, proc: Path = Path("/proc"), clock: Clock = Clock(), maintenance: bool = False, overrun: bool = False, missed_deadlines: int = 0, overrun_seconds: float = 0.0, checkpoint: Callable[[str], tuple[int, int, int]] = checkpoint_wal, maintenance_conn_factory: Callable[[str], sqlite3.Connection] = init_db, checkpoint_event_writer: Callable[[sqlite3.Connection, Event], None] = insert_event, checkpoint_metric_writer: Callable[[sqlite3.Connection, int, Metric, int | None, int | None], None] = insert_metric) -> int:
     ts = int(clock.wall() if now is None else now)
     started = clock.monotonic()
     conn = init_db(db_path)
@@ -694,19 +759,16 @@ def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Cal
         conn.commit()
         success = True
         if maintenance:
-            ck = init_db(db_path)
+            ckpt: tuple[int, int, int] | None = None
+            ckpt_error: Exception | None = None
             try:
-                ck.execute("BEGIN IMMEDIATE")
-                try:
-                    ckpt = checkpoint(db_path)
-                    insert_event(ck, Event(ts, "info", "wal_checkpoint", "WAL checkpoint completed", {"busy": ckpt[0], "log": ckpt[1], "checkpointed": ckpt[2]}))
-                    insert_metric(ck, sid, Metric("collector", "checkpoint_success", 1, "count", "exact", entity_type="collector", entity_id="local"), cycle_id, ts)
-                except Exception as exc:
-                    insert_event(ck, Event(ts, "warning", "wal_checkpoint_failed", "WAL checkpoint failed after collection commit", {"error": str(exc)}))
-                    insert_metric(ck, sid, Metric("collector", "checkpoint_success", 0, "count", "exact", entity_type="collector", entity_id="local"), cycle_id, ts)
-                ck.commit()
-            finally:
-                ck.close()
+                ckpt = checkpoint(db_path)
+            except Exception as exc:
+                ckpt_error = exc
+            try:
+                _record_checkpoint_result(db_path, ts, cycle_id, sid, ckpt, ckpt_error, maintenance_conn_factory, checkpoint_event_writer, checkpoint_metric_writer)
+            except Exception:
+                pass
         return ts
     except Exception as exc:
         conn.rollback()
@@ -717,7 +779,7 @@ def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Cal
             conn.commit()
         except Exception:
             conn.rollback()
-        raise
+        raise CollectionCycleError(ts, str(exc)) from exc
     finally:
         if not success:
             pass
@@ -758,6 +820,13 @@ def run_daemon(db_path: str, env_dir: str, interval: float = DEFAULT_SAMPLE_INTE
                 cycle_ts = collect_once(db_path, env_dir, runner=runner, clock=clock, maintenance=maintenance, overrun=False, missed_deadlines=0, overrun_seconds=0.0)
                 finished = clock.monotonic()
                 record_cycle_overrun(db_path, cycle_ts, finished, deadline, interval)
+            except CollectionCycleError as exc:
+                finished = clock.monotonic()
+                try:
+                    record_cycle_overrun(db_path, exc.ts, finished, deadline, interval)
+                except Exception:
+                    pass
+                print(f"collection failed: {exc}", file=sys.stderr)
             except Exception as exc:
                 print(f"collection failed: {exc}", file=sys.stderr)
             deadline += interval
