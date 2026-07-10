@@ -508,3 +508,40 @@ class MonitoringRuntimeSeparationTests(unittest.TestCase):
             conn=init_db(db)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM metric_points WHERE metric_name='listen_ports_up'").fetchone()[0],1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type='tunnel' AND entity_id='iran-1'").fetchone()[0],1)
+
+class MonitoringFinalReviewTests(unittest.TestCase):
+    def test_minute_rollups_time_index_owned_by_active_table_after_v2_migration(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3'); c=sqlite3.connect(db)
+            c.executescript('''
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL); INSERT INTO schema_migrations VALUES(2,2);
+            CREATE TABLE minute_rollups(scope TEXT NOT NULL, name TEXT NOT NULL, minute_start INTEGER NOT NULL, samples INTEGER NOT NULL, min_value REAL, avg_value REAL, max_value REAL, unavailable_count INTEGER NOT NULL, reset_count INTEGER NOT NULL DEFAULT 0, gap_count INTEGER NOT NULL DEFAULT 0, coverage REAL NOT NULL, unit TEXT NOT NULL, quality TEXT NOT NULL, PRIMARY KEY(scope,name,minute_start));
+            CREATE INDEX idx_minute_rollups_time ON minute_rollups(minute_start);
+            INSERT INTO minute_rollups VALUES('collector','x',60,1,1,1,1,0,0,0,1,'count','exact');
+            '''); c.commit(); c.close()
+            conn=init_db(db)
+            rows=conn.execute("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name='idx_minute_rollups_time'").fetchall()
+            self.assertEqual(rows, [('minute_rollups',)])
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM minute_rollups_archive').fetchone()[0],1)
+
+    def test_no_duplicate_unique_indexes_for_metric_points_or_entities(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn=init_db(str(Path(td)/'m.sqlite3'))
+            def matching_unique(table, cols):
+                count=0
+                for row in conn.execute(f'PRAGMA index_list({table})'):
+                    if row[2] and tuple(r[2] for r in conn.execute(f'PRAGMA index_info({row[1]})')) == cols:
+                        count += 1
+                return count
+            self.assertEqual(matching_unique('metric_points', ('cycle_id','entity_pk','metric_name')),1)
+            self.assertEqual(matching_unique('entities', ('entity_type','entity_id')),1)
+
+    def test_deadline_missed_boundary_cases(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3'); init_db(db).close()
+            cases=((900,5.000,0,0,0.0),(901,5.001,1,1,0.001),(902,10.000,1,1,5.0),(903,10.001,1,2,5.001),(904,12.000,1,2,7.0))
+            for ts,finish,overrun,missed,seconds in cases:
+                conn=open_runtime_database(db); conn.execute('BEGIN IMMEDIATE'); _cycle(conn,ts,0,finish,finish,True,False); conn.commit(); conn.close()
+                record_cycle_overrun(db,ts,finish,0.0,5.0)
+                row=open_runtime_database(db).execute('SELECT overrun,missed_deadlines,overrun_seconds FROM sample_cycles WHERE collected_at=?',(ts,)).fetchone()
+                self.assertEqual(row[0],overrun); self.assertEqual(row[1],missed); self.assertAlmostEqual(row[2],seconds,places=3)

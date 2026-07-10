@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import os
 import re
 import shlex
@@ -125,16 +126,14 @@ def _v4_statements() -> list[str]:
     ]
 
 
-def _required_indexes() -> dict[str, str]:
+def _required_indexes() -> dict[str, tuple[str, str, tuple[str, ...], bool]]:
     return {
-        "idx_entities_lookup": "CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_lookup ON entities(entity_type,entity_id)",
-        "idx_metric_points_lookup": "CREATE INDEX IF NOT EXISTS idx_metric_points_lookup ON metric_points(entity_pk,metric_name,ts)",
-        "idx_metric_points_unique": "CREATE UNIQUE INDEX IF NOT EXISTS idx_metric_points_unique ON metric_points(cycle_id,entity_pk,metric_name)",
-        "idx_metric_points_time": "CREATE INDEX IF NOT EXISTS idx_metric_points_time ON metric_points(ts)",
-        "idx_metric_samples_time": "CREATE INDEX IF NOT EXISTS idx_metric_samples_time ON metric_samples(collected_at)",
-        "idx_metric_samples_identity": "CREATE UNIQUE INDEX IF NOT EXISTS idx_metric_samples_identity ON metric_samples(cycle_id,sample_identity)",
-        "idx_events_time": "CREATE INDEX IF NOT EXISTS idx_events_time ON events(ts)",
-        "idx_minute_rollups_time": "CREATE INDEX IF NOT EXISTS idx_minute_rollups_time ON minute_rollups(minute_start)",
+        "idx_metric_points_lookup": ("CREATE INDEX IF NOT EXISTS idx_metric_points_lookup ON metric_points(entity_pk,metric_name,ts)", "metric_points", ("entity_pk", "metric_name", "ts"), False),
+        "idx_metric_points_time": ("CREATE INDEX IF NOT EXISTS idx_metric_points_time ON metric_points(ts)", "metric_points", ("ts",), False),
+        "idx_metric_samples_time": ("CREATE INDEX IF NOT EXISTS idx_metric_samples_time ON metric_samples(collected_at)", "metric_samples", ("collected_at",), False),
+        "idx_metric_samples_identity": ("CREATE UNIQUE INDEX IF NOT EXISTS idx_metric_samples_identity ON metric_samples(cycle_id,sample_identity)", "metric_samples", ("cycle_id", "sample_identity"), True),
+        "idx_events_time": ("CREATE INDEX IF NOT EXISTS idx_events_time ON events(ts)", "events", ("ts",), False),
+        "idx_minute_rollups_time": ("CREATE INDEX IF NOT EXISTS idx_minute_rollups_time ON minute_rollups(minute_start)", "minute_rollups", ("minute_start",), False),
     }
 
 
@@ -190,12 +189,23 @@ def _has_metric_points_unique(conn: sqlite3.Connection) -> bool:
 
 
 def _ensure_indexes(conn: sqlite3.Connection) -> None:
-    for sql in _required_indexes().values():
+    required = _required_indexes()
+    for sql, _table, _columns, _unique in required.values():
         conn.execute(sql)
-    existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-    missing = set(_required_indexes()) - existing
-    if missing:
-        raise RuntimeError(f"missing indexes: {sorted(missing)}")
+    by_name = {r[1]: r for r in conn.execute("PRAGMA index_list(metric_points)")}
+    for table in ("entities", "metric_samples", "events", "minute_rollups"):
+        by_name.update({r[1]: r for r in conn.execute(f"PRAGMA index_list({table})")})
+    for name, (_sql, table, columns, unique) in required.items():
+        row = by_name.get(name)
+        if row is None:
+            raise RuntimeError(f"missing index: {name}")
+        owner = conn.execute("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()
+        if owner is None or owner[0] != table:
+            raise RuntimeError(f"index {name} is owned by {owner[0] if owner else None}, expected {table}")
+        if _index_columns(conn, name) != columns:
+            raise RuntimeError(f"index {name} has wrong columns")
+        if bool(row[2]) != unique:
+            raise RuntimeError(f"index {name} uniqueness mismatch")
 
 
 def _ensure_metrics_view(conn: sqlite3.Connection) -> None:
@@ -342,7 +352,9 @@ def migrate_database(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None 
         if "tunnels_legacy" in _tables(conn):
             conn.execute("DROP TABLE tunnels_legacy")
         if "minute_rollups_legacy" in _tables(conn):
+            conn.execute("DROP INDEX IF EXISTS idx_minute_rollups_time")
             conn.execute("ALTER TABLE minute_rollups_legacy RENAME TO minute_rollups_archive")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_minute_rollups_time ON minute_rollups_archive(minute_start)")
         _ensure_metrics_view(conn)
         conn.execute("INSERT OR REPLACE INTO schema_migrations(version,applied_at) VALUES(?,?)", (SCHEMA_VERSION, now))
         _dedupe_sample_identities(conn)
@@ -697,7 +709,7 @@ def record_cycle_overrun(db_path: str, ts: int, finished: float, deadline: float
     overrun_seconds = max(0.0, finished - (deadline + interval))
     if overrun_seconds <= 0:
         return
-    missed = int(overrun_seconds // interval) + 1 if interval > 0 else 0
+    missed = math.ceil(overrun_seconds / interval) if interval > 0 else 0
     conn = open_runtime_database(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
