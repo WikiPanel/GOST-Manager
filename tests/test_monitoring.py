@@ -123,4 +123,119 @@ class MonitoringTests(unittest.TestCase):
             finally:
                 gm.collect_once = old
 
+class MonitoringIssue13Tests(unittest.TestCase):
+    def test_once_with_maintenance_persists_checkpoint_and_rollup(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td,'iran-1.env').write_text('MAPPINGS=80:80\n',encoding='utf-8')
+            db=str(Path(td)/'m.sqlite3')
+            def run(cmd):
+                if cmd[0]=='systemctl':
+                    return 'ActiveState=active\nSubState=running\nNRestarts=0\nMainPID=1\n'
+                return 'LISTEN 0 1 0.0.0.0:80 0.0.0.0:* users:(("gost",pid=1,fd=1))\n'
+            self.assertEqual(collect_once(db, td, 120, run, maintenance=True), 120)
+            conn=init_db(db)
+            self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM sample_cycles').fetchone()[0], 1)
+            self.assertGreater(conn.execute('SELECT COUNT(*) FROM metric_points').fetchone()[0], 0)
+            self.assertGreater(conn.execute('SELECT COUNT(*) FROM minute_rollups').fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE code='wal_checkpoint'").fetchone()[0], 1)
+
+    def test_populated_v1_migration_multiple_tunnels_same_timestamp(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3')
+            c=sqlite3.connect(db)
+            c.executescript(CREATE_SCHEMA)
+            c.execute("INSERT INTO tunnels(tunnel_id,side,tunnel_number,service_name,env_path,listen_ports_json,target_ports_json,updated_at) VALUES('iran-1','iran',1,'gost-iran-1.service','a','[80]','[80]',1)")
+            c.execute("INSERT INTO tunnels(tunnel_id,side,tunnel_number,service_name,env_path,listen_ports_json,target_ports_json,updated_at) VALUES('iran-2','iran',2,'gost-iran-2.service','b','[81]','[81]',1)")
+            c.execute("INSERT INTO metric_samples(tunnel_id,collected_at,service_state,service_substate,restart_count,listen_ports_total,listen_ports_up,configured_mappings_total,rx_bytes,tx_bytes) VALUES('iran-1',100,1,1,0,1,1,1,10,20)")
+            c.execute("INSERT INTO metric_samples(tunnel_id,collected_at,service_state,service_substate,restart_count,listen_ports_total,listen_ports_up,configured_mappings_total,rx_bytes,tx_bytes) VALUES('iran-2',100,1,1,0,1,1,1,30,40)")
+            c.commit(); c.close()
+            conn=init_db(db)
+            self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM tunnels').fetchone()[0], 2)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM metric_samples').fetchone()[0], 2)
+            self.assertEqual(conn.execute('SELECT COUNT(DISTINCT cycle_id) FROM metric_samples').fetchone()[0], 1)
+
+    def test_v2_incompatible_tables_are_renamed_and_recreated(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3')
+            c=sqlite3.connect(db)
+            c.executescript('''
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+            INSERT INTO schema_migrations VALUES(2,2);
+            CREATE TABLE metrics(id INTEGER PRIMARY KEY, bad TEXT);
+            CREATE TABLE minute_rollups(id INTEGER PRIMARY KEY, bad TEXT);
+            CREATE TABLE metric_samples(sample_id INTEGER PRIMARY KEY, cycle_id INTEGER, tunnel_id TEXT, collected_at INTEGER);
+            CREATE TABLE tunnels(tunnel_id TEXT PRIMARY KEY, entity_pk INTEGER, side TEXT, tunnel_number INTEGER, service_name TEXT, env_path TEXT, listen_ports_json TEXT, target_ports_json TEXT, updated_at INTEGER);
+            ''')
+            c.commit(); c.close()
+            conn=init_db(db)
+            self.assertEqual(conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0], 3)
+            self.assertIn('metric_points', {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")})
+            self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
+
+    def test_metric_points_idempotent_and_unavailable_rollup(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn=init_db(str(Path(td)/'m.sqlite3'))
+            sid=insert_sample(conn,MetricSample(None,60,1,1,0,0,0,0))
+            insert_metric(conn,sid,Metric('host','x',None,'count','unavailable',entity_type='host',entity_id='local'))
+            insert_metric(conn,sid,Metric('host','x',None,'count','unavailable',entity_type='host',entity_id='local'))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM metric_points WHERE metric_name='x'").fetchone()[0],1)
+            rollup_completed_minutes(conn,120)
+            self.assertEqual(conn.execute("SELECT samples,unavailable_count,min_value,avg_value,max_value,quality FROM minute_rollups WHERE metric_name='x'").fetchone(), (1,1,None,None,None,'unavailable'))
+
+    def test_one_ss_and_one_systemd_per_service_per_cycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            for i,p in enumerate((80,81,82),1):
+                Path(td,f'iran-{i}.env').write_text(f'MAPPINGS={p}:{p}\n',encoding='utf-8')
+            db=str(Path(td)/'m.sqlite3'); calls=[]
+            def run(cmd):
+                calls.append(tuple(cmd))
+                if cmd[0]=='systemctl':
+                    return 'ActiveState=active\nSubState=running\nNRestarts=0\nMainPID=1\n'
+                return '\n'.join(f'LISTEN 0 1 0.0.0.0:{p} 0.0.0.0:* users:(("gost",pid=1,fd=1))' for p in (80,81,82))
+            collect_once(db,td,100,run)
+            self.assertEqual(sum(1 for c in calls if c[:2]==('ss','-H')),1)
+            self.assertEqual(sum(1 for c in calls if c and c[0]=='systemctl'),3)
+
+    def test_concurrent_readers_no_corruption(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td,'iran-1.env').write_text('MAPPINGS=80:80\n',encoding='utf-8'); db=str(Path(td)/'m.sqlite3')
+            errors=[]
+            def run(cmd): return 'ActiveState=active\nSubState=running\nNRestarts=0\nMainPID=1\n' if cmd[0]=='systemctl' else 'LISTEN 0 1 0.0.0.0:80 0.0.0.0:* users:(("gost",pid=1,fd=1))\n'
+            def writer():
+                try:
+                    for i in range(5): collect_once(db,td,200+i,run)
+                except Exception as e: errors.append(e)
+            def reader():
+                try:
+                    for _ in range(20):
+                        c=init_db(db); c.execute('SELECT COUNT(*) FROM metric_points').fetchone(); c.close()
+                except Exception as e: errors.append(e)
+            threads=[threading.Thread(target=writer), threading.Thread(target=reader), threading.Thread(target=reader)]
+            [t.start() for t in threads]; [t.join(5) for t in threads]
+            self.assertTrue(all(not t.is_alive() for t in threads))
+            self.assertEqual(errors, [])
+            c=init_db(db)
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM sample_cycles').fetchone()[0],5)
+            self.assertGreater(c.execute('SELECT COUNT(*) FROM metric_points').fetchone()[0],5)
+
+    def test_daemon_timing_and_signal_stop(self):
+        import monitoring.gost_monitoring as gm
+        calls=[]; mono=[0.0]; wall=[1000.0]
+        clock=gm.Clock(lambda: wall[0], lambda: mono[0])
+        def fake_collect(*args, **kwargs):
+            calls.append(kwargs.copy()); mono[0]+=12.0; wall[0]+=12.0
+            if len(calls)>=2: raise KeyboardInterrupt()
+        old=gm.collect_once
+        gm.collect_once=fake_collect
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                gm.run_daemon('db','env',interval=5,maintenance_interval=60,clock=clock,sleeper=lambda s: mono.__setitem__(0, mono[0] + s))
+        finally:
+            gm.collect_once=old
+        self.assertFalse(calls[0]['overrun'])
+        self.assertTrue(calls[1]['overrun'])
+        self.assertEqual(calls[1]['missed_deadlines'],1)
+
 if __name__ == '__main__': unittest.main()
