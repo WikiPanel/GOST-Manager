@@ -1,57 +1,95 @@
 #!/usr/bin/env python3
-import tempfile
-import unittest
+import os, sqlite3, tempfile, threading, time, unittest
 from pathlib import Path
 
-from monitoring.gost_monitoring import (
-    MetricSample, Tunnel, apply_retention, collect_sample, discover_tunnels,
-    init_db, insert_sample, parse_mappings, tunnel_from_env, upsert_tunnel,
-)
+from monitoring.gost_monitoring import *
 
 class MonitoringTests(unittest.TestCase):
-    def test_parses_legacy_env_without_mutating_it(self):
+    def test_production_mappings_and_no_mutation(self):
         with tempfile.TemporaryDirectory() as td:
-            env = Path(td) / "iran-1.env"
-            env.write_text("PORT_MAPPINGS=80:8080,2052:2052\nGOST_USER=a\n", encoding="utf-8")
-            tunnel = tunnel_from_env(env)
-            self.assertEqual(tunnel.tunnel_id, "iran-1")
-            self.assertEqual(tunnel.listen_ports, (80, 2052))
-            self.assertEqual(tunnel.target_ports, (8080, 2052))
-            self.assertIn("PORT_MAPPINGS=80:8080", env.read_text(encoding="utf-8"))
+            env=Path(td)/'iran-1.env'; env.write_text('MAPPINGS=80:8080,2052:2052\nKHAREJ_IP=198.51.100.20\nGOST_PASS=12345\n',encoding='utf-8')
+            before=env.read_text(); t=tunnel_from_env(env)
+            self.assertEqual(t.listen_ports,(80,2052)); self.assertEqual(t.target_ports,(8080,2052)); self.assertEqual(env.read_text(), before)
 
-    def test_discovers_only_numbered_gost_env_files(self):
+    def test_production_tunnel_port_not_socks_port(self):
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "iran-1.env").write_text("PORT_MAPPINGS=443:443\n", encoding="utf-8")
-            Path(td, "notes.env").write_text("PORT=1\n", encoding="utf-8")
-            self.assertEqual([t.tunnel_id for t in discover_tunnels(td)], ["iran-1"])
+            env=Path(td)/'kharej-2.env'; env.write_text('TUNNEL_PORT=28420\nSOCKS_PORT=9999\nIRAN_IP=203.0.113.77\n',encoding='utf-8')
+            self.assertEqual(tunnel_from_env(env).listen_ports,(28420,))
 
-    def test_sqlite_schema_samples_retention_and_rollups(self):
+    def test_credentials_ips_not_detected_as_ports_and_legacy_keys_rejected(self):
         with tempfile.TemporaryDirectory() as td:
-            conn = init_db(str(Path(td) / "m.sqlite3"))
-            env = Path(td) / "kharej-2.env"
-            env.write_text("SOCKS_PORT=28420\n", encoding="utf-8")
-            tunnel = tunnel_from_env(env)
-            upsert_tunnel(conn, tunnel, 1_000_000)
-            insert_sample(conn, MetricSample("kharej-2", 1_000_000 - 8 * 24 * 3600, 1, 1, 2, 1, 1, 0))
-            insert_sample(conn, MetricSample("kharej-2", 1_000_000, 1, 1, 3, 1, 0, 0))
-            apply_retention(conn, 1_000_000)
-            conn.commit()
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0], 1)
-            self.assertGreater(conn.execute("SELECT COUNT(*) FROM metric_rollups").fetchone()[0], 0)
+            env=Path(td)/'iran-1.env'; env.write_text('PORT_MAPPINGS=443:443\nTOKEN=65535\nIP=1.2.3.4\n',encoding='utf-8')
+            with self.assertRaises(ValueError): tunnel_from_env(env)
+            env.write_text('MAPPINGS=443:443\nTOKEN=65535\nIP=1.2.3.4\n',encoding='utf-8')
+            self.assertEqual(tunnel_from_env(env).listen_ports,(443,))
 
-    def test_collect_sample_is_deterministic_with_runner(self):
-        tunnel = Tunnel("iran", 3, "gost-iran-3.service", "/tmp/iran-3.env", (80, 2052), (80, 2052))
-        def runner(cmd):
-            if cmd[0] == "systemctl":
-                return "ActiveState=active\nSubState=running\nNRestarts=4\n"
-            return "LISTEN 0 4096 0.0.0.0:80 0.0.0.0:*\n"
-        sample = collect_sample(tunnel, now=123, runner=runner)
-        self.assertEqual(sample.restart_count, 4)
-        self.assertEqual(sample.listen_ports_up, 1)
-        self.assertEqual(sample.configured_mappings_total, 2)
+    def test_malformed_env_isolation_structured_event(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td,'iran-1.env').write_text('MAPPINGS=80:80\n',encoding='utf-8')
+            Path(td,'kharej-1.env').write_text('TUNNEL_PORT=99999\n',encoding='utf-8')
+            tunnels, events=discover_tunnels(td)
+            self.assertEqual([t.tunnel_id for t in tunnels], ['iran-1'])
+            self.assertEqual(events[0].code, 'env_parse_error')
 
-    def test_parse_mappings_ignores_invalid_fragments(self):
-        self.assertEqual(parse_mappings("bad,80:443,0:1,65536:1"), ((80, 443),))
+    def test_ipv4_ipv6_listener_and_remote_rejection(self):
+        text='''tcp LISTEN 0 128 0.0.0.0:80 0.0.0.0:* users:(("gost",pid=9,fd=4))\ntcp ESTAB 0 0 10.0.0.1:111 8.8.8.8:443\ntcp LISTEN 0 128 [::1]:2052 [::]:* users:(("gost",pid=10,fd=5))\n'''
+        rows=parse_ss_listeners(text)
+        self.assertEqual([r['port'] for r in rows], [80,2052])
+        t=Tunnel('iran',1,'gost-iran-1.service','x',(80,443,2052),(80,443,2052))
+        def run(cmd): return 'ActiveState=active\nSubState=running\nNRestarts=1\n' if cmd[0]=='systemctl' else text
+        s=collect_sample(t,1,run); self.assertEqual(s.listen_ports_up,2)
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_db_wal_busy_timeout_and_v1_migration(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3'); c=sqlite3.connect(db); c.executescript(CREATE_SCHEMA); c.close()
+            conn=init_db(db)
+            self.assertEqual(conn.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
+            self.assertEqual(conn.execute('PRAGMA busy_timeout').fetchone()[0], 30000)
+            self.assertEqual(conn.execute('PRAGMA foreign_keys').fetchone()[0], 1)
+            self.assertEqual(conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0], 2)
+
+    def test_concurrent_collect_query(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td,'iran-1.env').write_text('MAPPINGS=80:80\n',encoding='utf-8'); db=str(Path(td)/'m.sqlite3')
+            def run(cmd): return 'ActiveState=active\nSubState=running\nNRestarts=0\n' if cmd[0]=='systemctl' else 'tcp LISTEN 0 1 0.0.0.0:80 0.0.0.0:* users:(("gost",pid=1,fd=1))\n'
+            th=threading.Thread(target=lambda: [collect_once(db,td,100+i,run) for i in range(3)]); th.start()
+            conn=init_db(db); [conn.execute('SELECT COUNT(*) FROM metric_samples').fetchone() for _ in range(3)]; th.join()
+
+    def test_counter_delta_reset_gap_cpu_network_interface_loopback(self):
+        self.assertEqual(counter_delta(100,160,5).rate, 12)
+        self.assertTrue(counter_delta(200,100,5).reset)
+        self.assertTrue(counter_delta(100,160,20,12.5).gap)
+        with tempfile.TemporaryDirectory() as td:
+            proc=Path(td); (proc/'net').mkdir(parents=True); (proc/'sys/net/netfilter').mkdir(parents=True); (proc/'sys/fs').mkdir(parents=True)
+            (proc/'stat').write_text('cpu  1 2 3 4 5 6 7 8 0 0\n'); (proc/'loadavg').write_text('0.1 0.2 0.3 1/2 3\n')
+            (proc/'meminfo').write_text('MemTotal: 1000 kB\nMemAvailable: 400 kB\n')
+            (proc/'net/dev').write_text('Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\nlo: 10 1 0 0 0 0 0 0 20 2 0 0 0 0 0 0\neth0: 100 10 0 0 0 0 0 0 200 20 0 0 0 0 0 0\n')
+            (proc/'sys/fs/file-nr').write_text('1 0 10\n'); (proc/'sys/fs/file-max').write_text('10\n')
+            m,_=collect_host_metrics(proc,[Path('/')]); scopes=[x.scope for x in m]
+            self.assertIn('net.loopback', scopes); self.assertIn('net.external', scopes); self.assertIn('unavailable', [x.quality for x in m])
+
+    def test_rollups_retention_boundaries_and_rerun(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn=init_db(str(Path(td)/'m.sqlite3')); upsert_tunnel(conn,Tunnel('iran',1,'gost-iran-1.service','x',(80,),(80,)),0)
+            sid=insert_sample(conn,MetricSample('iran-1',60,1,1,0,1,1,1)); insert_metric(conn,sid,Metric('t','x',2,'count','exact'))
+            sid=insert_sample(conn,MetricSample('iran-1',119,1,1,0,1,1,1)); insert_metric(conn,sid,Metric('t','x',4,'count','exact'))
+            rollup_completed_minutes(conn,180); rollup_completed_minutes(conn,180)
+            self.assertEqual(conn.execute('SELECT samples,avg_value FROM minute_rollups WHERE minute_start=60').fetchone(), (2,3.0))
+            old=10_000_000-RAW_RETENTION_SECONDS-1; insert_sample(conn,MetricSample('iran-1',old,1,1,0,1,1,1)); conn.execute("INSERT OR REPLACE INTO minute_rollups(scope,name,minute_start,samples,unavailable_count,coverage,unit,quality) VALUES('a','b',?,?,?,?,?,?)", (10_000_000-ROLLUP_RETENTION_SECONDS-60,1,0,1,'x','exact'))
+            apply_retention(conn,10_000_000)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM metric_samples WHERE collected_at=?',(old,)).fetchone()[0],0)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM minute_rollups WHERE minute_start<?',(10_000_000-ROLLUP_RETENTION_SECONDS,)).fetchone()[0],0)
+
+    def test_structured_events_self_metrics_optional_sources_scheduler_pid_replacement(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td,'bad-1.env').write_text('X=1\n'); Path(td,'iran-1.env').write_text('MAPPINGS=80:80\n')
+            db=str(Path(td)/'m.sqlite3')
+            collect_once(db,td,100,lambda cmd: 'ActiveState=active\nSubState=running\nNRestarts=0\nMainPID=1\n' if cmd[0]=='systemctl' else '')
+            conn=init_db(db)
+            self.assertGreater(conn.execute("SELECT COUNT(*) FROM metrics WHERE scope='collector'").fetchone()[0],0)
+            self.assertEqual(scheduler_ticks(0,5,[1,8,1]), [0,5,15])
+            props1=parse_systemd_properties('MainPID=1\nExecMainStartTimestampMonotonic=10\n')
+            props2=parse_systemd_properties('MainPID=2\nExecMainStartTimestampMonotonic=20\n')
+            self.assertNotEqual((props1['MainPID'],props1['ExecMainStartTimestampMonotonic']),(props2['MainPID'],props2['ExecMainStartTimestampMonotonic']))
+
+if __name__ == '__main__': unittest.main()
