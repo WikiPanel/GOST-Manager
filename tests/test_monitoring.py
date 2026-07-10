@@ -6,7 +6,7 @@ from monitoring.gost_monitoring import (
     CREATE_SCHEMA, RAW_RETENTION_SECONDS, ROLLUP_RETENTION_SECONDS, Metric,
     MetricSample, Tunnel, apply_retention, collect_once, collect_host_metrics, collect_sample,
     counter_delta, discover_tunnels, init_db, insert_metric, insert_sample, listener_quality,
-    parse_ss_listeners, parse_systemd_properties, quality_worst,
+    parse_ss_listeners, parse_systemd_properties, quality_worst, open_runtime_database, _cycle, record_cycle_overrun,
     rollup_completed_minutes, scheduler_ticks, tunnel_from_env, upsert_tunnel,
 )
 
@@ -451,3 +451,60 @@ class BrokenCommit:
     def commit(self): raise RuntimeError('commit')
     def rollback(self): return self.conn.rollback()
     def close(self): return self.conn.close()
+
+class MonitoringRuntimeSeparationTests(unittest.TestCase):
+    def test_runtime_open_healthy_v4_avoids_migration_work(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3')
+            conn=init_db(db)
+            cid=conn.execute("INSERT INTO sample_cycles(collected_at,monotonic_started,monotonic_finished,duration_seconds,success,overrun) VALUES(700,0,1,1,1,0)").lastrowid
+            sid=insert_sample(conn,MetricSample(None,700,1,1,0,0,0,0),cid)
+            for i in range(3000):
+                insert_metric(conn,sid,Metric('host',f'm{i}',i,'count','exact',entity_type='host',entity_id='local'),cid,700)
+            conn.commit(); conn.close()
+            traced=[]
+            old=sqlite3.connect
+            def traced_connect(*args, **kwargs):
+                c=old(*args, **kwargs)
+                c.set_trace_callback(lambda sql: traced.append(sql.upper()))
+                return c
+            sqlite3.connect=traced_connect
+            try:
+                c=open_runtime_database(db); c.close()
+                c=open_runtime_database(db); c.close()
+            finally:
+                sqlite3.connect=old
+            forbidden=('CREATE TABLE','ALTER TABLE','DROP TABLE','DROP VIEW','FOREIGN_KEY_CHECK','DELETE FROM METRIC_SAMPLES')
+            self.assertFalse([sql for sql in traced if any(f in sql for f in forbidden)])
+            self.assertFalse([sql for sql in traced if 'COUNT(*)' in sql])
+
+    def test_deadline_boundary_calculation(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3'); init_db(db).close()
+            for ts,finish,expected in ((800,5.000,(0,0,0.0)),(801,5.001,(1,1,0.001)),(802,12.000,(1,2,7.0))):
+                conn=open_runtime_database(db); conn.execute('BEGIN IMMEDIATE'); _cycle(conn,ts,0,finish,finish,True,False); conn.commit(); conn.close()
+                record_cycle_overrun(db,ts,finish,0.0,5.0)
+                row=open_runtime_database(db).execute('SELECT overrun,missed_deadlines,overrun_seconds FROM sample_cycles WHERE collected_at=?',(ts,)).fetchone()
+                self.assertEqual(row[0],expected[0]); self.assertEqual(row[1],expected[1]); self.assertAlmostEqual(row[2],expected[2],places=3)
+
+    def test_old_v3_tunnel_scope_precedence_with_empty_labels(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=str(Path(td)/'m.sqlite3'); c=sqlite3.connect(db)
+            c.executescript('''
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL); INSERT INTO schema_migrations VALUES(3,3);
+            CREATE TABLE sample_cycles(cycle_id INTEGER PRIMARY KEY AUTOINCREMENT, collected_at INTEGER NOT NULL UNIQUE, monotonic_started REAL NOT NULL, monotonic_finished REAL NOT NULL, duration_seconds REAL NOT NULL, success INTEGER NOT NULL, overrun INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE entities(entity_pk INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, display_name TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', updated_at INTEGER NOT NULL, UNIQUE(entity_type,entity_id));
+            CREATE TABLE tunnels(tunnel_id TEXT PRIMARY KEY, entity_pk INTEGER REFERENCES entities(entity_pk) ON DELETE SET NULL, side TEXT NOT NULL CHECK(side IN('iran','kharej')), tunnel_number INTEGER NOT NULL, service_name TEXT NOT NULL UNIQUE, env_path TEXT NOT NULL, listen_ports_json TEXT NOT NULL DEFAULT '[]', target_ports_json TEXT NOT NULL DEFAULT '[]', updated_at INTEGER NOT NULL, UNIQUE(side,tunnel_number));
+            CREATE TABLE metric_samples(sample_id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL REFERENCES sample_cycles(cycle_id) ON DELETE CASCADE, tunnel_id TEXT REFERENCES tunnels(tunnel_id) ON DELETE CASCADE, collected_at INTEGER NOT NULL, service_state INTEGER NOT NULL DEFAULT 0, service_substate INTEGER NOT NULL DEFAULT 0, restart_count INTEGER NOT NULL DEFAULT 0, listen_ports_total INTEGER NOT NULL DEFAULT 0, listen_ports_up INTEGER NOT NULL DEFAULT 0, configured_mappings_total INTEGER NOT NULL DEFAULT 0, rx_bytes INTEGER, tx_bytes INTEGER, UNIQUE(cycle_id,tunnel_id));
+            CREATE TABLE metric_points(point_id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL REFERENCES sample_cycles(cycle_id) ON DELETE CASCADE, entity_pk INTEGER NOT NULL REFERENCES entities(entity_pk) ON DELETE CASCADE, metric_name TEXT NOT NULL, ts INTEGER NOT NULL, numeric_value REAL, text_value TEXT, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), reset INTEGER NOT NULL DEFAULT 0, gap INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE metrics(sample_id INTEGER NOT NULL REFERENCES metric_samples(sample_id) ON DELETE CASCADE, scope TEXT NOT NULL, name TEXT NOT NULL, value REAL, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), labels_json TEXT NOT NULL DEFAULT '{}');
+            CREATE TABLE minute_rollups(entity_pk INTEGER NOT NULL REFERENCES entities(entity_pk) ON DELETE CASCADE, metric_name TEXT NOT NULL, minute_start INTEGER NOT NULL, samples INTEGER NOT NULL, expected_samples INTEGER NOT NULL, min_value REAL, avg_value REAL, max_value REAL, unavailable_count INTEGER NOT NULL, reset_count INTEGER NOT NULL DEFAULT 0, gap_count INTEGER NOT NULL DEFAULT 0, coverage REAL NOT NULL, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), PRIMARY KEY(entity_pk,metric_name,minute_start));
+            CREATE TABLE events(event_id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, severity TEXT NOT NULL, code TEXT NOT NULL, message TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}'); CREATE TABLE collector_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO sample_cycles VALUES(1,900,0,1,1,1,0); INSERT INTO entities VALUES(1,'tunnel','iran-1','iran-1','{}',900);
+            INSERT INTO metric_samples(sample_id,cycle_id,tunnel_id,collected_at) VALUES(1,1,NULL,900);
+            INSERT INTO metric_points(cycle_id,entity_pk,metric_name,ts,numeric_value,unit,quality) VALUES(1,1,'listen_ports_up',900,1,'count','exact');
+            INSERT INTO metrics VALUES(1,'tunnel.iran-1','listen_ports_up',2,'count','exact','{}');
+            '''); c.commit(); c.close()
+            conn=init_db(db)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM metric_points WHERE metric_name='listen_ports_up'").fetchone()[0],1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type='tunnel' AND entity_id='iran-1'").fetchone()[0],1)

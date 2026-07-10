@@ -220,6 +220,12 @@ def _ensure_entity(conn: sqlite3.Connection, entity_type: str, entity_id: str, d
 
 
 def _legacy_metric_entity(scope: str, labels: dict[str, object]) -> tuple[str, str]:
+    if scope.startswith("tunnel."):
+        return "tunnel", scope.removeprefix("tunnel.")
+    if scope.startswith("service."):
+        return "service", scope.removeprefix("service.")
+    if scope.startswith("route."):
+        return "route", scope.removeprefix("route.")
     if "interface" in labels:
         iface = str(labels["interface"])
         return "interface", f"interface:{iface}"
@@ -255,7 +261,7 @@ def _dedupe_sample_identities(conn: sqlite3.Connection) -> None:
     )
 
 
-def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -> sqlite3.Connection:
+def migrate_database(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -> sqlite3.Connection:
     conn = connect_db(db_path)
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -362,6 +368,18 @@ def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -
     except Exception:
         conn.rollback()
         raise
+    return conn
+
+
+def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -> sqlite3.Connection:
+    return migrate_database(db_path, inject_failure)
+
+
+def open_runtime_database(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    conn = connect_db(db_path)
+    if _version(conn) != SCHEMA_VERSION:
+        conn.close()
+        raise RuntimeError("monitoring database requires migration")
     return conn
 
 
@@ -677,10 +695,10 @@ def checkpoint_wal(db_path: str) -> tuple[int, int, int]:
 
 def record_cycle_overrun(db_path: str, ts: int, finished: float, deadline: float, interval: float) -> None:
     overrun_seconds = max(0.0, finished - (deadline + interval))
-    missed = int(max(0.0, finished - deadline) // interval) if interval > 0 else 0
-    if missed <= 0 and overrun_seconds <= 0:
+    if overrun_seconds <= 0:
         return
-    conn = init_db(db_path)
+    missed = int(overrun_seconds // interval) + 1 if interval > 0 else 0
+    conn = open_runtime_database(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
@@ -725,10 +743,12 @@ def _record_checkpoint_result(db_path: str, ts: int, cycle_id: int, sample_id: i
         conn.close()
 
 
-def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Callable[[Sequence[str]], str] = _run, proc: Path = Path("/proc"), clock: Clock = Clock(), maintenance: bool = False, overrun: bool = False, missed_deadlines: int = 0, overrun_seconds: float = 0.0, checkpoint: Callable[[str], tuple[int, int, int]] = checkpoint_wal, maintenance_conn_factory: Callable[[str], sqlite3.Connection] = init_db, checkpoint_event_writer: Callable[[sqlite3.Connection, Event], None] = insert_event, checkpoint_metric_writer: Callable[[sqlite3.Connection, int, Metric, int | None, int | None], None] = insert_metric) -> int:
+def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Callable[[Sequence[str]], str] = _run, proc: Path = Path("/proc"), clock: Clock = Clock(), maintenance: bool = False, overrun: bool = False, missed_deadlines: int = 0, overrun_seconds: float = 0.0, checkpoint: Callable[[str], tuple[int, int, int]] = checkpoint_wal, maintenance_conn_factory: Callable[[str], sqlite3.Connection] = open_runtime_database, checkpoint_event_writer: Callable[[sqlite3.Connection, Event], None] = insert_event, checkpoint_metric_writer: Callable[[sqlite3.Connection, int, Metric, int | None, int | None], None] = insert_metric) -> int:
     ts = int(clock.wall() if now is None else now)
     started = clock.monotonic()
-    conn = init_db(db_path)
+    if not Path(db_path).exists():
+        migrate_database(db_path)
+    conn = open_runtime_database(db_path)
     success = False
     try:
         tunnels, events = discover_tunnels(env_dir, clock)
@@ -803,6 +823,7 @@ def run_daemon(db_path: str, env_dir: str, interval: float = DEFAULT_SAMPLE_INTE
     def _stop(_signum: int, _frame: object) -> None:
         nonlocal stop
         stop = True
+    migrate_database(db_path)
     old_term = signal.signal(signal.SIGTERM, _stop)
     old_int = signal.signal(signal.SIGINT, _stop)
     try:
@@ -831,7 +852,7 @@ def run_daemon(db_path: str, env_dir: str, interval: float = DEFAULT_SAMPLE_INTE
                 print(f"collection failed: {exc}", file=sys.stderr)
             deadline += interval
             current = clock.monotonic()
-            while deadline <= current:
+            while deadline < current:
                 deadline += interval
         return 0
     finally:
@@ -850,6 +871,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.once:
         try:
+            migrate_database(args.db)
             collect_once(args.db, args.env_dir, args.now, maintenance=True)
             return 0
         except Exception as exc:
