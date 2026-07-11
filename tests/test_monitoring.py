@@ -272,24 +272,61 @@ class MonitoringIssue13Tests(unittest.TestCase):
 
     def test_daemon_timing_and_signal_stop(self):
         import monitoring.gost_monitoring as gm
-        calls=[]; sleeps=[]; mono=[0.0]; wall=[1000.0]; stops=[False]
-        clock=gm.Clock(lambda: wall[0], lambda: mono[0])
-        def fake_collect(*args, **kwargs):
-            calls.append(kwargs.copy())
-            mono[0]+=12.0; wall[0]+=12.0
-            return int(wall[0])
-        def fake_record(db, ts, finished, deadline, interval):
-            calls[-1]['recorded']=(ts, finished, deadline, interval)
-            stops[0]=True
-        old_collect, old_record = gm.collect_once, gm.record_cycle_overrun
-        gm.collect_once, gm.record_cycle_overrun = fake_collect, fake_record
-        try:
-            self.assertEqual(gm.run_daemon('db','env',interval=5,maintenance_interval=60,clock=clock,sleeper=lambda s: (sleeps.append(s), mono.__setitem__(0, mono[0] + s)), stop_requested=lambda: stops[0]),0)
-        finally:
-            gm.collect_once, gm.record_cycle_overrun = old_collect, old_record
-        self.assertEqual(len(calls),1)
-        self.assertEqual(calls[0]['recorded'][2],0.0)
-        self.assertEqual(calls[0]['recorded'][3],5)
+        with tempfile.TemporaryDirectory() as td:
+            db_path = str(Path(td) / "m.sqlite3")
+            env_dir = str(Path(td) / "env")
+            Path(env_dir).mkdir()
+
+            calls = []
+            sleeps = []
+            mono = [0.0]
+            wall = [1000.0]
+            stops = [False]
+            clock = gm.Clock(lambda: wall[0], lambda: mono[0])
+
+            def fake_collect(*args, **kwargs):
+                calls.append(kwargs.copy())
+                mono[0] += 12.0
+                wall[0] += 12.0
+                return int(wall[0])
+
+            def fake_record(db, ts, finished, deadline, interval):
+                calls[-1]["recorded"] = (
+                    ts,
+                    finished,
+                    deadline,
+                    interval,
+                )
+                stops[0] = True
+
+            old_collect = gm.collect_once
+            old_record = gm.record_cycle_overrun
+            gm.collect_once = fake_collect
+            gm.record_cycle_overrun = fake_record
+
+            try:
+                self.assertEqual(
+                    gm.run_daemon(
+                        db_path,
+                        env_dir,
+                        interval=5,
+                        maintenance_interval=60,
+                        clock=clock,
+                        sleeper=lambda seconds: (
+                            sleeps.append(seconds),
+                            mono.__setitem__(0, mono[0] + seconds),
+                        ),
+                        stop_requested=lambda: stops[0],
+                    ),
+                    0,
+                )
+            finally:
+                gm.collect_once = old_collect
+                gm.record_cycle_overrun = old_record
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["recorded"][2], 0.0)
+            self.assertEqual(calls[0]["recorded"][3], 5)
 
     def test_retry_same_cycle_is_idempotent(self):
         with tempfile.TemporaryDirectory() as td:
