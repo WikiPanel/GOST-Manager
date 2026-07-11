@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Added an independent read-only monitoring query layer with raw/rollup/hybrid summaries, observational health views, plain and ANSI dashboards, detail/event commands, and bounded atomic JSON/CSV export.
 - Hardened the monitoring collector core for the issue #8 compatibility contract: production `MAPPINGS`/`TUNNEL_PORT` env parsing, SQLite WAL/busy-timeout storage, versioned v1-to-v2 migrations, quality-labelled metrics, structured events, bounded retention, incremental minute rollups, and deterministic collector tests.
 - Completed issue #11 host, network, TCP/IP, storage, service, process, socket, tunnel, and collector-self metric coverage with injectable sources, persistent delta state, and deduplicated transition events.
 - Split the monitoring collector into focused standard-library modules while preserving schema v4 and existing Direct Mode env compatibility.

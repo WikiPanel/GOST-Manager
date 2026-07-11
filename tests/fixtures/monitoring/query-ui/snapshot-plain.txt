@@ -1,0 +1,57 @@
+OVERALL
+status: healthy
+reasons: observations_current
+last successful sample: 1999999998
+sample age: 2s
+database window coverage: current snapshot
+
+HOST
+CPU: 20 [derived]
+RAM: 50 [derived]
+load 1: 0.20 [exact]
+load 5: 0.30 [exact]
+load 15: 0.40 [exact]
+conntrack: 10 [derived]
+file handles: 5 [derived]
+root filesystem: 45
+monitoring filesystem: 35
+
+NETWORK
+external RX: 1000
+external TX: 500
+external RX packets: unavailable
+external TX packets: unavailable
+external RX errors: unavailable
+external TX drops: unavailable
+loopback RX: unavailable
+loopback TX: unavailable
+
+TCP
+established: 4
+SYN-SENT: unavailable
+SYN-RECV: unavailable
+CLOSE-WAIT: unavailable
+TIME-WAIT: unavailable
+retransmit rate: unavailable
+listen drops: unavailable
+listen overflows: unavailable
+
+NGINX / SERVICES
+nginx.service: healthy state=active cpu=2 rss=4096 processes=3 fds=20 listeners=2 sockets=4
+  restarts=0 quality=exact age=2s
+
+TUNNELS
+iran-1: healthy service=gost-iran-1.service listeners=1/1 ownership=1 remote=example.invalid:443
+  remote_sockets=1 cpu=1 rss=2048 fds=8 quality=exact age=2s
+
+COLLECTOR / DATABASE
+cycle: 1
+duration: 0.15
+missed deadlines: 0
+source errors: 0
+database size: 123456
+WAL size: 0
+checkpoint: 1
+
+RECENT EVENTS
+1999999990 info metric_source_available entity=proc_stat: Metric source recovered

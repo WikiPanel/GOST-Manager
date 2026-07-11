@@ -20,17 +20,15 @@ local kernel/systemd/NGINX/GOST observations
       ↓
 /var/lib/gost-manager/metrics.sqlite3
       ↓
-gost-manager Monitoring menu
-      ├── Live dashboard
-      ├── 10-minute summary
-      ├── 30-minute summary
-      ├── 1-hour summary
-      ├── Custom window
-      ├── Detailed service/route view
-      └── JSON/CSV export
+python3 -m monitoring.query_cli
+      ├── plain snapshot / ANSI live dashboard
+      ├── cadence-aware historical summaries
+      ├── host/network/service/tunnel/collector details
+      ├── structured event timeline
+      └── bounded JSON/CSV export
 ```
 
-The collector and query CLI use Python 3 standard library only. Bash remains the menu and orchestration layer.
+The collector and independent query CLI use Python 3 standard library only. Installer, systemd, and Bash-menu integration are intentionally deferred to issue #6.
 
 ## Sampling and retention
 
@@ -274,6 +272,8 @@ A route failover counter is incremented only when the manager/health subsystem c
 
 Initial v0.2 health is observational. It does not rewrite NGINX membership automatically.
 
+The query health policy marks observations stale after 20 seconds. CPU at 80%, memory at 85%, and filesystem, conntrack, or system file handles at 85% produce `degraded` reasons. Filesystem, conntrack, and file handles at 95% produce `critical` only from exact or derived observations. An estimated value can degrade health but cannot independently make it critical. Missing required CPU data, unavailable listener ownership, or unavailable process snapshots produce `unknown`; an exact inactive service or exact missing tunnel listener can produce `down`. Each result includes stable reason codes, readable reasons, evaluation time, observation age, semantic quality, and affected entity. Health evaluation never starts, stops, or restarts a service and never changes NGINX, GOST, firewall, routes, or env files.
+
 ## Live dashboard
 
 The live view refreshes in place and includes a compact summary:
@@ -307,6 +307,40 @@ Views include:
 - per-route summary;
 - event timeline for restarts, health transitions, config changes, and sampling gaps.
 
+### Query CLI
+
+Every command accepts `--db`; the default is `/var/lib/gost-manager/metrics.sqlite3`.
+
+```bash
+python3 -m monitoring.query_cli snapshot
+python3 -m monitoring.query_cli live --refresh 2
+python3 -m monitoring.query_cli summary --window 10m
+python3 -m monitoring.query_cli summary --start 2026-07-11T10:00:00Z --end 2026-07-11T11:00:00Z
+python3 -m monitoring.query_cli host --window 30m
+python3 -m monitoring.query_cli network --window 30m
+python3 -m monitoring.query_cli services --window 30m
+python3 -m monitoring.query_cli service nginx.service --window 30m
+python3 -m monitoring.query_cli tunnels --window 1h
+python3 -m monitoring.query_cli tunnel iran-1 --window 1h
+python3 -m monitoring.query_cli collector --window 1h
+python3 -m monitoring.query_cli events --window 1h --severity warning,error
+python3 -m monitoring.query_cli export --window 1h --format json --granularity auto --output -
+```
+
+Durations must be an integer followed by `s`, `m`, `h`, or `d`, such as `90s`, `15m`, `2h`, or `2d`. Zero, negative, ambiguous, overflowing, future-only, and greater-than-30-day windows are rejected. Absolute `--start` and `--end` must be supplied together and must include `Z` or an explicit UTC offset. Results retain both the requested and effective window and mark retention truncation.
+
+The shared planner reads `metric_points` for windows wholly inside 48-hour raw retention, `minute_rollups` for older retained windows, and a non-overlapping `hybrid` combination across that boundary. The raw side begins at the first complete minute after the cutoff so a minute is never counted twice. Coverage remains visible if that conservative boundary leaves a gap. Expected samples use `collector_state.metric_cadence_seconds`, including 5-second fast, 30-second full-socket, and 60-second slow families; unknown families use the collector's 5-second default.
+
+Raw numeric averages are piecewise-constant and weighted by observed duration. A seed before the window is accepted only within 2.5 cadence intervals, and no value is carried across a larger gap. Raw p95 uses deterministic weighted nearest rank: values are ordered, elapsed weights are accumulated, and the first value reaching 95% of covered time is selected. Minute rollups preserve min/max and use covered-time-weighted averages. Rollup-only and hybrid p95 are `unavailable` because minute rows do not retain a distribution. Text/state series are never assigned numeric min/average/max/p95; historical categorical values outside raw retention remain unavailable.
+
+Detailed output exposes unit, semantic quality, sample/expected counts, coverage, unavailable/reset/gap counts, observation age, and source mode. Exit codes are stable: `0` success, `2` invalid input/window or missing selected entity, `3` missing/corrupt/unsupported database, `4` query/export safety limit, and `130` interrupt.
+
+`snapshot` always produces plain text. `live` uses ANSI only on a real TTY; pipes, `TERM=dumb`, `NO_COLOR`, and `--no-color` use plain refreshes. Refresh is bounded to 0.2 through 60 seconds, `--iterations` permits finite runs, terminal width is sampled for each refresh, and cursor state is restored after interrupt, termination, or rendering failure.
+
+### Read-only guarantee
+
+The query layer opens SQLite with `mode=ro`, enables `PRAGMA query_only=ON` and a five-second busy timeout, and validates schema v4 using reads only. It never calls migration, initialization, retention, maintenance, or checkpoint functions and never executes DDL or DML. Each live refresh opens a fresh short read snapshot. Tests inspect SQLite trace output for `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP`, `REPLACE`, `VACUUM`, and `wal_checkpoint` and exercise a concurrent WAL writer.
+
 ## Events and audit trail
 
 A separate event table stores bounded, structured events:
@@ -325,17 +359,18 @@ Events contain identifiers and safe diagnostics, never credentials.
 
 ## Export
 
-Exports support JSON and CSV for a selected time window and entity scope. Every export includes:
+Exports support `summary`, `raw`, `minute`, and `auto` granularity with exact entity and metric filters. `auto` uses raw data for a recent small window and otherwise follows the raw/rollup/hybrid planner. JSON metadata includes:
 
-- schema version;
-- node ID;
-- UTC time range;
-- sample interval;
-- metric quality labels;
-- coverage metadata;
-- units.
+- export and database schema versions;
+- UTC Unix generation time;
+- requested and effective windows;
+- source mode and selected granularity;
+- filters and retention policy;
+- row count and truncation state.
 
-Secret state is never included in monitoring export.
+Rows include entity identity, metric, timestamp or minute start, numeric/text value, unit, quality, reset/gap markers, and rollup coverage fields. CSV uses the fixed header documented by `monitoring.exporters.CSV_FIELDS`. Windows are capped at 30 days, query series at 5,000, and estimated and actual export rows at 100,000. The estimate is checked before an output file is created. Rows are fetched in bounded batches; files use a same-directory temporary file, mode `0600`, atomic replace, and temporary cleanup on failure. `--output -` streams to stdout.
+
+Exports read only the sanitized metric/entity tables and never raw env files or arbitrary collector state. Keys and text matching credential, username, password, token, authorization, or secret forms are removed or redacted as a second defense. Secret-canary fixtures verify that these values do not appear in JSON or CSV.
 
 ## Performance guardrails
 
