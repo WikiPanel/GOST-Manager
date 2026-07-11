@@ -1,0 +1,7 @@
+Name:	nginx
+State:	S (sleeping)
+Pid:	3131
+VmRSS:	400 kB
+RssAnon:	300 kB
+RssFile:	100 kB
+Threads:	1

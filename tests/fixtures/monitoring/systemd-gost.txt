@@ -1,0 +1,12 @@
+ActiveState=active
+SubState=running
+MainPID=4242
+ExecMainStartTimestampMonotonic=1000000
+NRestarts=2
+TasksCurrent=4
+MemoryCurrent=8388608
+MemoryPeak=12582912
+ControlGroup=/system.slice/gost-iran-1.service
+IPAccounting=yes
+IPIngressBytes=100000
+IPEgressBytes=200000

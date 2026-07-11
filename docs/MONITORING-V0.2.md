@@ -39,6 +39,7 @@ Defaults:
 - sample interval: 5 seconds;
 - raw sample retention: 48 hours;
 - one-minute rollup retention: 30 days;
+- structured event retention: 30 days;
 - cleanup interval: 15 minutes;
 - maximum tolerated missed-sample gap before coverage is marked incomplete: 2.5 sample intervals.
 
@@ -167,12 +168,14 @@ Services include NGINX and every managed `gost-*` unit.
 Sources: systemd properties, cgroup files, `/proc/<pid>`, and local status endpoints.
 
 - active/sub state;
-- main PID and start time;
+- main PID and start time as systemd identity metadata;
+- authoritative service process count from `cgroup.procs`;
 - restart count;
-- CPU time and derived CPU percentage;
-- RSS, anonymous memory, file cache where available;
-- task/thread count;
-- open file-descriptor count and limit;
+- CPU time and derived CPU percentage aggregated across the cgroup PID set;
+- aggregate RSS, anonymous memory, file cache where available;
+- aggregate task/thread count;
+- aggregate open file-descriptor count and limits;
+- `established_sockets_total` across every authoritative service PID, without claiming that every socket is a remote tunnel leg;
 - cgroup memory/current and peak where available;
 - listener ownership;
 - recent unit failures;
@@ -226,6 +229,8 @@ For every managed tunnel:
 - process CPU/RSS/tasks/FDs;
 - unit IP-accounting counters when available;
 - restart count and recent errors.
+
+`established_remote_sockets` is exact only when the configured Kharej endpoint is a numeric IP and port, the full socket snapshot is authoritative, and socket ownership can be correlated to the service cgroup PID set. Hostname endpoints or missing PID attribution are reported as unavailable. Cached values between full snapshots are identity-bound and labelled estimated.
 
 ### Bytes and throughput attribution
 
@@ -342,6 +347,35 @@ Secret state is never included in monitoring export.
 - Collector CPU, RSS, database write latency, sample duration, and missed deadlines are themselves monitored.
 - A collector overrun skips or delays monitoring work; it never applies backpressure to traffic services.
 
+### Representative storage budget
+
+The planning profile is one NGINX unit with one master and two workers plus six managed GOST services. It assumes five-second fast samples, 30-second full socket snapshots, 60-second FD/limit/filesystem samples, 48-hour raw retention, 30-day minute-rollup retention, and an explicit 30-day structured-event retention policy.
+
+The current metric-family model, measured with deterministic fixtures for that exact service profile, records 522 points per fast cycle, 9 additional points per full socket cycle, and 52 additional points per slow cycle. The completed-minute rollup has approximately 583 metric series. The resulting retained row counts are:
+
+- 9,120,960 metric points per day;
+- 18,241,920 raw metric points over 48 hours;
+- 25,185,600 minute-rollup rows over 30 days;
+- 34,560 `sample_cycles` rows and 241,920 `metric_samples` rows over 48 hours;
+- 150,000 retained event rows at 5,000 deduplicated events per day over the independent 30-day event window, plus 2,048 entity rows.
+
+The deterministic capacity estimate uses 128 bytes per raw metric row and 160 bytes per minute-rollup row before indexes. It reserves 128 bytes per sample-cycle row, 192 bytes per metric-sample row, and 512 bytes per event or entity row. Small schema, tunnel, and collector-state tables are covered by the entity allowance and the free-page factor. It then adds 50 percent of table bytes for SQLite primary-key and secondary indexes, B-tree fill variance, and reusable free pages, followed by 20 percent for WAL growth, checkpoints, and operational headroom.
+
+Under those conservative assumptions the estimated occupancy is:
+
+- 2.17 GiB for the raw `metric_points` table;
+- 3.75 GiB for the `minute_rollups` table;
+- 0.12 GiB for `sample_cycles`, `metric_samples`, events, and entities;
+- 3.02 GiB for indexes and free-page overhead;
+- 1.81 GiB for WAL and operational headroom;
+- 10.89 GiB estimated total database footprint.
+
+Operators should reserve at least 12 GiB for the monitoring database under this profile. A 5 GiB reservation is not sufficient once 30-day minute rollups are included. Hosts with more interfaces, disks, services, metric cardinality, or event volume need additional space; reducing raw, rollup, or event retention or reducing metric cardinality lowers the requirement. Maintenance deletes structured events with timestamps older than `EVENT_RETENTION_SECONDS`; events exactly at the cutoff remain. `EVENT_RETENTION_SECONDS` is an explicit 30-day policy and does not alias the rollup-retention constant.
+
+Process CPU/stat and aggregate RSS/thread observations remain on the fast cadence. `/proc/<pid>/fd`, process limits, cgroup file memory, filesystem capacity, and database-size observations use the slow cadence. A service PID set comes from `cgroup.procs`; MainPID fallback totals are estimated rather than exact. Only a complete authoritative cgroup PID set plus complete fast process snapshots advances process-set transition state. A missing fast snapshot makes process metrics unavailable for that cycle without emitting `pid_replaced`, and non-authoritative MainPID fallback never overwrites the last authoritative identity. Identity-bound socket and slow-process caches are neither read nor replaced when the current identity cannot be confirmed. Inactive historical source-error keys are retained for at most 48 hours and capped at 64 keys, while the global error total remains cumulative.
+
+The deterministic performance suite parses and attributes a synthetic 20,000-row socket snapshot within the five-second cycle budget and verifies that a synthetic 10,000-entry FD directory is enumerated once, not six times, across six five-second cycles.
+
 ## Acceptance tests
 
 - Live view works with NGINX absent, GOST absent, and both present.
@@ -356,8 +390,27 @@ Secret state is never included in monitoring export.
 
 ## Issue #8 collector-core contract status
 
-The accepted collector core uses `/var/lib/gost-manager/metrics.sqlite3` by default and samples every 5 seconds.  It uses `time.monotonic()` scheduling primitives, explicit SQLite sample transactions, WAL mode, busy timeout, foreign keys, 48-hour raw retention, 30-day one-minute rollup retention, and 15-minute maintenance cadence.
+The accepted collector core uses `/var/lib/gost-manager/metrics.sqlite3` by default and samples every 5 seconds.  It uses `time.monotonic()` scheduling primitives, explicit SQLite sample transactions, WAL mode, busy timeout, foreign keys, 48-hour raw retention, 30-day one-minute rollup retention, explicit 30-day structured-event retention, and 15-minute maintenance cadence.
 
 Legacy Direct Mode discovery is intentionally narrow.  Iran env files read listen/target ports only from validated `MAPPINGS`; Kharej env files read the listener only from validated `TUNNEL_PORT`.  The collector never scans arbitrary env values, so IP addresses, credentials, UUIDs, and tokens are not treated as ports.  Malformed env files produce structured `env_parse_error` events and do not stop the rest of the collection cycle.  Monitoring does not write to existing env files.
 
 Metric samples store a unit and one of `exact`, `derived`, `estimated`, or `unavailable`.  Optional kernel sources that are missing are stored as NULL/unavailable instead of fake zeroes.  Loopback interface counters are recorded separately from external interface counters.  `/proc/<pid>/io` is not used as a network source.
+
+## Issue #11 metric coverage status
+
+The collector implementation is split into independently testable standard-library modules:
+
+- `models` and `entities` for stable models and secret-safe Direct Mode discovery;
+- `schema` for schema v4 migration, persistence, retention, rollups, and WAL maintenance;
+- `proc_readers` and `network_readers` for host, process, disk, interface, and TCP/IP counters;
+- `systemd_readers` and `socket_readers` for managed-service, cgroup, listener, and connection observations;
+- `event_state` for persisted transition state and deduplicated events;
+- `collector` and `scheduler` for fault-isolated collection and monotonic cadence.
+
+CPU, network, TCP/IP, memory, swap, filesystem, diskstats, conntrack, file-handle, GOST, NGINX, process, cgroup, listener, tunnel, and collector-self metrics now use the quality labels defined above. Counter rates are calculated only from persisted counter deltas and monotonic elapsed time. Reset and gap samples are marked and never converted into negative rates or spikes.
+
+Every filesystem, procfs, command, clock, process, and statvfs source used by the collector is injectable. A failed source or managed entity records unavailable metrics and a source-error counter while unrelated sources continue. Source, service, PID, listener, interface, cycle, maintenance, and checkpoint events are transition-aware, so an unchanged warning is not written every sample.
+
+Socket commands and proc network tables are structurally validated: a successful empty `ss` snapshot is authoritative, while non-empty malformed output is unavailable. Full socket collection stores separate attempt and success timestamps, so a failed heavy snapshot is not retried on every fast cycle. Collector totals include checkpoint duration on maintenance cycles; `metrics_written`, `events_written`, and row-attempt counts remain estimated because checkpoint result persistence occurs after the main sample transaction.
+
+Tunnel metadata may contain only the remote `host:port` endpoint. Env usernames and passwords are not copied into metrics, events, entity metadata, collector state, or test exports.

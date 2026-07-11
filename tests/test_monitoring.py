@@ -3,11 +3,11 @@ import os, sqlite3, tempfile, threading, time, unittest
 from pathlib import Path
 
 from monitoring.gost_monitoring import (
-    CREATE_SCHEMA, RAW_RETENTION_SECONDS, ROLLUP_RETENTION_SECONDS, Metric,
-    MetricSample, Tunnel, apply_retention, collect_once, collect_host_metrics, collect_sample,
-    counter_delta, discover_tunnels, init_db, insert_metric, insert_sample, listener_quality,
+    CREATE_SCHEMA, EVENT_RETENTION_SECONDS, RAW_RETENTION_SECONDS, ROLLUP_RETENTION_SECONDS,
+    Event, Metric, MetricSample, Tunnel, apply_retention, collect_once, collect_host_metrics,
+    collect_sample, counter_delta, discover_tunnels, init_db, insert_event, insert_metric, insert_sample, listener_quality,
     parse_ss_listeners, parse_systemd_properties, quality_worst, open_runtime_database, _cycle, record_cycle_overrun,
-    rollup_completed_minutes, scheduler_ticks, tunnel_from_env, upsert_tunnel,
+    rollup_completed_minutes, run_maintenance, scheduler_ticks, tunnel_from_env, upsert_tunnel,
 )
 
 class MonitoringTests(unittest.TestCase):
@@ -90,6 +90,93 @@ class MonitoringTests(unittest.TestCase):
             apply_retention(conn,10_000_000)
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM metric_samples WHERE collected_at=?',(old,)).fetchone()[0],0)
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM minute_rollups WHERE minute_start<?',(10_000_000-ROLLUP_RETENTION_SECONDS,)).fetchone()[0],0)
+
+    def test_independent_retention_policies_are_bounded_and_idempotent(self):
+        now = 10_000_000
+        raw_cutoff = now - RAW_RETENTION_SECONDS
+        rollup_cutoff = now - ROLLUP_RETENTION_SECONDS
+        event_cutoff = now - EVENT_RETENTION_SECONDS
+        self.assertEqual(RAW_RETENTION_SECONDS, 48 * 3600)
+        self.assertEqual(ROLLUP_RETENTION_SECONDS, 30 * 24 * 3600)
+        self.assertEqual(EVENT_RETENTION_SECONDS, 30 * 24 * 3600)
+
+        with tempfile.TemporaryDirectory() as td:
+            conn = init_db(str(Path(td) / 'm.sqlite3'))
+            upsert_tunnel(
+                conn,
+                Tunnel('iran', 1, 'gost-iran-1.service', 'x', (80,), (80,)),
+                0,
+            )
+            for timestamp, name in (
+                (raw_cutoff - 1, 'expired_raw'),
+                (raw_cutoff, 'retained_raw'),
+            ):
+                sample_id = insert_sample(
+                    conn,
+                    MetricSample('iran-1', timestamp, 1, 1, 0, 1, 1, 1),
+                )
+                insert_metric(
+                    conn,
+                    sample_id,
+                    Metric('retention', name, 1, 'count', 'exact'),
+                )
+            entity_pk = conn.execute(
+                "SELECT entity_pk FROM entities WHERE entity_type='tunnel' "
+                "AND entity_id='iran-1'"
+            ).fetchone()[0]
+            for minute_start, name in (
+                (rollup_cutoff - 60, 'expired_rollup'),
+                (rollup_cutoff, 'retained_rollup'),
+            ):
+                conn.execute(
+                    "INSERT INTO minute_rollups(entity_pk,metric_name,minute_start,"
+                    "samples,expected_samples,unavailable_count,coverage,unit,quality) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (entity_pk, name, minute_start, 1, 1, 0, 1.0, 'count', 'exact'),
+                )
+            insert_event(
+                conn,
+                Event(event_cutoff - 1, 'info', 'expired_event', 'expired'),
+            )
+            insert_event(
+                conn,
+                Event(event_cutoff, 'info', 'retained_event', 'retained'),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO collector_state(key,value) VALUES(?,?)",
+                ('minute_rollup_watermark', str((now // 60) * 60)),
+            )
+
+            def retained_state():
+                return (
+                    conn.execute(
+                        "SELECT collected_at FROM metric_samples ORDER BY collected_at"
+                    ).fetchall(),
+                    conn.execute(
+                        "SELECT ts FROM metric_points ORDER BY ts"
+                    ).fetchall(),
+                    conn.execute(
+                        "SELECT minute_start FROM minute_rollups ORDER BY minute_start"
+                    ).fetchall(),
+                    conn.execute(
+                        "SELECT ts,code FROM events ORDER BY ts"
+                    ).fetchall(),
+                )
+
+            conn.execute('BEGIN IMMEDIATE')
+            run_maintenance(conn, now)
+            conn.commit()
+            first = retained_state()
+            conn.execute('BEGIN IMMEDIATE')
+            run_maintenance(conn, now)
+            conn.commit()
+            second = retained_state()
+
+            self.assertEqual(first, second)
+            self.assertEqual(first[0], [(raw_cutoff,)])
+            self.assertEqual(first[1], [(raw_cutoff,)])
+            self.assertEqual(first[2], [(rollup_cutoff,)])
+            self.assertEqual(first[3], [(event_cutoff, 'retained_event')])
 
     def test_structured_events_self_metrics_optional_sources_scheduler_pid_replacement(self):
         with tempfile.TemporaryDirectory() as td:
@@ -245,8 +332,8 @@ class MonitoringIssue13Tests(unittest.TestCase):
                     return 'ActiveState=active\nSubState=running\nNRestarts=0\nMainPID=1\n'
                 return '\n'.join(f'LISTEN 0 1 0.0.0.0:{p} 0.0.0.0:* users:(("gost",pid=1,fd=1))' for p in (80,81,82))
             collect_once(db,td,100,run)
-            self.assertEqual(sum(1 for c in calls if c[:2]==('ss','-H')),1)
-            self.assertEqual(sum(1 for c in calls if c and c[0]=='systemctl'),3)
+            self.assertEqual(sum(1 for c in calls if c[:2]==('ss','-H')),2)
+            self.assertEqual(sum(1 for c in calls if c and c[0]=='systemctl'),4)
 
     def test_concurrent_readers_no_corruption(self):
         with tempfile.TemporaryDirectory() as td:

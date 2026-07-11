@@ -1,0 +1,12 @@
+ActiveState=active
+SubState=running
+MainPID=3131
+ExecMainStartTimestampMonotonic=900000
+NRestarts=1
+TasksCurrent=3
+MemoryCurrent=16777216
+MemoryPeak=33554432
+ControlGroup=/system.slice/nginx.service
+IPAccounting=no
+IPIngressBytes=[not set]
+IPEgressBytes=[not set]
