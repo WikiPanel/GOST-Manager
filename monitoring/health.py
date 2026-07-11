@@ -23,6 +23,61 @@ class HealthPolicy:
     recent_event_seconds: int = 3600
 
 
+def _required_services(snapshot: dict[str, object]) -> set[str]:
+    required: set[str] = set()
+    for entity in snapshot.get("entities", []):
+        if not isinstance(entity, dict):
+            continue
+        metadata = entity.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if entity.get("entity_type") == "tunnel" and metadata.get("service"):
+            required.add(str(metadata["service"]))
+        if (
+            entity.get("entity_type") == "service"
+            and metadata.get("gateway_required") is True
+        ):
+            required.add(str(entity.get("entity_id", "")))
+    return required
+
+
+def _unavailable(metric: dict[str, object] | None) -> bool:
+    return (
+        metric is None
+        or metric.get("quality") == "unavailable"
+        or bool(metric.get("stale"))
+    )
+
+
+def _required_event_codes(
+    snapshot: dict[str, object],
+    now: int,
+    policy: HealthPolicy,
+) -> set[str]:
+    required_services = _required_services(snapshot)
+    codes: set[str] = set()
+    for event in snapshot.get("health_events", snapshot.get("events", [])):
+        if not isinstance(event, dict) or now - int(event.get("ts", 0)) > policy.recent_event_seconds:
+            continue
+        details = event.get("details")
+        details = details if isinstance(details, dict) else {}
+        service = str(details.get("service", ""))
+        source = str(details.get("source", ""))
+        if service and service not in required_services:
+            continue
+        if "nginx.service" in source and "nginx.service" not in required_services:
+            continue
+        if event.get("code") == "metric_source_unavailable" and source:
+            required_host_sources = {"proc_stat", "proc_meminfo", "filesystem:/"}
+            required_service_source = any(
+                required in source for required in required_services
+            )
+            if source not in required_host_sources and not required_service_source:
+                continue
+        codes.add(str(event.get("code", "")))
+    return codes
+
+
 def _metric_map(snapshot: dict[str, object]) -> dict[tuple[str, str, str], dict[str, object]]:
     result: dict[tuple[str, str, str], dict[str, object]] = {}
     for raw in snapshot.get("metrics", []):
@@ -124,15 +179,15 @@ def evaluate_node(
         metrics.get(("host", "local", "memory_used_percent")),
         metrics.get(("filesystem", "fs:/", "filesystem_used_percent")),
     )
-    if any(metric is None or metric.get("quality") == "unavailable" for metric in required):
+    if any(_unavailable(metric) for metric in required):
         status = "unknown" if status != "critical" else status
         reasons.append(("required_data_unavailable", "Required host utilization data is unavailable"))
-    recent_codes = {
-        str(event.get("code", ""))
-        for event in snapshot.get("events", [])
-        if isinstance(event, dict) and now - int(event.get("ts", 0)) <= policy.recent_event_seconds
-    }
-    if recent_codes & {"metric_source_unavailable", "service_state_changed", "pid_replaced"}:
+    recent_codes = _required_event_codes(snapshot, now, policy)
+    if recent_codes & {
+        "metric_source_unavailable", "service_state_changed", "pid_replaced",
+        "collection_failed", "database_retention_failed", "wal_checkpoint_failed",
+        "listener_disappeared", "sampling_gap",
+    }:
         if status == "healthy":
             status = "degraded"
         reasons.append(("recent_monitoring_event", "A recent service or source transition was recorded"))
@@ -147,6 +202,7 @@ def evaluate_services(
     policy: HealthPolicy = HealthPolicy(),
 ) -> dict[str, HealthResult]:
     metrics = _metric_map(snapshot)
+    required_services = _required_services(snapshot)
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
     for (kind, entity_id, _name), value in metrics.items():
         if kind == "service":
@@ -157,29 +213,30 @@ def evaluate_services(
         latest_ts = max(int(item.get("ts", 0)) for item in values)
         age = max(0, now - latest_ts)
         reasons: list[tuple[str, str]] = []
-        if age > policy.stale_after_seconds:
+        active = by_name.get("service_active")
+        listener = by_name.get("listener_owned_count")
+        process = by_name.get("process_rss_bytes")
+        if _unavailable(active):
             status = "unknown"
-            reasons.append(("stale_data", f"Service data is {age}s old"))
+            reasons.append(("service_state_unavailable", "Service state is unavailable"))
+        elif active.get("quality") != "exact":
+            status = "unknown"
+            reasons.append(("service_state_not_authoritative", "Service state is not authoritative"))
+        elif float(active.get("numeric_value") or 0) == 0:
+            status = "down"
+            reasons.append(("service_inactive", "Service is inactive"))
+        elif _unavailable(process):
+            status = "unknown"
+            reasons.append(("process_snapshot_unavailable", "Process snapshot is unavailable"))
+        elif _unavailable(listener) or listener.get("quality") != "exact":
+            status = "unknown"
+            reasons.append(("listener_ownership_unavailable", "Listener ownership is unavailable"))
+        elif float(listener.get("numeric_value") or 0) == 0:
+            status = "down"
+            reasons.append(("required_listener_missing", "No listener is owned by the active service"))
         else:
-            active = by_name.get("service_active")
-            if not active or active.get("quality") == "unavailable":
-                status = "unknown"
-                reasons.append(("service_state_unavailable", "Service state is unavailable"))
-            elif active.get("quality") != "exact":
-                status = "unknown"
-                reasons.append(("service_state_not_authoritative", "Service state is not authoritative"))
-            elif float(active.get("numeric_value") or 0) == 0 and active.get("quality") == "exact":
-                status = "down"
-                reasons.append(("service_inactive", "Service is inactive"))
-            elif not by_name.get("process_rss_bytes") or by_name["process_rss_bytes"].get("quality") == "unavailable":
-                status = "unknown"
-                reasons.append(("process_snapshot_unavailable", "Process snapshot is unavailable"))
-            elif by_name.get("listener_owned_count", {}).get("quality") != "exact":
-                status = "unknown"
-                reasons.append(("listener_ownership_unavailable", "Listener ownership is unavailable"))
-            else:
-                status = "healthy"
-                reasons.append(("service_observed", "Service is active and observations are current"))
+            status = "healthy"
+            reasons.append(("service_observed", "Service is active and observations are current"))
         results[entity_id] = _result(status, reasons, now, age, _quality(values), "service", entity_id)
     return results
 
@@ -202,10 +259,7 @@ def evaluate_tunnels(
         ownership = by_name.get("listener_ownership_exact")
         active = by_name.get("service_active")
         reasons: list[tuple[str, str]] = []
-        if age > policy.stale_after_seconds:
-            status = "unknown"
-            reasons.append(("stale_data", f"Tunnel data is {age}s old"))
-        elif not active or active.get("quality") == "unavailable":
+        if _unavailable(active):
             status = "unknown"
             reasons.append(("service_state_unavailable", "Tunnel service state is unavailable"))
         elif active.get("quality") == "exact" and float(active.get("numeric_value") or 0) == 0:
@@ -214,7 +268,7 @@ def evaluate_tunnels(
         elif active and active.get("quality") != "exact":
             status = "unknown"
             reasons.append(("service_state_not_authoritative", "Tunnel service state is not authoritative"))
-        elif not ownership or ownership.get("quality") != "exact":
+        elif _unavailable(ownership) or ownership.get("quality") != "exact":
             status = "unknown"
             reasons.append(("listener_ownership_unavailable", "Listener ownership is unavailable"))
         elif float(ownership.get("numeric_value") or 0) == 0 and ownership.get("quality") == "exact":
@@ -235,12 +289,15 @@ def evaluate_snapshot(
     node = evaluate_node(snapshot, now, policy)
     services = evaluate_services(snapshot, now, policy)
     tunnels = evaluate_tunnels(snapshot, now, policy)
+    required_services = _required_services(snapshot)
     status = node.status
     reason_codes = list(node.reason_codes)
     reasons = list(node.reasons)
     rank = {"healthy": 0, "degraded": 1, "unknown": 2, "critical": 3}
     for entity_type, values in (("service", services), ("tunnel", tunnels)):
         for entity_id, result in values.items():
+            if entity_type == "service" and entity_id not in required_services:
+                continue
             candidate = "critical" if result.status == "down" else result.status
             if rank.get(candidate, 0) > rank.get(status, 0):
                 status = candidate
@@ -249,7 +306,10 @@ def evaluate_snapshot(
                 reasons.append(
                     f"{entity_type.capitalize()} {entity_id} is {result.status}"
                 )
-    if any(result.status != "healthy" for result in (*services.values(), *tunnels.values())):
+    relevant_results = [
+        result for key, result in services.items() if key in required_services
+    ] + list(tunnels.values())
+    if any(result.status != "healthy" for result in relevant_results):
         paired = [
             (code, reason)
             for code, reason in zip(reason_codes, reasons)
@@ -263,8 +323,13 @@ def evaluate_snapshot(
         reason_codes=tuple(reason_codes),
         reasons=tuple(reasons),
     )
+    service_values = {}
+    for key, value in services.items():
+        rendered = value.to_dict()
+        rendered["required"] = key in required_services
+        service_values[key] = rendered
     return {
         "overall": overall.to_dict(),
-        "services": {key: value.to_dict() for key, value in services.items()},
+        "services": service_values,
         "tunnels": {key: value.to_dict() for key, value in tunnels.items()},
     }

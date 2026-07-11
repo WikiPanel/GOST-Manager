@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import dataclasses
+import datetime as dt
 import os
 import shutil
 import textwrap
@@ -43,6 +43,24 @@ def _display(value: object | None) -> object:
     return "unavailable" if value is None else value
 
 
+def _utc(timestamp: object | None) -> str:
+    if timestamp is None:
+        return "unavailable"
+    return dt.datetime.fromtimestamp(int(timestamp), dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _age(point: dict[str, object] | None) -> str:
+    if not point:
+        return "age=unavailable"
+    age = point.get("data_age_seconds")
+    if age is None:
+        return "age=unavailable"
+    stale = " stale" if point.get("stale") else ""
+    return f"at={_utc(point.get('ts'))} age={age}s{stale}"
+
+
 def _metric_index(snapshot: dict[str, object]) -> dict[tuple[str, str, str], dict[str, object]]:
     return {
         (
@@ -78,9 +96,12 @@ def render_snapshot_plain(
     lines.append(f"status: {overall['status']}")
     lines.append("reasons: " + ", ".join(overall["reason_codes"]))
     last_success = metrics.get(("collector", "local", "last_successful_cycle_timestamp"))
-    lines.append(f"last successful sample: {_value(last_success) if last_success else cycle.get('collected_at', 'unavailable')}")
+    last_success_ts = (
+        last_success.get("numeric_value") if last_success else cycle.get("collected_at")
+    )
+    lines.append(f"last successful sample: {_utc(last_success_ts)}")
     lines.append(f"sample age: {overall.get('data_age_seconds', 'unavailable')}s")
-    lines.append("database window coverage: current snapshot")
+    lines.append("history coverage: not applicable (latest-per-series snapshot)")
 
     lines.extend(["", "HOST"])
     for label, name in (
@@ -93,11 +114,11 @@ def render_snapshot_plain(
         ("file handles", "file_handles_utilization_percent"),
     ):
         point = metrics.get(("host", "local", name))
-        lines.append(f"{label}: {_value(point)} [{point.get('quality', 'unavailable') if point else 'unavailable'}]")
+        lines.append(f"{label}: {_value(point)} [{point.get('quality', 'unavailable') if point else 'unavailable'}; {_age(point)}]")
     root = metrics.get(("filesystem", "fs:/", "filesystem_used_percent"))
     monitor_fs = metrics.get(("filesystem", "fs:/var/lib/gost-manager", "filesystem_used_percent"))
-    lines.append(f"root filesystem: {_value(root)}")
-    lines.append(f"monitoring filesystem: {_value(monitor_fs)}")
+    lines.append(f"root filesystem: {_value(root)} [{_age(root)}]")
+    lines.append(f"monitoring filesystem: {_value(monitor_fs)} [{_age(monitor_fs)}]")
 
     lines.extend(["", "NETWORK"])
     for label, entity, name in (
@@ -106,11 +127,14 @@ def render_snapshot_plain(
         ("external RX packets", "interface:external-total", "rx_packets_per_second"),
         ("external TX packets", "interface:external-total", "tx_packets_per_second"),
         ("external RX errors", "interface:external-total", "rx_errors"),
+        ("external TX errors", "interface:external-total", "tx_errors"),
+        ("external RX drops", "interface:external-total", "rx_drops"),
         ("external TX drops", "interface:external-total", "tx_drops"),
         ("loopback RX", "interface:lo", "rx_bytes_per_second"),
         ("loopback TX", "interface:lo", "tx_bytes_per_second"),
     ):
-        lines.append(f"{label}: {_value(metrics.get(('interface', entity, name)))}")
+        point = metrics.get(("interface", entity, name))
+        lines.append(f"{label}: {_value(point)} [{_age(point)}]")
 
     lines.extend(["", "TCP"])
     for label, name in (
@@ -123,7 +147,8 @@ def render_snapshot_plain(
         ("listen drops", "tcp_listen_drops"),
         ("listen overflows", "tcp_listen_overflows"),
     ):
-        lines.append(f"{label}: {_value(metrics.get(('host', 'local', name)))}")
+        point = metrics.get(("host", "local", name))
+        lines.append(f"{label}: {_value(point)} [{_age(point)}]")
 
     lines.extend(["", "NGINX / SERVICES"])
     services = health["services"]
@@ -132,7 +157,8 @@ def render_snapshot_plain(
     for service, result in sorted(services.items()):
         prefix = ("service", service)
         lines.append(
-            f"{service}: {result['status']} state={_value(metrics.get(prefix + ('service_active_state',)))} "
+            f"{service}: {result['status']} required={str(result.get('required', False)).lower()} "
+            f"state={_value(metrics.get(prefix + ('service_active_state',)))} "
             f"cpu={_value(metrics.get(prefix + ('process_cpu_percent',)))} "
             f"rss={_value(metrics.get(prefix + ('process_rss_bytes',)))} "
             f"processes={_value(metrics.get(prefix + ('process_count',)))} "
@@ -141,6 +167,7 @@ def render_snapshot_plain(
             f"sockets={_value(metrics.get(prefix + ('established_sockets_total',)))} "
             f"restarts={_value(metrics.get(prefix + ('service_restart_count',)))} "
             f"quality={result['source_quality']} age={result['data_age_seconds']}s"
+            f" observed={_utc(metrics.get(prefix + ('service_active',), {}).get('ts'))}"
         )
 
     lines.extend(["", "TUNNELS"])
@@ -167,6 +194,7 @@ def render_snapshot_plain(
             f"rss={_value(metrics.get(prefix + ('process_rss_bytes',)))} "
             f"fds={_value(metrics.get(prefix + ('process_open_fds',)))} "
             f"quality={result['source_quality']} age={result['data_age_seconds']}s"
+            f" observed={_utc(metrics.get(prefix + ('service_active',), {}).get('ts'))}"
         )
 
     lines.extend(["", "COLLECTOR / DATABASE"])
@@ -179,7 +207,8 @@ def render_snapshot_plain(
         ("WAL size", "database_wal_size_bytes"),
         ("checkpoint", "checkpoint_success"),
     ):
-        lines.append(f"{label}: {_value(metrics.get(('collector', 'local', name)))}")
+        point = metrics.get(("collector", "local", name))
+        lines.append(f"{label}: {_value(point)} [{_age(point)}]")
 
     lines.extend(["", "RECENT EVENTS"])
     events = snapshot.get("events", [])
@@ -195,21 +224,25 @@ def render_snapshot_plain(
                         entity = f" entity={details[key]}"
                         break
             lines.append(
-                f"{event.get('ts')} {event.get('severity')} {event.get('code')}{entity}: {event.get('message')}"
+                f"{_utc(event.get('ts'))} {event.get('severity')} {event.get('code')}{entity}: {event.get('message')}"
             )
     return "\n".join(_line(item, width) if item else "" for item in lines) + "\n"
 
 
 def render_summary(result: QueryResult, width: int = 120) -> str:
     lines = [
-        f"SUMMARY source={result.source_mode} window={result.window.effective_start}..{result.window.effective_end}",
-        "ENTITY | METRIC | LATEST | MIN | AVG | MAX | P95 | SAMPLES/EXPECTED | COVERAGE | UNAVAILABLE | RESET | GAP | AGE | QUALITY | UNIT | SOURCE",
+        f"SUMMARY source={result.source_mode} truncated={str(result.window.truncated).lower()}",
+        f"requested={_utc(result.window.requested_start)}..{_utc(result.window.requested_end)}",
+        f"effective={_utc(result.window.effective_start)}..{_utc(result.window.effective_end)} materialized_rows={result.materialized_rows}",
+        "ENTITY | METRIC | LATEST@TIME | MIN | AVG | MAX | P95 | FIRST..LAST | TRANSITIONS | SAMPLES/EXPECTED | COVERAGE | UNAVAILABLE | RESET | GAP | AGE | QUALITY | UNIT | SOURCE",
     ]
     for item in result.series:
         values = (
-            f"{item.entity_type}:{item.entity_id} | {item.metric_name} | {_display(item.latest)} | "
+            f"{item.entity_type}:{item.entity_id} | {item.metric_name} | {_display(item.latest)}@{_utc(item.latest_timestamp)} | "
             f"{_display(item.minimum)} | {_display(item.average)} | {_display(item.maximum)} | "
             f"{_display(item.p95)} | "
+            f"{_utc(item.first_timestamp)}..{_utc(item.last_timestamp)} | "
+            f"{_display(item.transition_count)} | "
             f"{item.sample_count}/{item.expected_sample_count} | {item.coverage:.2f} | "
             f"{item.unavailable_count} | {item.reset_count} | {item.gap_count} | "
             f"{_display(item.data_age_seconds)} | {item.quality} | {item.unit} | {item.source_mode}"
@@ -221,7 +254,7 @@ def render_summary(result: QueryResult, width: int = 120) -> str:
 
 
 def render_events(events: list[EventRecord], width: int = 120) -> str:
-    lines = ["EVENTS", "TIME | SEVERITY | CODE | ENTITY | MESSAGE"]
+    lines = ["EVENTS", "TIME (UTC) | SEVERITY | CODE | ENTITY | MESSAGE"]
     for event in events:
         entity = "unavailable"
         for key in ("tunnel_id", "service", "entity_id", "source"):
@@ -230,7 +263,7 @@ def render_events(events: list[EventRecord], width: int = 120) -> str:
                 break
         lines.append(
             _line(
-                f"{event.ts} | {event.severity} | {event.code} | {entity} | {event.message}",
+                f"{_utc(event.ts)} | {event.severity} | {event.code} | {entity} | {event.message}",
                 width,
             )
         )

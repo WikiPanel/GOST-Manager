@@ -37,6 +37,8 @@ def metric(kind, entity_id, name, value, unit="percent", quality="exact", ts=NOW
         "quality": quality,
         "reset": 0,
         "gap": 0,
+        "data_age_seconds": NOW - ts,
+        "stale": False,
     }
 
 
@@ -150,7 +152,7 @@ class HealthTests(unittest.TestCase):
         active["numeric_value"] = 0
         evaluated = evaluate_snapshot(snapshot)
         self.assertEqual("down", evaluated["services"]["nginx.service"]["status"])
-        self.assertEqual("critical", evaluated["overall"]["status"])
+        self.assertEqual("healthy", evaluated["overall"]["status"])
         active["numeric_value"] = None
         active["quality"] = "unavailable"
         self.assertEqual("unknown", evaluate_snapshot(snapshot)["services"]["nginx.service"]["status"])

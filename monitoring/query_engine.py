@@ -34,6 +34,9 @@ class QueryLimits:
     max_export_rows: int = 100_000
     max_seed_seconds: int = 300
     max_gap_multiplier: float = 2.5
+    max_entities: int = 256
+    max_materialized_rows: int = 110_000
+    max_health_events: int = 200
 
 
 def worst_quality(values: Sequence[str]) -> str:
@@ -49,6 +52,20 @@ def cadence_for(
     default: float = DEFAULT_SAMPLE_INTERVAL_SECONDS,
 ) -> float:
     cadence = default
+    if entity_type == "host" and metric_name.startswith("tcp_state_"):
+        cadence = 30.0
+    elif entity_type == "service" and metric_name in {
+        "established_sockets_total", "process_open_fds",
+    }:
+        cadence = 30.0 if metric_name == "established_sockets_total" else 60.0
+    elif entity_type == "tunnel" and metric_name == "established_remote_sockets":
+        cadence = 30.0
+    elif entity_type == "filesystem" or (
+        entity_type == "collector" and metric_name.startswith("database_")
+    ):
+        cadence = 60.0
+    elif entity_type == "collector" and metric_name.startswith("checkpoint"):
+        cadence = 900.0
     for key, seconds in registry.items():
         registered_type, separator, pattern = key.partition(":")
         if not separator or registered_type != entity_type:
@@ -161,7 +178,12 @@ def _rollup_summary(
     entity_type, entity_id, metric_name = key
     ordered = sorted(points, key=lambda item: item.minute_start)
     unit = ordered[-1].unit
-    expected = max(1, math.ceil(max(0, end - start) / cadence))
+    represented_rows_seconds = len(ordered) * 60
+    missing_seconds = max(0, end - start - represented_rows_seconds)
+    expected = sum(item.expected_samples for item in ordered)
+    if missing_seconds:
+        expected += max(1, math.ceil(missing_seconds / cadence))
+    expected = max(1, expected)
     if unit in TEXT_UNITS:
         return SeriesSummary(
             entity_type=entity_type,
@@ -225,6 +247,10 @@ def _combine_hybrid(
     start: int,
     end: int,
     cadence: float,
+    rollup_start: int | None,
+    rollup_end: int | None,
+    raw_start: int | None,
+    raw_end: int | None,
 ) -> SeriesSummary:
     parts = [item for item in (rollup, raw) if item is not None]
     base = raw or rollup
@@ -238,7 +264,15 @@ def _combine_hybrid(
     )
     minimums = [float(item.minimum) for item in parts if item.minimum is not None]
     maximums = [float(item.maximum) for item in parts if item.maximum is not None]
-    expected = max(1, math.ceil(max(0, end - start) / cadence))
+    expected = sum(item.expected_sample_count for item in parts)
+    represented_seconds = 0
+    if rollup is not None and rollup_start is not None and rollup_end is not None:
+        represented_seconds += max(0, rollup_end - rollup_start)
+    if raw is not None and raw_start is not None and raw_end is not None:
+        represented_seconds += max(0, raw_end - raw_start)
+    missing_seconds = max(0, end - start - represented_seconds)
+    if missing_seconds:
+        expected += max(1, math.ceil(missing_seconds / cadence))
     samples = sum(item.sample_count for item in parts)
     return SeriesSummary(
         entity_type=key[0],
@@ -279,11 +313,62 @@ class QueryEngine:
         clock: Callable[[], float] = time.time,
         retention: RetentionPolicy = RetentionPolicy(),
         limits: QueryLimits = QueryLimits(),
+        read_hook: Callable[[str], None] | None = None,
     ):
         self.database = database
         self.clock = clock
         self.retention = retention
         self.limits = limits
+        self.read_hook = read_hook
+
+    def _cost_aware_plan(
+        self,
+        conn,
+        window: QueryWindow,
+        plan,
+        entity_type: str | None,
+        entity_id: str | None,
+        metric_names: Sequence[str] | None,
+    ):
+        if plan.raw_start is None or plan.raw_end is None:
+            return plan
+        raw_count = self.database.bounded_point_count(
+            conn,
+            "raw",
+            plan.raw_start,
+            plan.raw_end,
+            self.limits.max_query_rows,
+            entity_type,
+            entity_id,
+            metric_names,
+        )
+        if raw_count <= self.limits.max_query_rows:
+            return dataclasses.replace(plan, estimated_rows=raw_count)
+        raw_tail_start = int(math.floor(window.effective_end / 60.0) * 60)
+        raw_tail_start = max(window.effective_start, raw_tail_start)
+        source_mode = "hybrid" if raw_tail_start < window.effective_end else "rollup"
+        return type(plan)(
+            source_mode,
+            raw_start=raw_tail_start if raw_tail_start < window.effective_end else None,
+            raw_end=window.effective_end if raw_tail_start < window.effective_end else None,
+            rollup_start=window.effective_start,
+            rollup_end=raw_tail_start,
+            estimated_rows=raw_count,
+            reason="raw_cost_limit",
+        )
+
+    def query_plan(
+        self,
+        conn,
+        window: QueryWindow,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        metric_names: Sequence[str] | None = None,
+    ):
+        base = plan_window(window, int(self.clock()), self.retention)
+        return self._cost_aware_plan(
+            conn, window, base, entity_type, entity_id, metric_names
+        )
 
     def summary(
         self,
@@ -297,6 +382,9 @@ class QueryEngine:
         plan = plan_window(window, now, self.retention)
         with self.database.connection() as conn:
             registry = self.database.cadence_registry(conn)
+            plan = self._cost_aware_plan(
+                conn, window, plan, entity_type, entity_id, metric_names
+            )
             raw_points: list[MetricPoint] = []
             rollup_points: list[RollupPoint] = []
             categorical_catalog: list[MetricPoint] = []
@@ -311,6 +399,7 @@ class QueryEngine:
                     plan.raw_end,
                     seed,
                     self.limits.max_query_rows,
+                    self.limits.max_series,
                     entity_type,
                     entity_id,
                     metric_names,
@@ -341,7 +430,8 @@ class QueryEngine:
                         if point.unit in TEXT_UNITS
                     ]
             schema_version = self.database.schema_version(conn)
-        if len(raw_points) + len(rollup_points) > self.limits.max_query_rows:
+        materialized_rows = len(raw_points) + len(rollup_points)
+        if materialized_rows > self.limits.max_materialized_rows:
             raise QueryLimitError("combined query exceeds the safe row limit")
 
         raw_groups: dict[tuple[str, str, str], list[MetricPoint]] = defaultdict(list)
@@ -411,6 +501,10 @@ class QueryEngine:
                     window.effective_start,
                     window.effective_end,
                     cadence_for(key[0], key[2], registry),
+                    plan.rollup_start,
+                    plan.rollup_end,
+                    plan.raw_start,
+                    plan.raw_end,
                 )
             else:
                 item = raw_summary or rollup_summary
@@ -426,7 +520,9 @@ class QueryEngine:
                 "entity_type": entity_type,
                 "entity_id": entity_id,
                 "metrics": list(metric_names or ()),
+                "plan_reason": plan.reason,
             },
+            materialized_rows=materialized_rows,
         )
 
     def events(
@@ -446,25 +542,61 @@ class QueryEngine:
     def snapshot(self, recent_event_seconds: int = 3600) -> dict[str, object]:
         now = int(self.clock())
         with self.database.connection() as conn:
-            points = self.database.latest_points(conn, self.limits.max_series)
             cycle = self.database.latest_cycle(conn)
+            if self.read_hook is not None:
+                self.read_hook("after_cycle")
+            registry = self.database.cadence_registry(conn)
+            points = self.database.latest_points(
+                conn,
+                self.limits.max_series,
+                max_entities=self.limits.max_entities,
+            )
             events = self.database.events(
                 conn,
                 now - recent_event_seconds,
                 now + 1,
                 min(50, self.limits.max_events),
+                truncate=True,
             )
-            entities = self.database.list_entities(conn)
+            health_events = self.database.health_events(
+                conn,
+                now - recent_event_seconds,
+                now + 1,
+                self.limits.max_health_events,
+            )
+            entities = self.database.list_entities(
+                conn,
+                ("service", "tunnel"),
+                max_rows=self.limits.max_entities,
+            )
             schema_version = self.database.schema_version(conn)
+        metric_values = []
+        for point in points:
+            value = dataclasses.asdict(point)
+            cadence = cadence_for(point.entity_type, point.metric_name, registry)
+            age = max(0, now - point.ts)
+            freshness = cadence * self.limits.max_gap_multiplier
+            value.update(
+                {
+                    "data_age_seconds": age,
+                    "cadence_seconds": cadence,
+                    "freshness_seconds": freshness,
+                    "stale": age > freshness,
+                }
+            )
+            metric_values.append(value)
         return {
             "generated_at": now,
             "schema_version": schema_version,
             "cycle": cycle,
-            "metrics": [dataclasses.asdict(point) for point in points],
+            "metrics": metric_values,
             "entities": entities,
             "events": [event.to_dict() for event in events],
+            "health_events": [event.to_dict() for event in health_events],
         }
 
     def entities(self, entity_type: str | None = None) -> list[dict[str, object]]:
         with self.database.connection() as conn:
-            return self.database.list_entities(conn, entity_type)
+            return self.database.list_entities(
+                conn, entity_type, max_rows=self.limits.max_entities
+            )

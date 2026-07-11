@@ -54,6 +54,8 @@ class QueryPlan:
     raw_end: int | None = None
     rollup_start: int | None = None
     rollup_end: int | None = None
+    estimated_rows: int | None = None
+    reason: str = "retention"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -158,6 +160,7 @@ class QueryResult:
     schema_version: int
     granularity: str = "summary"
     filters: dict[str, object] = dataclasses.field(default_factory=dict)
+    materialized_rows: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -167,5 +170,6 @@ class QueryResult:
             "schema_version": self.schema_version,
             "granularity": self.granularity,
             "filters": self.filters,
+            "materialized_rows": self.materialized_rows,
             "series": [item.to_dict() for item in self.series],
         }

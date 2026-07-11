@@ -31,6 +31,44 @@ REQUIRED_TABLES = {
     "collector_state",
 }
 
+SNAPSHOT_METRICS_BY_ENTITY = {
+    "host": (
+        "cpu_utilization_percent", "memory_used_percent", "load1", "load5", "load15",
+        "conntrack_utilization_percent", "file_handles_utilization_percent",
+        "tcp_state_estab", "tcp_state_syn_sent", "tcp_state_syn_recv",
+        "tcp_state_close_wait", "tcp_state_time_wait",
+        "tcp_retransmitted_segments_per_second", "tcp_listen_drops",
+        "tcp_listen_overflows",
+    ),
+    "filesystem": ("filesystem_used_percent",),
+    "interface": (
+        "rx_bytes_per_second", "tx_bytes_per_second", "rx_packets_per_second",
+        "tx_packets_per_second", "rx_errors", "tx_errors", "rx_drops", "tx_drops",
+    ),
+    "service": (
+        "service_active", "service_active_state", "process_cpu_percent",
+        "process_rss_bytes", "process_count", "process_open_fds",
+        "listener_owned_count", "established_sockets_total", "service_restart_count",
+    ),
+    "tunnel": (
+        "service_active", "configured_listener_count", "observed_listener_count",
+        "listener_ownership_exact", "remote_endpoint", "established_remote_sockets",
+        "process_cpu_percent", "process_rss_bytes", "process_open_fds",
+        "service_restart_count",
+    ),
+    "collector": (
+        "cycle_status", "duration_seconds", "missed_deadlines", "source_errors_total",
+        "database_size_bytes", "database_wal_size_bytes", "checkpoint_success",
+        "checkpoint_duration_seconds", "last_successful_cycle_timestamp",
+    ),
+}
+
+HEALTH_EVENT_CODES = (
+    "collection_failed", "database_retention_failed", "wal_checkpoint_failed",
+    "metric_source_unavailable", "service_state_changed", "pid_replaced",
+    "listener_disappeared", "sampling_gap",
+)
+
 
 def validate_filter(value: str, label: str) -> str:
     if not SAFE_FILTER_RE.fullmatch(value):
@@ -73,6 +111,7 @@ class ReadOnlyDatabase:
             conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_ms)}")
             conn.execute("PRAGMA query_only=ON")
             self._validate(conn)
+            conn.execute("BEGIN")
         except QueryDatabaseError:
             if conn is not None:
                 conn.close()
@@ -87,6 +126,8 @@ class ReadOnlyDatabase:
         except sqlite3.DatabaseError as exc:
             raise QueryDatabaseError(f"monitoring query failed: {exc}") from exc
         finally:
+            if conn.in_transaction:
+                conn.rollback()
             conn.close()
 
     @staticmethod
@@ -138,16 +179,32 @@ class ReadOnlyDatabase:
     @staticmethod
     def list_entities(
         conn: sqlite3.Connection,
-        entity_type: str | None = None,
+        entity_type: str | Sequence[str] | None = None,
+        entity_id: str | None = None,
+        max_rows: int = 256,
     ) -> list[dict[str, object]]:
         sql = "SELECT entity_type,entity_id,display_name,metadata_json,updated_at FROM entities"
         params: list[object] = []
-        if entity_type is not None:
-            sql += " WHERE entity_type=?"
+        clauses: list[str] = []
+        if isinstance(entity_type, str):
+            clauses.append("entity_type=?")
             params.append(validate_filter(entity_type, "entity type"))
-        sql += " ORDER BY entity_type,entity_id"
+        elif entity_type:
+            values = [validate_filter(value, "entity type") for value in entity_type]
+            clauses.append("entity_type IN (" + ",".join("?" for _ in values) + ")")
+            params.extend(values)
+        if entity_id is not None:
+            clauses.append("entity_id=?")
+            params.append(validate_filter(entity_id, "entity id"))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY entity_type,entity_id LIMIT ?"
+        params.append(max_rows + 1)
         rows = []
-        for row in conn.execute(sql, params):
+        selected = conn.execute(sql, params).fetchall()
+        if len(selected) > max_rows:
+            raise QueryLimitError("entity query exceeds the safe row limit")
+        for row in selected:
             try:
                 metadata = json.loads(str(row[3] or "{}"))
             except json.JSONDecodeError:
@@ -193,24 +250,66 @@ class ReadOnlyDatabase:
         end: int,
         seed_seconds: int,
         max_rows: int,
+        max_seed_rows: int,
         entity_type: str | None = None,
         entity_id: str | None = None,
         metric_names: Sequence[str] | None = None,
     ) -> list[MetricPoint]:
         filters, params = self._filter_clause(entity_type, entity_id, metric_names)
-        sql = (
-            "SELECT e.entity_type,e.entity_id,p.metric_name,p.ts,p.numeric_value,"
-            "p.text_value,p.unit,p.quality,p.reset,p.gap FROM metric_points p "
-            "JOIN entities e ON e.entity_pk=p.entity_pk "
-            "WHERE p.ts>=? AND p.ts<?" + filters + " ORDER BY e.entity_type,e.entity_id,p.metric_name,p.ts LIMIT ?"
+        columns = (
+            "e.entity_type,e.entity_id,p.metric_name,p.ts,p.numeric_value,"
+            "p.text_value,p.unit,p.quality,p.reset,p.gap"
         )
-        query_params: list[object] = [start - seed_seconds, end]
+        sql = (
+            "WITH in_window AS (SELECT " + columns + " FROM metric_points p "
+            "JOIN entities e ON e.entity_pk=p.entity_pk WHERE p.ts>=? AND p.ts<?"
+            + filters
+            + "), seed_ranked AS (SELECT " + columns
+            + ",ROW_NUMBER() OVER(PARTITION BY p.entity_pk,p.metric_name ORDER BY p.ts DESC) rn "
+            "FROM metric_points p JOIN entities e ON e.entity_pk=p.entity_pk "
+            "WHERE p.ts>=? AND p.ts<?" + filters
+            + ") SELECT entity_type,entity_id,metric_name,ts,numeric_value,text_value,unit,quality,reset,gap "
+            "FROM (SELECT *,0 rn FROM in_window UNION ALL SELECT * FROM seed_ranked WHERE rn=1) "
+            "ORDER BY entity_type,entity_id,metric_name,ts LIMIT ?"
+        )
+        query_params: list[object] = [start, end]
         query_params.extend(params)
-        query_params.append(max_rows + 1)
+        query_params.extend([start - seed_seconds, start])
+        query_params.extend(params)
+        query_params.append(max_rows + max_seed_rows + 1)
         rows = conn.execute(sql, query_params).fetchall()
-        if len(rows) > max_rows:
+        if len(rows) > max_rows + max_seed_rows:
             raise QueryLimitError("raw query exceeds the safe row limit")
         return [MetricPoint(*tuple(row)) for row in rows]
+
+    def bounded_point_count(
+        self,
+        conn: sqlite3.Connection,
+        source: str,
+        start: int,
+        end: int,
+        limit: int,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        metric_names: Sequence[str] | None = None,
+    ) -> int:
+        filters, params = self._filter_clause(entity_type, entity_id, metric_names)
+        if source == "raw":
+            table, column = "metric_points", "ts"
+        elif source == "rollup":
+            table, column = "minute_rollups", "minute_start"
+        else:
+            raise QueryInputError("invalid query source")
+        query_params: list[object] = [start, end]
+        query_params.extend(params)
+        query_params.append(limit + 1)
+        row = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM " + table + " p "
+            "JOIN entities e ON e.entity_pk=p.entity_pk WHERE p." + column
+            + ">=? AND p." + column + "<?" + filters + " LIMIT ?)",
+            query_params,
+        ).fetchone()
+        return int(row[0])
 
     def rollup_points(
         self,
@@ -245,21 +344,101 @@ class ReadOnlyDatabase:
         entity_type: str | None = None,
         entity_id: str | None = None,
         metric_names: Sequence[str] | None = None,
+        max_entities: int = 256,
     ) -> list[MetricPoint]:
-        filters, params = self._filter_clause(entity_type, entity_id, metric_names)
-        sql = (
-            "SELECT e.entity_type,e.entity_id,p.metric_name,p.ts,p.numeric_value,"
-            "p.text_value,p.unit,p.quality,p.reset,p.gap FROM metric_points p "
-            "JOIN entities e ON e.entity_pk=p.entity_pk WHERE p.cycle_id=("
-            "SELECT cycle_id FROM sample_cycles ORDER BY collected_at DESC LIMIT 1)"
-            + filters
-            + " ORDER BY e.entity_type,e.entity_id,p.metric_name LIMIT ?"
+        entity_clauses: list[str] = []
+        entity_params: list[object] = []
+        if entity_type is not None:
+            entity_clauses.append("entity_type=?")
+            entity_params.append(validate_filter(entity_type, "entity type"))
+        else:
+            kinds = tuple(SNAPSHOT_METRICS_BY_ENTITY)
+            entity_clauses.append("entity_type IN (" + ",".join("?" for _ in kinds) + ")")
+            entity_params.extend(kinds)
+        if entity_id is not None:
+            entity_clauses.append("entity_id=?")
+            entity_params.append(validate_filter(entity_id, "entity id"))
+        entity_where = " AND ".join(entity_clauses)
+        count_params = [*entity_params, max_entities + 1]
+        entity_count = len(
+            conn.execute(
+                "SELECT 1 FROM entities WHERE " + entity_where + " LIMIT ?",
+                count_params,
+            ).fetchall()
         )
-        params.append(max_rows + 1)
-        rows = conn.execute(sql, params).fetchall()
+        if entity_count > max_entities:
+            raise QueryLimitError("snapshot entity count exceeds the safe limit")
+
+        specs: list[tuple[str, str]] = []
+        if metric_names:
+            if len(metric_names) > 100:
+                raise QueryLimitError("metric filter exceeds the safe limit of 100 names")
+            kinds = (entity_type,) if entity_type else tuple(SNAPSHOT_METRICS_BY_ENTITY)
+            specs = [
+                (str(kind), validate_filter(name, "metric"))
+                for kind in kinds
+                for name in metric_names
+            ]
+        elif entity_type:
+            specs = [(entity_type, name) for name in SNAPSHOT_METRICS_BY_ENTITY.get(entity_type, ())]
+        else:
+            specs = [
+                (kind, name)
+                for kind, names in SNAPSHOT_METRICS_BY_ENTITY.items()
+                for name in names
+            ]
+        if not specs:
+            return []
+        values_sql = ",".join("(?,?)" for _ in specs)
+        spec_params = [value for spec in specs for value in spec]
+        sql = (
+            "WITH desired(entity_type,metric_name) AS (VALUES " + values_sql + "),"
+            "active AS (SELECT entity_pk,entity_type,entity_id FROM entities WHERE "
+            + entity_where
+            + "), latest AS (SELECT a.entity_type,a.entity_id,d.metric_name,("
+            "SELECT p.point_id FROM metric_points p WHERE p.entity_pk=a.entity_pk "
+            "AND p.metric_name=d.metric_name ORDER BY p.ts DESC LIMIT 1) point_id "
+            "FROM active a JOIN desired d ON d.entity_type=a.entity_type) "
+            "SELECT l.entity_type,l.entity_id,l.metric_name,p.ts,p.numeric_value,p.text_value,"
+            "p.unit,p.quality,p.reset,p.gap FROM latest l JOIN metric_points p "
+            "ON p.point_id=l.point_id WHERE l.point_id IS NOT NULL "
+            "ORDER BY l.entity_type,l.entity_id,l.metric_name LIMIT ?"
+        )
+        rows = conn.execute(sql, [*spec_params, *entity_params, max_rows + 1]).fetchall()
         if len(rows) > max_rows:
             raise QueryLimitError("snapshot exceeds the safe series limit")
         return [MetricPoint(*tuple(row)) for row in rows]
+
+    @staticmethod
+    def health_events(
+        conn: sqlite3.Connection,
+        start: int,
+        end: int,
+        max_rows: int,
+    ) -> list[EventRecord]:
+        params: list[object] = [start, end, *HEALTH_EVENT_CODES, max_rows + 1]
+        rows = conn.execute(
+            "SELECT ts,severity,code,message,details_json FROM events WHERE ts>=? AND ts<? "
+            "AND code IN (" + ",".join("?" for _ in HEALTH_EVENT_CODES) + ") "
+            "ORDER BY ts DESC,event_id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        if len(rows) > max_rows:
+            raise QueryLimitError("health-event query exceeds the safe row limit")
+        result: list[EventRecord] = []
+        for row in rows:
+            try:
+                details = json.loads(str(row[4] or "{}"))
+            except json.JSONDecodeError:
+                details = {}
+            result.append(
+                EventRecord(
+                    int(row[0]), str(row[1]), str(row[2]),
+                    sanitize_text(str(row[3])),
+                    sanitize_mapping(details) if isinstance(details, dict) else {},
+                )
+            )
+        return result
 
     @staticmethod
     def events(
@@ -268,6 +447,7 @@ class ReadOnlyDatabase:
         end: int,
         max_rows: int,
         severities: Sequence[str] | None = None,
+        truncate: bool = False,
     ) -> list[EventRecord]:
         clauses = ["ts>=?", "ts<?"]
         params: list[object] = [start, end]
@@ -283,7 +463,9 @@ class ReadOnlyDatabase:
             params,
         ).fetchall()
         if len(rows) > max_rows:
-            raise QueryLimitError("event query exceeds the safe row limit")
+            if not truncate:
+                raise QueryLimitError("event query exceeds the safe row limit")
+            rows = rows[:max_rows]
         result: list[EventRecord] = []
         for row in rows:
             try:
@@ -318,28 +500,6 @@ class ReadOnlyDatabase:
             "overrun_seconds": float(row[5]),
         }
 
-    @staticmethod
-    def count_rows(
-        conn: sqlite3.Connection,
-        table: str,
-        time_column: str,
-        start: int,
-        end: int,
-    ) -> int:
-        allowed = {
-            ("metric_points", "ts"),
-            ("minute_rollups", "minute_start"),
-            ("events", "ts"),
-        }
-        if (table, time_column) not in allowed:
-            raise QueryInputError("invalid export source")
-        return int(
-            conn.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE {time_column}>=? AND {time_column}<?",
-                (start, end),
-            ).fetchone()[0]
-        )
-
     def count_export_rows(
         self,
         conn: sqlite3.Connection,
@@ -349,23 +509,11 @@ class ReadOnlyDatabase:
         entity_type: str | None = None,
         entity_id: str | None = None,
         metric_names: Sequence[str] | None = None,
+        limit: int = 100_000,
     ) -> int:
-        filters, params = self._filter_clause(entity_type, entity_id, metric_names)
-        if source == "raw":
-            table, time_column = "metric_points", "ts"
-        elif source == "rollup":
-            table, time_column = "minute_rollups", "minute_start"
-        else:
-            raise QueryInputError("invalid export source")
-        query_params: list[object] = [start, end]
-        query_params.extend(params)
-        return int(
-            conn.execute(
-                f"SELECT COUNT(*) FROM {table} p "
-                "JOIN entities e ON e.entity_pk=p.entity_pk "
-                f"WHERE p.{time_column}>=? AND p.{time_column}<?" + filters,
-                query_params,
-            ).fetchone()[0]
+        return self.bounded_point_count(
+            conn, source, start, end, limit,
+            entity_type, entity_id, metric_names,
         )
 
     def iter_export_rows(
@@ -409,6 +557,7 @@ class ReadOnlyDatabase:
             entity_type,
             entity_id,
             metric_names,
+            max_rows,
         )
         if estimated > max_rows:
             raise QueryLimitError(

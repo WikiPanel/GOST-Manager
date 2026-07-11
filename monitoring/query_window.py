@@ -109,14 +109,13 @@ def plan_window(
         return QueryPlan("raw", raw_start=start, raw_end=end)
     if end <= raw_cutoff:
         return QueryPlan("rollup", rollup_start=start, rollup_end=end)
-    boundary = int(math.ceil(raw_cutoff / 60.0) * 60)
-    boundary = min(max(boundary, start), end)
-    if boundary >= end:
-        return QueryPlan("rollup", rollup_start=start, rollup_end=end)
+    rollup_end = int(math.floor(raw_cutoff / 60.0) * 60)
+    rollup_end = min(max(rollup_end, start), end)
+    raw_start = max(start, raw_cutoff)
     return QueryPlan(
         "hybrid",
-        raw_start=boundary,
+        raw_start=raw_start,
         raw_end=end,
         rollup_start=start,
-        rollup_end=boundary,
+        rollup_end=rollup_end,
     )

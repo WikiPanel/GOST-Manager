@@ -285,12 +285,13 @@ class QueryEngineTests(unittest.TestCase):
 
     def test_hybrid_boundary_has_no_double_count_and_no_p95(self):
         policy = RetentionPolicy(raw_seconds=120, rollup_seconds=1000, event_seconds=1000)
-        boundary = math.ceil((NOW - 120) / 60) * 60
+        cutoff = NOW - 120
+        boundary = math.floor(cutoff / 60) * 60
         self.fixture.rollup(boundary - 60, "cpu_utilization_percent", 10, samples=12)
-        self.fixture.point(boundary, "cpu_utilization_percent", 20)
-        self.fixture.point(boundary + 5, "cpu_utilization_percent", 30)
+        self.fixture.point(cutoff, "cpu_utilization_percent", 20)
+        self.fixture.point(cutoff + 5, "cpu_utilization_percent", 30)
         engine = QueryEngine(ReadOnlyDatabase(self.fixture.path), clock=lambda: NOW, retention=policy)
-        result = engine.summary(resolve_window(NOW, "180s", retention=policy))
+        result = engine.summary(resolve_window(NOW, "300s", retention=policy))
         item = result.series[0]
         self.assertEqual("hybrid", result.source_mode)
         self.assertEqual(14, item.sample_count)
@@ -308,7 +309,7 @@ class QueryEngineTests(unittest.TestCase):
     def test_query_limits_and_no_match(self):
         self.fixture.point(NOW - 5, "cpu_utilization_percent", 20)
         with self.assertRaises(QueryLimitError):
-            self.fixture.engine(QueryLimits(max_query_rows=0)).summary(resolve_window(NOW, "10s"))
+            self.fixture.engine(QueryLimits(max_materialized_rows=0)).summary(resolve_window(NOW, "10s"))
         with self.assertRaises(QueryInputError):
             self.fixture.engine().summary(resolve_window(NOW, "10s"), entity_type="service", require_match=True)
 
@@ -402,6 +403,7 @@ class ExportTests(unittest.TestCase):
                 "export_version",
                 "filters",
                 "generated_at",
+                "generated_at_utc",
                 "granularity",
                 "requested_window",
                 "retention",

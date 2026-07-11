@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import datetime as dt
 import json
 import math
 import os
@@ -15,11 +16,31 @@ from typing import TextIO
 
 from monitoring.query_engine import QueryEngine
 from monitoring.query_models import QueryInputError, QueryLimitError, QueryWindow
-from monitoring.query_window import plan_window
 from monitoring.schema import SCHEMA_VERSION
 
 EXPORT_VERSION = 1
 CSV_FIELDS = (
+    "record_type",
+    "export_version",
+    "database_schema_version",
+    "generated_at_utc",
+    "generated_at_epoch",
+    "requested_start_utc",
+    "requested_end_utc",
+    "requested_start_epoch",
+    "requested_end_epoch",
+    "effective_start_utc",
+    "effective_end_utc",
+    "effective_start_epoch",
+    "effective_end_epoch",
+    "source_mode",
+    "granularity",
+    "truncated",
+    "raw_retention_seconds",
+    "rollup_retention_seconds",
+    "event_retention_seconds",
+    "filters_json",
+    "row_count",
     "entity_type",
     "entity_id",
     "metric_name",
@@ -34,7 +55,19 @@ CSV_FIELDS = (
     "samples",
     "expected_samples",
     "coverage",
-    "source_mode",
+    "latest",
+    "latest_timestamp",
+    "minimum",
+    "average",
+    "maximum",
+    "p95",
+    "unavailable_count",
+    "reset_count",
+    "gap_count",
+    "first_timestamp",
+    "last_timestamp",
+    "transition_count",
+    "data_age_seconds",
 )
 SENSITIVE_KEY_RE = re.compile(
     r"pass|password|token|secret|credential|authorization|username",
@@ -72,15 +105,21 @@ def _safe(value: object) -> object:
     return value
 
 
-def _summary_rows(engine: QueryEngine, window: QueryWindow, filters: dict[str, object]) -> Iterator[dict[str, object]]:
+def _utc_iso(timestamp: int) -> str:
+    return dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _summary_rows(engine: QueryEngine, window: QueryWindow, filters: dict[str, object]):
     result = engine.summary(
         window,
         filters.get("entity_type") if isinstance(filters.get("entity_type"), str) else None,
         filters.get("entity_id") if isinstance(filters.get("entity_id"), str) else None,
         filters.get("metric_names") if isinstance(filters.get("metric_names"), list) else None,
     )
+    rows = []
     for item in result.series:
-        yield {
+        rows.append({
+            "record_type": "summary",
             "entity_type": item.entity_type,
             "entity_id": item.entity_id,
             "metric_name": item.metric_name,
@@ -97,27 +136,41 @@ def _summary_rows(engine: QueryEngine, window: QueryWindow, filters: dict[str, o
             "coverage": item.coverage,
             "source_mode": item.source_mode,
             "latest": item.latest,
+            "latest_timestamp": item.latest_timestamp,
             "minimum": item.minimum,
+            "average": item.average,
             "maximum": item.maximum,
             "p95": item.p95,
-        }
+            "unavailable_count": item.unavailable_count,
+            "reset_count": item.reset_count,
+            "gap_count": item.gap_count,
+            "first_timestamp": item.first_timestamp,
+            "last_timestamp": item.last_timestamp,
+            "transition_count": item.transition_count,
+            "data_age_seconds": item.data_age_seconds,
+        })
+    return result, rows
 
 
 def _export_selection(
     engine: QueryEngine,
+    conn,
     window: QueryWindow,
     granularity: str,
     filters: dict[str, object],
-) -> tuple[str, list[tuple[str, int, int]]]:
-    now = int(engine.clock())
-    plan = plan_window(window, now, engine.retention)
+) -> tuple[str, str, list[tuple[str, int, int]]]:
     entity_type = filters.get("entity_type") if isinstance(filters.get("entity_type"), str) else None
     entity_id = filters.get("entity_id") if isinstance(filters.get("entity_id"), str) else None
     metric_names = filters.get("metric_names") if isinstance(filters.get("metric_names"), list) else None
+    plan = engine.query_plan(
+        conn, window, entity_type, entity_id, metric_names
+    )
     selected = granularity
     if selected == "auto":
         selected = "raw" if plan.source_mode == "raw" and window.duration_seconds <= 3600 else plan.source_mode
     if selected == "raw" and plan.source_mode != "raw":
+        if plan.reason == "raw_cost_limit":
+            raise QueryLimitError("raw export exceeds the safe row budget; use auto or minute")
         raise QueryInputError("raw export is unavailable for data outside raw retention")
 
     if selected in {"rollup", "minute"}:
@@ -143,11 +196,17 @@ def _export_selection(
         ]
     else:
         raise QueryInputError("granularity must be summary, raw, minute, or auto")
-    return selected, sources
+    actual_source = (
+        "rollup" if selected in {"rollup", "minute"}
+        else "raw" if selected == "raw"
+        else "hybrid"
+    )
+    return selected, actual_source, sources
 
 
 def _point_rows(
     engine: QueryEngine,
+    conn,
     sources: list[tuple[str, int, int]],
     filters: dict[str, object],
     expected_rows: int,
@@ -155,38 +214,41 @@ def _point_rows(
     entity_type = filters.get("entity_type") if isinstance(filters.get("entity_type"), str) else None
     entity_id = filters.get("entity_id") if isinstance(filters.get("entity_id"), str) else None
     metric_names = filters.get("metric_names") if isinstance(filters.get("metric_names"), list) else None
-    with engine.database.connection() as conn:
-        emitted = 0
-        for source, start, end in sources:
-            for row in engine.database.iter_export_rows(
-                conn,
-                source,
-                start,
-                end,
-                expected_rows - emitted,
-                entity_type,
-                entity_id,
-                metric_names,
-            ):
-                emitted += 1
-                yield row
+    emitted = 0
+    for source, start, end in sources:
+        for row in engine.database.iter_export_rows(
+            conn,
+            source,
+            start,
+            end,
+            expected_rows - emitted,
+            entity_type,
+            entity_id,
+            metric_names,
+        ):
+            emitted += 1
+            row["record_type"] = source
+            yield row
 
 
 def _count_point_rows(
     engine: QueryEngine,
+    conn,
     sources: list[tuple[str, int, int]],
     filters: dict[str, object],
 ) -> int:
     entity_type = filters.get("entity_type") if isinstance(filters.get("entity_type"), str) else None
     entity_id = filters.get("entity_id") if isinstance(filters.get("entity_id"), str) else None
     metric_names = filters.get("metric_names") if isinstance(filters.get("metric_names"), list) else None
-    with engine.database.connection() as conn:
-        count = sum(
-            engine.database.count_export_rows(
-                conn, source, start, end, entity_type, entity_id, metric_names
-            )
-            for source, start, end in sources
+    count = 0
+    for source, start, end in sources:
+        remaining = engine.limits.max_export_rows - count
+        value = engine.database.count_export_rows(
+            conn, source, start, end, entity_type, entity_id, metric_names, remaining
         )
+        count += value
+        if count > engine.limits.max_export_rows:
+            break
     if count > engine.limits.max_export_rows:
         raise QueryLimitError(
             f"export estimate {count} rows exceeds the safe limit {engine.limits.max_export_rows}"
@@ -209,21 +271,39 @@ def export_data(
     if output_format not in {"json", "csv"}:
         raise QueryInputError("format must be json or csv")
     generated_at = int(engine.clock())
+    point_context = None
+    point_conn = None
     if granularity == "summary":
         selected = "summary"
-        summary_rows = list(_summary_rows(engine, window, active_filters))
+        result, summary_rows = _summary_rows(engine, window, active_filters)
         if len(summary_rows) > engine.limits.max_export_rows:
             raise QueryLimitError("summary export exceeds the safe row limit")
         row_count = len(summary_rows)
         rows: Iterator[dict[str, object]] = iter(summary_rows)
+        source_mode = result.source_mode
     else:
-        selected, sources = _export_selection(engine, window, granularity, active_filters)
-        row_count = _count_point_rows(engine, sources, active_filters)
-        rows = _point_rows(engine, sources, active_filters, row_count)
+        point_context = engine.database.connection()
+        point_conn = point_context.__enter__()
+        try:
+            selected, source_mode, sources = _export_selection(
+                engine, point_conn, window, granularity, active_filters
+            )
+            row_count = _count_point_rows(
+                engine, point_conn, sources, active_filters
+            )
+            rows = _point_rows(
+                engine, point_conn, sources, active_filters, row_count
+            )
+        except Exception as exc:
+            point_context.__exit__(type(exc), exc, exc.__traceback__)
+            point_context = None
+            point_conn = None
+            raise
     metadata = {
         "export_version": EXPORT_VERSION,
         "database_schema_version": SCHEMA_VERSION,
         "generated_at": generated_at,
+        "generated_at_utc": _utc_iso(generated_at),
         "requested_window": {
             "start": window.requested_start,
             "end": window.requested_end,
@@ -232,7 +312,7 @@ def export_data(
             "start": window.effective_start,
             "end": window.effective_end,
         },
-        "source_mode": plan_window(window, generated_at, engine.retention).source_mode,
+        "source_mode": source_mode,
         "granularity": selected,
         "filters": active_filters,
         "retention": {
@@ -287,11 +367,34 @@ def export_data(
         else:
             writer = csv.DictWriter(target_stream, fieldnames=CSV_FIELDS, extrasaction="ignore")
             writer.writeheader()
+            base = {
+                "export_version": metadata["export_version"],
+                "database_schema_version": metadata["database_schema_version"],
+                "generated_at_utc": metadata["generated_at_utc"],
+                "generated_at_epoch": generated_at,
+                "requested_start_utc": _utc_iso(window.requested_start),
+                "requested_end_utc": _utc_iso(window.requested_end),
+                "requested_start_epoch": window.requested_start,
+                "requested_end_epoch": window.requested_end,
+                "effective_start_utc": _utc_iso(window.effective_start),
+                "effective_end_utc": _utc_iso(window.effective_end),
+                "effective_start_epoch": window.effective_start,
+                "effective_end_epoch": window.effective_end,
+                "source_mode": source_mode,
+                "granularity": selected,
+                "truncated": str(window.truncated).lower(),
+                "raw_retention_seconds": engine.retention.raw_seconds,
+                "rollup_retention_seconds": engine.retention.rollup_seconds,
+                "event_retention_seconds": engine.retention.event_seconds,
+                "filters_json": json.dumps(_safe(active_filters), sort_keys=True, separators=(",", ":")),
+                "row_count": row_count,
+            }
+            writer.writerow({**base, "record_type": "metadata"})
             for row in rows:
                 count += 1
                 if count > engine.limits.max_export_rows:
                     raise QueryLimitError("export exceeded the actual row limit")
-                writer.writerow(_safe(row))
+                writer.writerow(_safe({**base, **row}))
         if count != row_count:
             raise QueryLimitError(
                 f"export changed while reading: expected {row_count} rows, received {count}"
@@ -321,3 +424,6 @@ def export_data(
             except OSError:
                 pass
         raise
+    finally:
+        if point_context is not None and point_conn is not None:
+            point_context.__exit__(None, None, None)
