@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import os
 import re
 import shlex
@@ -21,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_DB_PATH = "/var/lib/gost-manager/metrics.sqlite3"
 DEFAULT_ENV_DIR = "/etc/gost"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 5.0
@@ -111,38 +112,45 @@ INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,1);
 """
 
 
-def _v3_statements() -> list[str]:
+def _v4_statements() -> list[str]:
     return [
         "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS sample_cycles(cycle_id INTEGER PRIMARY KEY AUTOINCREMENT, collected_at INTEGER NOT NULL UNIQUE, monotonic_started REAL NOT NULL, monotonic_finished REAL NOT NULL, duration_seconds REAL NOT NULL, success INTEGER NOT NULL, overrun INTEGER NOT NULL DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS sample_cycles(cycle_id INTEGER PRIMARY KEY AUTOINCREMENT, collected_at INTEGER NOT NULL UNIQUE, monotonic_started REAL NOT NULL, monotonic_finished REAL NOT NULL, duration_seconds REAL NOT NULL, success INTEGER NOT NULL, overrun INTEGER NOT NULL DEFAULT 0, missed_deadlines INTEGER NOT NULL DEFAULT 0, overrun_seconds REAL NOT NULL DEFAULT 0.0)",
         "CREATE TABLE IF NOT EXISTS entities(entity_pk INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, display_name TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', updated_at INTEGER NOT NULL, UNIQUE(entity_type,entity_id))",
         "CREATE TABLE IF NOT EXISTS tunnels(tunnel_id TEXT PRIMARY KEY, entity_pk INTEGER REFERENCES entities(entity_pk) ON DELETE SET NULL, side TEXT NOT NULL CHECK(side IN('iran','kharej')), tunnel_number INTEGER NOT NULL, service_name TEXT NOT NULL UNIQUE, env_path TEXT NOT NULL, listen_ports_json TEXT NOT NULL DEFAULT '[]', target_ports_json TEXT NOT NULL DEFAULT '[]', updated_at INTEGER NOT NULL, UNIQUE(side,tunnel_number))",
-        "CREATE TABLE IF NOT EXISTS metric_samples(sample_id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL REFERENCES sample_cycles(cycle_id) ON DELETE CASCADE, tunnel_id TEXT REFERENCES tunnels(tunnel_id) ON DELETE CASCADE, collected_at INTEGER NOT NULL, service_state INTEGER NOT NULL DEFAULT 0, service_substate INTEGER NOT NULL DEFAULT 0, restart_count INTEGER NOT NULL DEFAULT 0, listen_ports_total INTEGER NOT NULL DEFAULT 0, listen_ports_up INTEGER NOT NULL DEFAULT 0, configured_mappings_total INTEGER NOT NULL DEFAULT 0, rx_bytes INTEGER, tx_bytes INTEGER, UNIQUE(cycle_id,tunnel_id))",
-        "CREATE TABLE IF NOT EXISTS metric_points(point_id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL REFERENCES sample_cycles(cycle_id) ON DELETE CASCADE, entity_pk INTEGER NOT NULL REFERENCES entities(entity_pk) ON DELETE CASCADE, metric_name TEXT NOT NULL, ts INTEGER NOT NULL, numeric_value REAL, text_value TEXT, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), reset INTEGER NOT NULL DEFAULT 0, gap INTEGER NOT NULL DEFAULT 0)",
-        "CREATE TABLE IF NOT EXISTS metrics(sample_id INTEGER NOT NULL REFERENCES metric_samples(sample_id) ON DELETE CASCADE, scope TEXT NOT NULL, name TEXT NOT NULL, value REAL, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), labels_json TEXT NOT NULL DEFAULT '{}')",
+        "CREATE TABLE IF NOT EXISTS metric_samples(sample_id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL REFERENCES sample_cycles(cycle_id) ON DELETE CASCADE, tunnel_id TEXT REFERENCES tunnels(tunnel_id) ON DELETE CASCADE, sample_identity TEXT NOT NULL DEFAULT '', collected_at INTEGER NOT NULL, service_state INTEGER NOT NULL DEFAULT 0, service_substate INTEGER NOT NULL DEFAULT 0, restart_count INTEGER NOT NULL DEFAULT 0, listen_ports_total INTEGER NOT NULL DEFAULT 0, listen_ports_up INTEGER NOT NULL DEFAULT 0, configured_mappings_total INTEGER NOT NULL DEFAULT 0, rx_bytes INTEGER, tx_bytes INTEGER, UNIQUE(cycle_id,tunnel_id))",
+        "CREATE TABLE IF NOT EXISTS metric_points(point_id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL REFERENCES sample_cycles(cycle_id) ON DELETE CASCADE, entity_pk INTEGER NOT NULL REFERENCES entities(entity_pk) ON DELETE CASCADE, metric_name TEXT NOT NULL, ts INTEGER NOT NULL, numeric_value REAL, text_value TEXT, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), reset INTEGER NOT NULL DEFAULT 0, gap INTEGER NOT NULL DEFAULT 0, UNIQUE(cycle_id,entity_pk,metric_name))",
         "CREATE TABLE IF NOT EXISTS minute_rollups(entity_pk INTEGER NOT NULL REFERENCES entities(entity_pk) ON DELETE CASCADE, metric_name TEXT NOT NULL, minute_start INTEGER NOT NULL, samples INTEGER NOT NULL, expected_samples INTEGER NOT NULL, min_value REAL, avg_value REAL, max_value REAL, unavailable_count INTEGER NOT NULL, reset_count INTEGER NOT NULL DEFAULT 0, gap_count INTEGER NOT NULL DEFAULT 0, coverage REAL NOT NULL, unit TEXT NOT NULL, quality TEXT NOT NULL CHECK(quality IN('exact','derived','estimated','unavailable')), PRIMARY KEY(entity_pk,metric_name,minute_start))",
         "CREATE TABLE IF NOT EXISTS events(event_id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, severity TEXT NOT NULL, code TEXT NOT NULL, message TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}')",
         "CREATE TABLE IF NOT EXISTS collector_state(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     ]
 
 
-def _required_indexes() -> dict[str, str]:
+def _required_indexes() -> dict[str, tuple[str, str, tuple[str, ...], bool]]:
     return {
-        "idx_entities_lookup": "CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_lookup ON entities(entity_type,entity_id)",
-        "idx_metric_points_lookup": "CREATE INDEX IF NOT EXISTS idx_metric_points_lookup ON metric_points(entity_pk,metric_name,ts)",
-        "idx_metric_points_time": "CREATE INDEX IF NOT EXISTS idx_metric_points_time ON metric_points(ts)",
-        "idx_metric_samples_time": "CREATE INDEX IF NOT EXISTS idx_metric_samples_time ON metric_samples(collected_at)",
-        "idx_metrics_lookup": "CREATE INDEX IF NOT EXISTS idx_metrics_lookup ON metrics(scope,name)",
-        "idx_events_time": "CREATE INDEX IF NOT EXISTS idx_events_time ON events(ts)",
-        "idx_minute_rollups_time": "CREATE INDEX IF NOT EXISTS idx_minute_rollups_time ON minute_rollups(minute_start)",
+        "idx_metric_points_lookup": ("CREATE INDEX IF NOT EXISTS idx_metric_points_lookup ON metric_points(entity_pk,metric_name,ts)", "metric_points", ("entity_pk", "metric_name", "ts"), False),
+        "idx_metric_points_time": ("CREATE INDEX IF NOT EXISTS idx_metric_points_time ON metric_points(ts)", "metric_points", ("ts",), False),
+        "idx_metric_samples_time": ("CREATE INDEX IF NOT EXISTS idx_metric_samples_time ON metric_samples(collected_at)", "metric_samples", ("collected_at",), False),
+        "idx_metric_samples_identity": ("CREATE UNIQUE INDEX IF NOT EXISTS idx_metric_samples_identity ON metric_samples(cycle_id,sample_identity)", "metric_samples", ("cycle_id", "sample_identity"), True),
+        "idx_events_time": ("CREATE INDEX IF NOT EXISTS idx_events_time ON events(ts)", "events", ("ts",), False),
+        "idx_minute_rollups_time": ("CREATE INDEX IF NOT EXISTS idx_minute_rollups_time ON minute_rollups(minute_start)", "minute_rollups", ("minute_start",), False),
     }
 
 
 def connect_db(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30.0, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    for _ in range(50):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "i/o" not in str(exc).lower():
+                raise
+            time.sleep(0.02)
+    else:
+        conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -159,17 +167,57 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
+def _views(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='view'")}
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
+def _index_columns(conn: sqlite3.Connection, index: str) -> tuple[str, ...]:
+    return tuple(str(r[2]) for r in conn.execute(f"PRAGMA index_info({index})"))
+
+
+def _has_metric_points_unique(conn: sqlite3.Connection) -> bool:
+    for row in conn.execute("PRAGMA index_list(metric_points)"):
+        if not int(row[2]):
+            continue
+        if _index_columns(conn, str(row[1])) == ("cycle_id", "entity_pk", "metric_name"):
+            return True
+    return False
+
+
 def _ensure_indexes(conn: sqlite3.Connection) -> None:
-    for sql in _required_indexes().values():
+    required = _required_indexes()
+    for sql, _table, _columns, _unique in required.values():
         conn.execute(sql)
-    existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-    missing = set(_required_indexes()) - existing
-    if missing:
-        raise RuntimeError(f"missing indexes: {sorted(missing)}")
+    by_name = {r[1]: r for r in conn.execute("PRAGMA index_list(metric_points)")}
+    for table in ("entities", "metric_samples", "events", "minute_rollups"):
+        by_name.update({r[1]: r for r in conn.execute(f"PRAGMA index_list({table})")})
+    for name, (_sql, table, columns, unique) in required.items():
+        row = by_name.get(name)
+        if row is None:
+            raise RuntimeError(f"missing index: {name}")
+        owner = conn.execute("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()
+        if owner is None or owner[0] != table:
+            raise RuntimeError(f"index {name} is owned by {owner[0] if owner else None}, expected {table}")
+        if _index_columns(conn, name) != columns:
+            raise RuntimeError(f"index {name} has wrong columns")
+        if bool(row[2]) != unique:
+            raise RuntimeError(f"index {name} uniqueness mismatch")
+
+
+def _ensure_metrics_view(conn: sqlite3.Connection) -> None:
+    if "metrics" in _views(conn):
+        conn.execute("DROP VIEW metrics")
+    conn.execute(
+        "CREATE VIEW metrics AS "
+        "SELECT NULL AS sample_id, e.entity_type AS scope, p.metric_name AS name, "
+        "p.numeric_value AS value, p.unit, p.quality, e.metadata_json AS labels_json "
+        "FROM metric_points p "
+        "JOIN entities e ON e.entity_pk = p.entity_pk"
+    )
 
 
 def _ensure_entity(conn: sqlite3.Connection, entity_type: str, entity_id: str, display: str | None, metadata: dict[str, object], now: int) -> int:
@@ -181,7 +229,49 @@ def _ensure_entity(conn: sqlite3.Connection, entity_type: str, entity_id: str, d
     return int(conn.execute("SELECT entity_pk FROM entities WHERE entity_type=? AND entity_id=?", (entity_type, entity_id)).fetchone()[0])
 
 
-def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -> sqlite3.Connection:
+def _legacy_metric_entity(scope: str, labels: dict[str, object]) -> tuple[str, str]:
+    if scope.startswith("tunnel."):
+        return "tunnel", scope.removeprefix("tunnel.")
+    if scope.startswith("service."):
+        return "service", scope.removeprefix("service.")
+    if scope.startswith("route."):
+        return "route", scope.removeprefix("route.")
+    if "interface" in labels:
+        iface = str(labels["interface"])
+        return "interface", f"interface:{iface}"
+    if "path" in labels:
+        path = str(labels["path"])
+        return "filesystem", f"fs:{path}"
+    for key in ("tunnel_id", "tunnel", "service"):
+        if key in labels:
+            value = str(labels[key])
+            if value.startswith("gost-"):
+                match = SERVICE_RE.match(value)
+                if match:
+                    return "tunnel", f"{match.group(1)}-{match.group(2)}"
+                return "service", value
+            return "tunnel", value
+    if scope == "collector":
+        return "collector", "local"
+    if scope == "host":
+        return "host", "local"
+    canonical = json.dumps(labels, sort_keys=True, separators=(",", ":"))
+    return scope, f"{scope}:{canonical}"
+
+
+def _dedupe_sample_identities(conn: sqlite3.Connection) -> None:
+    if "metrics_legacy" in _tables(conn) and {"sample_id"}.issubset(_columns(conn, "metrics_legacy")):
+        for cycle_id, identity, keep in conn.execute("SELECT cycle_id,sample_identity,MIN(sample_id) FROM metric_samples GROUP BY cycle_id,sample_identity HAVING COUNT(*)>1"):
+            dupes = [r[0] for r in conn.execute("SELECT sample_id FROM metric_samples WHERE cycle_id=? AND sample_identity=? AND sample_id<>?", (cycle_id, identity, keep))]
+            for sample_id in dupes:
+                conn.execute("UPDATE metrics_legacy SET sample_id=? WHERE sample_id=?", (keep, sample_id))
+    conn.execute(
+        "DELETE FROM metric_samples WHERE sample_id NOT IN "
+        "(SELECT MIN(sample_id) FROM metric_samples GROUP BY cycle_id,sample_identity)"
+    )
+
+
+def migrate_database(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -> sqlite3.Connection:
     conn = connect_db(db_path)
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -189,12 +279,30 @@ def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -
         tables = _tables(conn)
         if version > SCHEMA_VERSION:
             raise RuntimeError(f"unsupported schema version {version}")
+        pre_counts = {name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] for name in tables if name in {"tunnels", "metric_samples", "metrics", "metric_points", "minute_rollups", "sample_cycles"}}
+        if "metrics" in tables:
+            conn.execute("ALTER TABLE metrics RENAME TO metrics_legacy")
+            tables = _tables(conn)
         if "metric_samples" in tables and "cycle_id" not in _columns(conn, "metric_samples"):
             conn.execute("ALTER TABLE metric_samples RENAME TO metric_samples_legacy")
+            tables = _tables(conn)
         if "tunnels" in tables and "entity_pk" not in _columns(conn, "tunnels"):
             conn.execute("ALTER TABLE tunnels RENAME TO tunnels_legacy")
-        for sql in _v3_statements():
+            tables = _tables(conn)
+        if "minute_rollups" in tables and not {"entity_pk","metric_name","minute_start","samples","expected_samples","unavailable_count","coverage","unit","quality"}.issubset(_columns(conn, "minute_rollups")):
+            conn.execute("ALTER TABLE minute_rollups RENAME TO minute_rollups_legacy")
+            tables = _tables(conn)
+        if "metric_points" in tables and not _has_metric_points_unique(conn):
+            conn.execute("ALTER TABLE metric_points RENAME TO metric_points_legacy")
+            tables = _tables(conn)
+        for sql in _v4_statements():
             conn.execute(sql)
+        for column, default in (("missed_deadlines", "0"), ("overrun_seconds", "0.0")):
+            if column not in _columns(conn, "sample_cycles"):
+                conn.execute(f"ALTER TABLE sample_cycles ADD COLUMN {column} {'INTEGER' if column == 'missed_deadlines' else 'REAL'} NOT NULL DEFAULT {default}")
+        if "sample_identity" not in _columns(conn, "metric_samples"):
+            conn.execute("ALTER TABLE metric_samples ADD COLUMN sample_identity TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE metric_samples SET sample_identity=COALESCE(tunnel_id, 'host') WHERE sample_identity=''")
         if inject_failure == "after_create":
             raise RuntimeError("injected migration failure")
         now = int(time.time())
@@ -202,23 +310,88 @@ def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -
             for row in conn.execute("SELECT tunnel_id,side,tunnel_number,service_name,env_path,listen_ports_json,target_ports_json,updated_at FROM tunnels_legacy"):
                 entity_pk = _ensure_entity(conn, "tunnel", row[0], row[3], {"service": row[3]}, now)
                 conn.execute("INSERT OR IGNORE INTO tunnels VALUES(?,?,?,?,?,?,?,?,?)", (row[0], entity_pk, row[1], row[2], row[3], row[4], row[5], row[6], row[7]))
-            conn.execute("DROP TABLE tunnels_legacy")
         host_pk = _ensure_entity(conn, "host", "local", "local host", {}, now)
         if "metric_samples_legacy" in _tables(conn):
             for row in conn.execute("SELECT sample_id,tunnel_id,collected_at,service_state,service_substate,restart_count,listen_ports_total,listen_ports_up,configured_mappings_total,rx_bytes,tx_bytes FROM metric_samples_legacy"):
                 cycle = _cycle(conn, int(row[2]), float(row[2]), float(row[2]), 0.0, True, False)
-                conn.execute("INSERT OR IGNORE INTO metric_samples(sample_id,cycle_id,tunnel_id,collected_at,service_state,service_substate,restart_count,listen_ports_total,listen_ports_up,configured_mappings_total,rx_bytes,tx_bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (row[0], cycle, row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], None if row[9] == 0 else row[9], None if row[10] == 0 else row[10]))
+                conn.execute("INSERT OR IGNORE INTO metric_samples(sample_id,cycle_id,tunnel_id,sample_identity,collected_at,service_state,service_substate,restart_count,listen_ports_total,listen_ports_up,configured_mappings_total,rx_bytes,tx_bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (row[0], cycle, row[1], row[1] or 'host', row[2], row[3], row[4], row[5], row[6], row[7], row[8], None if row[9] == 0 else row[9], None if row[10] == 0 else row[10]))
+            pass
+        if "metric_points_legacy" in _tables(conn):
+            cols = _columns(conn, "metric_points_legacy")
+            select_cols = "point_id,cycle_id,entity_pk,metric_name,ts,numeric_value,text_value,unit,quality,reset,gap"
+            if {"point_id","cycle_id","entity_pk","metric_name","ts","numeric_value","text_value","unit","quality","reset","gap"}.issubset(cols):
+                conn.execute(
+                    "INSERT OR IGNORE INTO metric_points(point_id,cycle_id,entity_pk,metric_name,ts,numeric_value,text_value,unit,quality,reset,gap) "
+                    f"SELECT {select_cols} FROM metric_points_legacy"
+                )
+            conn.execute("DROP TABLE metric_points_legacy")
+        if "metrics_legacy" in _tables(conn):
+            cols = _columns(conn, "metrics_legacy")
+            if {"sample_id","scope","name","value","unit","quality","labels_json"}.issubset(cols):
+                for row in conn.execute("SELECT sample_id,scope,name,value,unit,quality,labels_json FROM metrics_legacy"):
+                    sample = conn.execute("SELECT cycle_id,collected_at FROM metric_samples WHERE sample_id=?", (row[0],)).fetchone()
+                    if not sample:
+                        continue
+                    labels = json.loads(row[6] or "{}")
+                    entity_type, entity_id = _legacy_metric_entity(str(row[1]), labels)
+                    entity_pk = _ensure_entity(conn, entity_type, entity_id, entity_id, labels, int(sample[1]))
+                    exists = conn.execute(
+                        "SELECT 1 FROM metric_points WHERE cycle_id=? AND entity_pk=? AND metric_name=?",
+                        (sample[0], entity_pk, row[2]),
+                    ).fetchone()
+                    if exists:
+                        continue
+                    conn.execute(
+                        "INSERT INTO metric_points(cycle_id,entity_pk,metric_name,ts,numeric_value,text_value,unit,quality,reset,gap) VALUES(?,?,?,?,?,?,?,?,0,0) "
+                        "ON CONFLICT(cycle_id,entity_pk,metric_name) DO UPDATE SET ts=excluded.ts,numeric_value=excluded.numeric_value,unit=excluded.unit,quality=excluded.quality",
+                        (sample[0], entity_pk, row[2], sample[1], row[3], None, row[4], row[5]),
+                    )
+            conn.execute("DROP TABLE metrics_legacy")
+        if "metric_samples_legacy" in _tables(conn):
             conn.execute("DROP TABLE metric_samples_legacy")
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)", (SCHEMA_VERSION, now))
+        if "tunnels_legacy" in _tables(conn):
+            conn.execute("DROP TABLE tunnels_legacy")
+        if "minute_rollups_legacy" in _tables(conn):
+            conn.execute("DROP INDEX IF EXISTS idx_minute_rollups_time")
+            conn.execute("ALTER TABLE minute_rollups_legacy RENAME TO minute_rollups_archive")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_minute_rollups_time ON minute_rollups_archive(minute_start)")
+        _ensure_metrics_view(conn)
+        conn.execute("INSERT OR REPLACE INTO schema_migrations(version,applied_at) VALUES(?,?)", (SCHEMA_VERSION, now))
+        _dedupe_sample_identities(conn)
         _ensure_indexes(conn)
         if inject_failure == "after_indexes":
             raise RuntimeError("injected migration failure")
+        post_counts = {name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] for name in {"tunnels", "metric_samples", "metric_points", "sample_cycles"}}
+        if pre_counts.get("tunnels", 0) and post_counts["tunnels"] < pre_counts["tunnels"]:
+            raise RuntimeError("tunnel migration row count decreased")
+        legacy_left = {name for name in _tables(conn) if name.endswith("_legacy")}
+        if legacy_left:
+            raise RuntimeError(f"stale legacy tables remain: {sorted(legacy_left)}")
+        fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if fk:
+            raise RuntimeError(f"foreign key check failed: {fk}")
+        required = {"schema_migrations","sample_cycles","entities","tunnels","metric_samples","metric_points","minute_rollups","events","collector_state"}
+        missing_tables = required - _tables(conn)
+        if missing_tables:
+            raise RuntimeError(f"missing required tables: {sorted(missing_tables)}")
         if _version(conn) != SCHEMA_VERSION:
-            raise RuntimeError("schema v3 postcondition failed")
+            raise RuntimeError("schema v4 postcondition failed")
         conn.commit()
     except Exception:
         conn.rollback()
         raise
+    return conn
+
+
+def init_db(db_path: str = DEFAULT_DB_PATH, inject_failure: str | None = None) -> sqlite3.Connection:
+    return migrate_database(db_path, inject_failure)
+
+
+def open_runtime_database(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    conn = connect_db(db_path)
+    if _version(conn) != SCHEMA_VERSION:
+        conn.close()
+        raise RuntimeError("monitoring database requires migration")
     return conn
 
 
@@ -337,6 +510,18 @@ def collect_sample(tunnel: Tunnel, now: int | None = None, runner: Callable[[Seq
     return MetricSample(tunnel.tunnel_id, ts, int(props.get("ActiveState") == "active"), int(props.get("SubState") == "running"), int(props.get("NRestarts") or 0), len(tunnel.listen_ports), len(owned_ports), len(tunnel.target_ports))
 
 
+def collect_tunnel_observation(tunnel: Tunnel, ts: int, props: dict[str, str], listeners: list[dict[str, object]]) -> tuple[MetricSample, str]:
+    main_pid = int(props.get("MainPID") or 0)
+    owned_ports = {int(r["port"]) for r in listeners if r["port"] in tunnel.listen_ports and r["pid"] == main_pid and r["process"] == "gost"}
+    quality = "exact"
+    for row in listeners:
+        if row["port"] in tunnel.listen_ports and (row["pid"] is None or not main_pid):
+            quality = "unavailable"
+            break
+    sample = MetricSample(tunnel.tunnel_id, ts, int(props.get("ActiveState") == "active"), int(props.get("SubState") == "running"), int(props.get("NRestarts") or 0), len(tunnel.listen_ports), len(owned_ports), len(tunnel.target_ports))
+    return sample, quality
+
+
 def listener_quality(tunnel: Tunnel, runner: Callable[[Sequence[str]], str] = _run) -> str:
     props = parse_systemd_properties(runner(["systemctl", "--no-pager", "show", tunnel.service_name, "--property=MainPID"]))
     main_pid = int(props.get("MainPID") or 0)
@@ -415,10 +600,8 @@ def collect_host_metrics(proc: Path = Path("/proc"), fs_paths: Iterable[Path] = 
     return metrics, events
 
 
-def _cycle(conn: sqlite3.Connection, ts: int, started: float, finished: float, duration: float, success: bool, overrun: bool) -> int:
-    cur = conn.execute("INSERT OR IGNORE INTO sample_cycles(collected_at,monotonic_started,monotonic_finished,duration_seconds,success,overrun) VALUES(?,?,?,?,?,?)", (ts, started, finished, duration, int(success), int(overrun)))
-    if cur.lastrowid:
-        return int(cur.lastrowid)
+def _cycle(conn: sqlite3.Connection, ts: int, started: float, finished: float, duration: float, success: bool, overrun: bool, missed: int = 0, overrun_seconds: float = 0.0) -> int:
+    conn.execute("INSERT INTO sample_cycles(collected_at,monotonic_started,monotonic_finished,duration_seconds,success,overrun,missed_deadlines,overrun_seconds) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(collected_at) DO UPDATE SET monotonic_started=excluded.monotonic_started,monotonic_finished=excluded.monotonic_finished,duration_seconds=excluded.duration_seconds,success=excluded.success,overrun=excluded.overrun,missed_deadlines=excluded.missed_deadlines,overrun_seconds=excluded.overrun_seconds", (ts, started, finished, duration, int(success), int(overrun), int(missed), float(overrun_seconds)))
     return int(conn.execute("SELECT cycle_id FROM sample_cycles WHERE collected_at=?", (ts,)).fetchone()[0])
 
 
@@ -436,13 +619,13 @@ def upsert_tunnel(conn: sqlite3.Connection, tunnel: Tunnel, now: int) -> None:
 
 def insert_sample(conn: sqlite3.Connection, sample: MetricSample, cycle_id: int | None = None) -> int:
     cid = cycle_id if cycle_id is not None else _cycle(conn, sample.collected_at, float(sample.collected_at), float(sample.collected_at), 0.0, True, False)
-    values = (cid, sample.tunnel_id, sample.collected_at, sample.service_state, sample.service_substate, sample.restart_count, sample.listen_ports_total, sample.listen_ports_up, sample.configured_mappings_total, sample.rx_bytes, sample.tx_bytes)
-    cur = conn.execute("INSERT OR REPLACE INTO metric_samples(cycle_id,tunnel_id,collected_at,service_state,service_substate,restart_count,listen_ports_total,listen_ports_up,configured_mappings_total,rx_bytes,tx_bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?)", values)
-    return int(cur.lastrowid or conn.execute("SELECT sample_id FROM metric_samples WHERE cycle_id=? AND tunnel_id IS ?", (cid, sample.tunnel_id)).fetchone()[0])
+    identity = sample.tunnel_id or "host"
+    values = (cid, sample.tunnel_id, identity, sample.collected_at, sample.service_state, sample.service_substate, sample.restart_count, sample.listen_ports_total, sample.listen_ports_up, sample.configured_mappings_total, sample.rx_bytes, sample.tx_bytes)
+    conn.execute("INSERT INTO metric_samples(cycle_id,tunnel_id,sample_identity,collected_at,service_state,service_substate,restart_count,listen_ports_total,listen_ports_up,configured_mappings_total,rx_bytes,tx_bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,sample_identity) DO UPDATE SET tunnel_id=excluded.tunnel_id,collected_at=excluded.collected_at,service_state=excluded.service_state,service_substate=excluded.service_substate,restart_count=excluded.restart_count,listen_ports_total=excluded.listen_ports_total,listen_ports_up=excluded.listen_ports_up,configured_mappings_total=excluded.configured_mappings_total,rx_bytes=excluded.rx_bytes,tx_bytes=excluded.tx_bytes", values)
+    return int(conn.execute("SELECT sample_id FROM metric_samples WHERE cycle_id=? AND sample_identity=?", (cid, identity)).fetchone()[0])
 
 
 def insert_metric(conn: sqlite3.Connection, sample_id: int, metric: Metric, cycle_id: int | None = None, ts: int | None = None) -> None:
-    conn.execute("INSERT INTO metrics(sample_id,scope,name,value,unit,quality,labels_json) VALUES(?,?,?,?,?,?,?)", (sample_id, metric.scope, metric.name, metric.value if isinstance(metric.value, (int, float)) else None, metric.unit, metric.quality, json.dumps(metric.labels, sort_keys=True)))
     if cycle_id is None or ts is None:
         row = conn.execute("SELECT cycle_id,collected_at FROM metric_samples WHERE sample_id=?", (sample_id,)).fetchone()
         cycle_id = int(row[0])
@@ -452,7 +635,7 @@ def insert_metric(conn: sqlite3.Connection, sample_id: int, metric: Metric, cycl
     entity_pk = _ensure_entity(conn, entity_type, entity_id, entity_id, metric.labels, ts)
     numeric = metric.value if isinstance(metric.value, (int, float)) else None
     text = metric.value if isinstance(metric.value, str) else None
-    conn.execute("INSERT INTO metric_points(cycle_id,entity_pk,metric_name,ts,numeric_value,text_value,unit,quality,reset,gap) VALUES(?,?,?,?,?,?,?,?,?,?)", (cycle_id, entity_pk, metric.name, ts, numeric, text, metric.unit, metric.quality, int(metric.reset), int(metric.gap)))
+    conn.execute("INSERT INTO metric_points(cycle_id,entity_pk,metric_name,ts,numeric_value,text_value,unit,quality,reset,gap) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,entity_pk,metric_name) DO UPDATE SET ts=excluded.ts,numeric_value=excluded.numeric_value,text_value=excluded.text_value,unit=excluded.unit,quality=excluded.quality,reset=excluded.reset,gap=excluded.gap", (cycle_id, entity_pk, metric.name, ts, numeric, text, metric.unit, metric.quality, int(metric.reset), int(metric.gap)))
 
 
 def quality_worst(qualities: Iterable[str]) -> str:
@@ -486,18 +669,19 @@ def rollup_completed_minutes(conn: sqlite3.Connection, now: int, interval: float
     rows = conn.execute("SELECT entity_pk,metric_name,ts,numeric_value,unit,quality,reset,gap FROM metric_points WHERE ts>=? AND ts<?", (start, end)).fetchall()
     conn.row_factory = None
     for row in rows:
-        if row["numeric_value"] is None:
-            continue
         key = (int(row["entity_pk"]), str(row["metric_name"]), (int(row["ts"]) // 60) * 60, str(row["unit"]))
         groups.setdefault(key, []).append(row)
     for (entity_pk, metric_name, minute, unit), points in groups.items():
-        values = [float(p["numeric_value"]) for p in points]
+        values = [float(p["numeric_value"]) for p in points if p["numeric_value"] is not None]
         q = quality_worst(str(p["quality"]) for p in points)
         unavailable = sum(1 for p in points if p["quality"] == "unavailable")
         resets = sum(int(p["reset"]) for p in points)
         gaps = sum(int(p["gap"]) for p in points)
         coverage = min(1.0, len(points) / expected)
-        conn.execute("INSERT OR REPLACE INTO minute_rollups(entity_pk,metric_name,minute_start,samples,expected_samples,min_value,avg_value,max_value,unavailable_count,reset_count,gap_count,coverage,unit,quality) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entity_pk, metric_name, minute, len(points), expected, min(values), sum(values) / len(values), max(values), unavailable, resets, gaps, coverage, unit, q))
+        min_v = min(values) if values else None
+        avg_v = (sum(values) / len(values)) if values else None
+        max_v = max(values) if values else None
+        conn.execute("INSERT OR REPLACE INTO minute_rollups(entity_pk,metric_name,minute_start,samples,expected_samples,min_value,avg_value,max_value,unavailable_count,reset_count,gap_count,coverage,unit,quality) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entity_pk, metric_name, minute, len(points), expected, min_v, avg_v, max_v, unavailable, resets, gaps, coverage, unit, q))
     _set_state(conn, "minute_rollup_watermark", end)
 
 
@@ -511,13 +695,72 @@ def apply_retention(conn: sqlite3.Connection, now: int) -> None:
 def run_maintenance(conn: sqlite3.Connection, now: int) -> None:
     rollup_completed_minutes(conn, now)
     apply_retention(conn, now)
-    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
 
-def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Callable[[Sequence[str]], str] = _run, proc: Path = Path("/proc"), clock: Clock = Clock(), maintenance: bool = False, overrun: bool = False) -> int:
+def checkpoint_wal(db_path: str) -> tuple[int, int, int]:
+    conn = connect_db(db_path)
+    try:
+        return tuple(int(x) for x in conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone())  # type: ignore[return-value]
+    finally:
+        conn.close()
+
+
+def record_cycle_overrun(db_path: str, ts: int, finished: float, deadline: float, interval: float) -> None:
+    overrun_seconds = max(0.0, finished - (deadline + interval))
+    if overrun_seconds <= 0:
+        return
+    missed = math.ceil(overrun_seconds / interval) if interval > 0 else 0
+    conn = open_runtime_database(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE sample_cycles SET overrun=1, missed_deadlines=?, overrun_seconds=? WHERE collected_at=?",
+            (missed, overrun_seconds, ts),
+        )
+        insert_event(conn, Event(ts, "warning", "collection_overrun", "Collection cycle exceeded its deadline", {"missed_deadlines": missed, "overrun_seconds": overrun_seconds}))
+        row = conn.execute("SELECT cycle_id FROM sample_cycles WHERE collected_at=?", (ts,)).fetchone()
+        if row:
+            sid = insert_sample(conn, MetricSample(None, ts, 1, 1, 0, 0, 0, 0), int(row[0]))
+            insert_metric(conn, sid, Metric("collector", "missed_deadlines", missed, "count", "exact", entity_type="collector", entity_id="local"), int(row[0]), ts)
+            insert_metric(conn, sid, Metric("collector", "overrun_seconds", overrun_seconds, "seconds", "exact", entity_type="collector", entity_id="local"), int(row[0]), ts)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+class CollectionCycleError(RuntimeError):
+    def __init__(self, ts: int, message: str):
+        super().__init__(message)
+        self.ts = ts
+
+
+def _record_checkpoint_result(db_path: str, ts: int, cycle_id: int, sample_id: int, result: tuple[int, int, int] | None, error: Exception | None, conn_factory: Callable[[str], sqlite3.Connection], event_writer: Callable[[sqlite3.Connection, Event], None], metric_writer: Callable[[sqlite3.Connection, int, Metric, int | None, int | None], None]) -> None:
+    conn = conn_factory(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if error is None and result is not None:
+            event_writer(conn, Event(ts, "info", "wal_checkpoint", "WAL checkpoint completed", {"busy": result[0], "log": result[1], "checkpointed": result[2]}))
+            metric_writer(conn, sample_id, Metric("collector", "checkpoint_success", 1, "count", "exact", entity_type="collector", entity_id="local"), cycle_id, ts)
+        else:
+            event_writer(conn, Event(ts, "warning", "wal_checkpoint_failed", "WAL checkpoint failed after collection commit", {"error": str(error)}))
+            metric_writer(conn, sample_id, Metric("collector", "checkpoint_success", 0, "count", "exact", entity_type="collector", entity_id="local"), cycle_id, ts)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Callable[[Sequence[str]], str] = _run, proc: Path = Path("/proc"), clock: Clock = Clock(), maintenance: bool = False, overrun: bool = False, missed_deadlines: int = 0, overrun_seconds: float = 0.0, checkpoint: Callable[[str], tuple[int, int, int]] = checkpoint_wal, maintenance_conn_factory: Callable[[str], sqlite3.Connection] = open_runtime_database, checkpoint_event_writer: Callable[[sqlite3.Connection, Event], None] = insert_event, checkpoint_metric_writer: Callable[[sqlite3.Connection, int, Metric, int | None, int | None], None] = insert_metric) -> int:
     ts = int(clock.wall() if now is None else now)
     started = clock.monotonic()
-    conn = init_db(db_path)
+    if not Path(db_path).exists():
+        migrate_database(db_path)
+    conn = open_runtime_database(db_path)
     success = False
     try:
         tunnels, events = discover_tunnels(env_dir, clock)
@@ -526,11 +769,14 @@ def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Cal
             insert_event(conn, event)
         finished = clock.monotonic()
         cycle_id = _cycle(conn, ts, started, finished, max(0.0, finished - started), True, overrun)
+        ss_text = runner(["ss", "-H", "-lntp"]) if tunnels else ""
+        listeners = parse_ss_listeners(ss_text)
+        service_props = {t.service_name: parse_systemd_properties(runner(["systemctl", "--no-pager", "show", t.service_name, "--property=ActiveState,SubState,NRestarts,MainPID,ExecMainStartTimestampMonotonic"])) for t in tunnels}
         for tunnel in tunnels:
             upsert_tunnel(conn, tunnel, ts)
-            sample = collect_sample(tunnel, ts, runner)
+            sample, lq = collect_tunnel_observation(tunnel, ts, service_props[tunnel.service_name], listeners)
             sid = insert_sample(conn, sample, cycle_id)
-            insert_metric(conn, sid, Metric(f"tunnel.{tunnel.tunnel_id}", "listen_ports_up", sample.listen_ports_up, "count", listener_quality(tunnel, runner), entity_type="tunnel", entity_id=tunnel.tunnel_id), cycle_id, ts)
+            insert_metric(conn, sid, Metric(f"tunnel.{tunnel.tunnel_id}", "listen_ports_up", sample.listen_ports_up, "count", lq, entity_type="tunnel", entity_id=tunnel.tunnel_id), cycle_id, ts)
         host_metrics, host_events = collect_host_metrics(proc)
         sid = insert_sample(conn, MetricSample(None, ts, 1, 1, 0, 0, 0, 0), cycle_id)
         all_metrics = host_metrics + [Metric("collector", "duration_seconds", clock.monotonic() - started, "seconds", "derived", entity_type="collector", entity_id="local"), Metric("collector", "tunnels_discovered", len(tunnels), "count", "exact", entity_type="collector", entity_id="local")]
@@ -540,19 +786,32 @@ def collect_once(db_path: str, env_dir: str, now: int | None = None, runner: Cal
             insert_event(conn, event)
         if maintenance:
             run_maintenance(conn, ts)
+        finished = clock.monotonic()
+        _cycle(conn, ts, started, finished, max(0.0, finished - started), True, overrun, missed_deadlines, overrun_seconds)
         conn.commit()
         success = True
+        if maintenance:
+            ckpt: tuple[int, int, int] | None = None
+            ckpt_error: Exception | None = None
+            try:
+                ckpt = checkpoint(db_path)
+            except Exception as exc:
+                ckpt_error = exc
+            try:
+                _record_checkpoint_result(db_path, ts, cycle_id, sid, ckpt, ckpt_error, maintenance_conn_factory, checkpoint_event_writer, checkpoint_metric_writer)
+            except Exception:
+                pass
         return ts
     except Exception as exc:
         conn.rollback()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            cycle_id = _cycle(conn, ts, started, clock.monotonic(), max(0.0, clock.monotonic() - started), False, overrun)
+            cycle_id = _cycle(conn, ts, started, clock.monotonic(), max(0.0, clock.monotonic() - started), False, overrun, missed_deadlines, overrun_seconds)
             insert_event(conn, Event(ts, "error", "collection_error", str(exc), {"cycle_id": cycle_id}))
             conn.commit()
         except Exception:
             conn.rollback()
-        raise
+        raise CollectionCycleError(ts, str(exc)) from exc
     finally:
         if not success:
             pass
@@ -571,31 +830,41 @@ def scheduler_ticks(start: float, interval: float, durations: Sequence[float]) -
     return ticks
 
 
-def run_daemon(db_path: str, env_dir: str, interval: float = DEFAULT_SAMPLE_INTERVAL_SECONDS, maintenance_interval: float = MAINTENANCE_INTERVAL_SECONDS, runner: Callable[[Sequence[str]], str] = _run, clock: Clock = Clock(), sleeper: Callable[[float], None] = time.sleep) -> int:
+def run_daemon(db_path: str, env_dir: str, interval: float = DEFAULT_SAMPLE_INTERVAL_SECONDS, maintenance_interval: float = MAINTENANCE_INTERVAL_SECONDS, runner: Callable[[Sequence[str]], str] = _run, clock: Clock = Clock(), sleeper: Callable[[float], None] = time.sleep, stop_requested: Callable[[], bool] | None = None) -> int:
     stop = False
     def _stop(_signum: int, _frame: object) -> None:
         nonlocal stop
         stop = True
+    migrate_database(db_path)
     old_term = signal.signal(signal.SIGTERM, _stop)
     old_int = signal.signal(signal.SIGINT, _stop)
     try:
         deadline = clock.monotonic()
         next_maintenance = deadline
-        while not stop:
+        while not stop and not (stop_requested and stop_requested()):
             now_mono = clock.monotonic()
             if now_mono < deadline:
                 sleeper(deadline - now_mono)
                 continue
-            overrun = now_mono > deadline + interval
             maintenance = now_mono >= next_maintenance
             if maintenance:
                 next_maintenance = now_mono + maintenance_interval
             try:
-                collect_once(db_path, env_dir, runner=runner, clock=clock, maintenance=maintenance, overrun=overrun)
+                cycle_ts = collect_once(db_path, env_dir, runner=runner, clock=clock, maintenance=maintenance, overrun=False, missed_deadlines=0, overrun_seconds=0.0)
+                finished = clock.monotonic()
+                record_cycle_overrun(db_path, cycle_ts, finished, deadline, interval)
+            except CollectionCycleError as exc:
+                finished = clock.monotonic()
+                try:
+                    record_cycle_overrun(db_path, exc.ts, finished, deadline, interval)
+                except Exception:
+                    pass
+                print(f"collection failed: {exc}", file=sys.stderr)
             except Exception as exc:
                 print(f"collection failed: {exc}", file=sys.stderr)
             deadline += interval
-            while deadline < clock.monotonic():
+            current = clock.monotonic()
+            while deadline < current:
                 deadline += interval
         return 0
     finally:
@@ -614,6 +883,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.once:
         try:
+            migrate_database(args.db)
             collect_once(args.db, args.env_dir, args.now, maintenance=True)
             return 0
         except Exception as exc:
