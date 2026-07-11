@@ -68,6 +68,9 @@ class MonitoringPerformanceTests(unittest.TestCase):
 
     def test_representative_storage_budget_is_explicit_and_bounded(self):
         budget = representative_storage_budget()
+        self.assertEqual(budget.raw_retention_hours, 48)
+        self.assertEqual(budget.rollup_retention_days, 30)
+        self.assertEqual(budget.event_retention_days, 30)
         self.assertEqual(budget.metric_points_per_day, 9_120_960)
         self.assertEqual(budget.raw_metric_points, 18_241_920)
         self.assertEqual(budget.minute_rollup_rows, 25_185_600)
@@ -101,6 +104,30 @@ class MonitoringPerformanceTests(unittest.TestCase):
             budget.estimated_total_database_bytes,
             without_rollups.estimated_total_database_bytes
             + budget.estimated_rollup_table_bytes,
+        )
+
+    def test_event_retention_is_independent_from_rollup_retention(self):
+        seven_day_events = estimate_storage_budget(event_retention_days=7)
+        seven_day_rollups = estimate_storage_budget(
+            rollup_retention_days=7,
+            event_retention_days=30,
+        )
+        self.assertEqual(seven_day_events.event_rows, 35_000)
+        self.assertEqual(seven_day_events.event_retention_days, 7)
+        self.assertEqual(seven_day_events.minute_rollup_rows, 25_185_600)
+        self.assertEqual(seven_day_rollups.event_rows, 150_000)
+        self.assertEqual(seven_day_rollups.event_retention_days, 30)
+        self.assertEqual(
+            seven_day_rollups.minute_rollup_rows,
+            REPRESENTATIVE_ROLLUP_SERIES_PER_MINUTE * 60 * 24 * 7,
+        )
+        self.assertEqual(
+            seven_day_events.raw_metric_points,
+            seven_day_rollups.raw_metric_points,
+        )
+        self.assertLess(
+            seven_day_events.estimated_events_bytes,
+            seven_day_rollups.estimated_events_bytes,
         )
 
     def test_twenty_thousand_socket_snapshot_stays_within_one_cycle_budget(self):

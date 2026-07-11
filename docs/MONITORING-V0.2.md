@@ -39,6 +39,7 @@ Defaults:
 - sample interval: 5 seconds;
 - raw sample retention: 48 hours;
 - one-minute rollup retention: 30 days;
+- structured event retention: 30 days;
 - cleanup interval: 15 minutes;
 - maximum tolerated missed-sample gap before coverage is marked incomplete: 2.5 sample intervals.
 
@@ -348,7 +349,7 @@ Secret state is never included in monitoring export.
 
 ### Representative storage budget
 
-The planning profile is one NGINX unit with one master and two workers plus six managed GOST services. It assumes five-second fast samples, 30-second full socket snapshots, 60-second FD/limit/filesystem samples, 48-hour raw retention, and 30-day minute-rollup retention.
+The planning profile is one NGINX unit with one master and two workers plus six managed GOST services. It assumes five-second fast samples, 30-second full socket snapshots, 60-second FD/limit/filesystem samples, 48-hour raw retention, 30-day minute-rollup retention, and an explicit 30-day structured-event retention policy.
 
 The current metric-family model, measured with deterministic fixtures for that exact service profile, records 522 points per fast cycle, 9 additional points per full socket cycle, and 52 additional points per slow cycle. The completed-minute rollup has approximately 583 metric series. The resulting retained row counts are:
 
@@ -356,7 +357,7 @@ The current metric-family model, measured with deterministic fixtures for that e
 - 18,241,920 raw metric points over 48 hours;
 - 25,185,600 minute-rollup rows over 30 days;
 - 34,560 `sample_cycles` rows and 241,920 `metric_samples` rows over 48 hours;
-- a planning allowance of 150,000 deduplicated event rows over 30 days and 2,048 entity rows.
+- 150,000 retained event rows at 5,000 deduplicated events per day over the independent 30-day event window, plus 2,048 entity rows.
 
 The deterministic capacity estimate uses 128 bytes per raw metric row and 160 bytes per minute-rollup row before indexes. It reserves 128 bytes per sample-cycle row, 192 bytes per metric-sample row, and 512 bytes per event or entity row. Small schema, tunnel, and collector-state tables are covered by the entity allowance and the free-page factor. It then adds 50 percent of table bytes for SQLite primary-key and secondary indexes, B-tree fill variance, and reusable free pages, followed by 20 percent for WAL growth, checkpoints, and operational headroom.
 
@@ -369,7 +370,7 @@ Under those conservative assumptions the estimated occupancy is:
 - 1.81 GiB for WAL and operational headroom;
 - 10.89 GiB estimated total database footprint.
 
-Operators should reserve at least 12 GiB for the monitoring database under this profile. A 5 GiB reservation is not sufficient once 30-day minute rollups are included. Hosts with more interfaces, disks, services, metric cardinality, or event volume need additional space; reducing raw/rollup retention or metric cardinality reduces the requirement. The 150,000-event allowance is a 30-day planning horizon, so unusually high long-term event volume must be budgeted separately.
+Operators should reserve at least 12 GiB for the monitoring database under this profile. A 5 GiB reservation is not sufficient once 30-day minute rollups are included. Hosts with more interfaces, disks, services, metric cardinality, or event volume need additional space; reducing raw, rollup, or event retention or reducing metric cardinality lowers the requirement. Maintenance deletes structured events with timestamps older than `EVENT_RETENTION_SECONDS`; events exactly at the cutoff remain. `EVENT_RETENTION_SECONDS` is an explicit 30-day policy and does not alias the rollup-retention constant.
 
 Process CPU/stat and aggregate RSS/thread observations remain on the fast cadence. `/proc/<pid>/fd`, process limits, cgroup file memory, filesystem capacity, and database-size observations use the slow cadence. A service PID set comes from `cgroup.procs`; MainPID fallback totals are estimated rather than exact. Only a complete authoritative cgroup PID set plus complete fast process snapshots advances process-set transition state. A missing fast snapshot makes process metrics unavailable for that cycle without emitting `pid_replaced`, and non-authoritative MainPID fallback never overwrites the last authoritative identity. Identity-bound socket and slow-process caches are neither read nor replaced when the current identity cannot be confirmed. Inactive historical source-error keys are retained for at most 48 hours and capped at 64 keys, while the global error total remains cumulative.
 
@@ -389,7 +390,7 @@ The deterministic performance suite parses and attributes a synthetic 20,000-row
 
 ## Issue #8 collector-core contract status
 
-The accepted collector core uses `/var/lib/gost-manager/metrics.sqlite3` by default and samples every 5 seconds.  It uses `time.monotonic()` scheduling primitives, explicit SQLite sample transactions, WAL mode, busy timeout, foreign keys, 48-hour raw retention, 30-day one-minute rollup retention, and 15-minute maintenance cadence.
+The accepted collector core uses `/var/lib/gost-manager/metrics.sqlite3` by default and samples every 5 seconds.  It uses `time.monotonic()` scheduling primitives, explicit SQLite sample transactions, WAL mode, busy timeout, foreign keys, 48-hour raw retention, 30-day one-minute rollup retention, explicit 30-day structured-event retention, and 15-minute maintenance cadence.
 
 Legacy Direct Mode discovery is intentionally narrow.  Iran env files read listen/target ports only from validated `MAPPINGS`; Kharej env files read the listener only from validated `TUNNEL_PORT`.  The collector never scans arbitrary env values, so IP addresses, credentials, UUIDs, and tokens are not treated as ports.  Malformed env files produce structured `env_parse_error` events and do not stop the rest of the collection cycle.  Monitoring does not write to existing env files.
 

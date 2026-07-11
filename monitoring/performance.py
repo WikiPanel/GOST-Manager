@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 import math
 
+from monitoring.schema import EVENT_RETENTION_SECONDS
+
 SECONDS_PER_DAY = 24 * 60 * 60
 MINUTES_PER_DAY = 24 * 60
 GIB = 1024 ** 3
@@ -14,6 +16,7 @@ REPRESENTATIVE_FULL_SOCKET_EXTRA_POINTS = 9
 REPRESENTATIVE_SLOW_EXTRA_POINTS = 52
 REPRESENTATIVE_ROLLUP_SERIES_PER_MINUTE = 583
 REPRESENTATIVE_SAMPLES_PER_CYCLE = 7
+REPRESENTATIVE_EVENT_RETENTION_DAYS = EVENT_RETENTION_SECONDS // SECONDS_PER_DAY
 
 ESTIMATED_RAW_TABLE_BYTES_PER_POINT = 128
 ESTIMATED_ROLLUP_TABLE_BYTES_PER_ROW = 160
@@ -30,6 +33,9 @@ RESERVATION_INCREMENT_BYTES = 2 * GIB
 
 @dataclasses.dataclass(frozen=True)
 class StorageBudget:
+    raw_retention_hours: int
+    rollup_retention_days: int
+    event_retention_days: int
     metric_points_per_day: int
     raw_metric_points: int
     minute_rollup_rows: int
@@ -77,6 +83,7 @@ def estimate_storage_budget(
     slow_interval: float = 60.0,
     raw_retention_hours: int = 48,
     rollup_retention_days: int = 30,
+    event_retention_days: int = REPRESENTATIVE_EVENT_RETENTION_DAYS,
     events_per_day: int = REPRESENTATIVE_EVENTS_PER_DAY,
     entity_capacity: int = REPRESENTATIVE_ENTITY_CAPACITY,
     raw_bytes_per_point: int = ESTIMATED_RAW_TABLE_BYTES_PER_POINT,
@@ -96,7 +103,7 @@ def estimate_storage_budget(
     rollup_rows = rollup_series_per_minute * MINUTES_PER_DAY * rollup_retention_days
     sample_cycle_rows = math.ceil(raw_retention_hours * 3600 / sample_interval)
     metric_sample_rows = sample_cycle_rows * samples_per_cycle
-    event_rows = events_per_day * rollup_retention_days
+    event_rows = events_per_day * event_retention_days
 
     raw_table_bytes = raw_points * raw_bytes_per_point
     rollup_table_bytes = rollup_rows * rollup_bytes_per_row
@@ -123,6 +130,9 @@ def estimate_storage_budget(
         * RESERVATION_INCREMENT_BYTES
     )
     return StorageBudget(
+        raw_retention_hours=raw_retention_hours,
+        rollup_retention_days=rollup_retention_days,
+        event_retention_days=event_retention_days,
         metric_points_per_day=points_per_day,
         raw_metric_points=raw_points,
         minute_rollup_rows=rollup_rows,

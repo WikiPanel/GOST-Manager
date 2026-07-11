@@ -17,6 +17,7 @@ DEFAULT_DB_PATH = "/var/lib/gost-manager/metrics.sqlite3"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 5.0
 RAW_RETENTION_SECONDS = 48 * 3600
 ROLLUP_RETENTION_SECONDS = 30 * 24 * 3600
+EVENT_RETENTION_SECONDS = 30 * 24 * 3600
 ROLLUP_BATCH_MINUTES = 240
 SENSITIVE_KEY_RE = re.compile(
     r"(?:^|_)(?:pass|password|token|secret|credential|auth|username|gost_user)(?:$|_)",
@@ -846,6 +847,10 @@ def apply_retention(conn: sqlite3.Connection, now: int) -> None:
     conn.execute(
         "DELETE FROM minute_rollups WHERE minute_start < ?",
         (now - ROLLUP_RETENTION_SECONDS,),
+    )
+    conn.execute(
+        "DELETE FROM events WHERE ts < ?",
+        (now - EVENT_RETENTION_SECONDS,),
     )
 
 
