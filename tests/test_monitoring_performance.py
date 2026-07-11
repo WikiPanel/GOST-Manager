@@ -10,9 +10,12 @@ from pathlib import Path
 
 from monitoring.collector import CollectorConfig, CommandResult, collect_once
 from monitoring.performance import (
+    GIB,
     REPRESENTATIVE_FAST_POINTS_PER_CYCLE,
     REPRESENTATIVE_FULL_SOCKET_EXTRA_POINTS,
+    REPRESENTATIVE_ROLLUP_SERIES_PER_MINUTE,
     REPRESENTATIVE_SLOW_EXTRA_POINTS,
+    estimate_storage_budget,
     representative_storage_budget,
 )
 from monitoring.schema import init_db
@@ -67,7 +70,38 @@ class MonitoringPerformanceTests(unittest.TestCase):
         budget = representative_storage_budget()
         self.assertEqual(budget.metric_points_per_day, 9_120_960)
         self.assertEqual(budget.raw_metric_points, 18_241_920)
-        self.assertAlmostEqual(budget.estimated_sqlite_gib, 3.751, places=3)
+        self.assertEqual(budget.minute_rollup_rows, 25_185_600)
+        self.assertEqual(budget.sample_cycle_rows, 34_560)
+        self.assertEqual(budget.metric_sample_rows, 241_920)
+        self.assertEqual(budget.event_rows, 150_000)
+        self.assertEqual(budget.entity_rows, 2_048)
+        self.assertAlmostEqual(budget.estimated_total_database_gib, 10.885, places=3)
+        self.assertEqual(budget.recommended_disk_reservation_bytes, 12 * GIB)
+        self.assertEqual(budget.recommended_disk_reservation_gib, 12.0)
+
+    def test_thirty_day_rollups_are_included_in_total_database_bytes(self):
+        budget = estimate_storage_budget()
+        table_bytes = (
+            budget.estimated_raw_table_bytes
+            + budget.estimated_rollup_table_bytes
+            + budget.estimated_auxiliary_table_bytes
+        )
+        self.assertEqual(
+            budget.minute_rollup_rows,
+            REPRESENTATIVE_ROLLUP_SERIES_PER_MINUTE * 60 * 24 * 30,
+        )
+        self.assertEqual(
+            budget.estimated_total_database_bytes,
+            table_bytes
+            + budget.estimated_indexes_and_free_pages_bytes
+            + budget.wal_and_operational_headroom_bytes,
+        )
+        without_rollups = estimate_storage_budget(rollup_retention_days=0)
+        self.assertGreater(
+            budget.estimated_total_database_bytes,
+            without_rollups.estimated_total_database_bytes
+            + budget.estimated_rollup_table_bytes,
+        )
 
     def test_twenty_thousand_socket_snapshot_stays_within_one_cycle_budget(self):
         rows = "\n".join(

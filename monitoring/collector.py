@@ -920,7 +920,7 @@ def _service_socket_metrics(
     service: str,
     pids: tuple[int, ...],
     pids_authoritative: bool,
-    process_identity: str,
+    process_identity: str | None,
     full_socket_due: bool,
     full_records: list[SocketRecord] | None,
 ) -> list[Metric]:
@@ -930,7 +930,12 @@ def _service_socket_metrics(
     established_quality = "unavailable"
     states: dict[str, int | None] = {state: None for state in TCP_SOCKET_STATES}
     state_qualities = {state: "unavailable" for state in TCP_SOCKET_STATES}
-    if pids and pids_authoritative and full_socket_due and full_records is not None:
+    if (
+        pids
+        and pids_authoritative
+        and full_socket_due
+        and full_records is not None
+    ):
         for state in TCP_SOCKET_STATES:
             state_records = [record for record in full_records if record.state == state]
             if any(record.pid is None for record in state_records):
@@ -939,16 +944,22 @@ def _service_socket_metrics(
             state_qualities[state] = "exact"
         established = states["ESTAB"]
         established_quality = state_qualities["ESTAB"]
-        set_json_state(
-            conn,
-            cache_key,
-            {
-                "identity": process_identity,
-                "established": established,
-                "states": states,
-            },
-        )
-    elif pids and pids_authoritative and (not full_socket_due or full_records is None):
+        if process_identity is not None:
+            set_json_state(
+                conn,
+                cache_key,
+                {
+                    "identity": process_identity,
+                    "established": established,
+                    "states": states,
+                },
+            )
+    elif (
+        pids
+        and pids_authoritative
+        and process_identity is not None
+        and (not full_socket_due or full_records is None)
+    ):
         cached = get_json_state(conn, cache_key)
         if (
             isinstance(cached, dict)
@@ -1012,7 +1023,7 @@ def _tunnel_remote_socket_metric(
     tunnel: Tunnel,
     pids: tuple[int, ...],
     pids_authoritative: bool,
-    process_identity: str,
+    process_identity: str | None,
     full_socket_due: bool,
     full_records: list[SocketRecord] | None,
 ) -> Metric:
@@ -1035,16 +1046,22 @@ def _tunnel_remote_socket_metric(
         )
         if value is not None:
             quality = "exact"
-            set_json_state(
-                conn,
-                cache_key,
-                {
-                    "identity": process_identity,
-                    "endpoint": tunnel.remote_endpoint,
-                    "value": value,
-                },
-            )
-    elif endpoint is not None and pids and pids_authoritative:
+            if process_identity is not None:
+                set_json_state(
+                    conn,
+                    cache_key,
+                    {
+                        "identity": process_identity,
+                        "endpoint": tunnel.remote_endpoint,
+                        "value": value,
+                    },
+                )
+    elif (
+        endpoint is not None
+        and pids
+        and pids_authoritative
+        and process_identity is not None
+    ):
         cached = get_json_state(conn, cache_key)
         if (
             isinstance(cached, dict)
@@ -1136,13 +1153,9 @@ def _process_slow_values(
 
 def _process_identity(
     start_identity: str,
-    pid_set: ServicePidSet,
-    snapshot: ServiceProcessSnapshot | None,
+    snapshot: ServiceProcessSnapshot,
 ) -> str:
-    if snapshot is not None:
-        members = ",".join(f"{pid}:{start}" for pid, start in snapshot.identity)
-    else:
-        members = ",".join(str(pid) for pid in pid_set.pids) + ":incomplete"
+    members = ",".join(f"{pid}:{start}" for pid, start in snapshot.identity)
     return f"{start_identity}|{members}"
 
 
@@ -1150,7 +1163,7 @@ def _cgroup_memory_values(
     conn: sqlite3.Connection,
     service: str,
     control_group: str,
-    process_identity: str,
+    process_identity: str | None,
     slow_sources_due: bool,
     captured: object,
 ) -> list[Metric]:
@@ -1158,16 +1171,19 @@ def _cgroup_memory_values(
     if slow_sources_due:
         if not isinstance(captured, dict):
             return []
-        set_json_state(
-            conn,
-            cache_key,
-            {
-                "control_group": control_group,
-                "identity": process_identity,
-                "values": captured,
-            },
-        )
+        if process_identity is not None:
+            set_json_state(
+                conn,
+                cache_key,
+                {
+                    "control_group": control_group,
+                    "identity": process_identity,
+                    "values": captured,
+                },
+            )
         return cgroup_memory_metrics(service, captured)
+    if process_identity is None:
+        return []
     cached = get_json_state(conn, cache_key)
     if (
         not isinstance(cached, dict)
@@ -1266,9 +1282,15 @@ def _service_and_tunnel_metrics(
                         slow_complete,
                         pid_set.authoritative,
                     )
-                process_identity = _process_identity(start_identity, pid_set, snapshot)
-                identities_by_service[service] = process_identity
-                local_events.extend(event_state.value_transition(f"service.pid_identity.{service}", process_identity, ts, "pid_replaced", "Managed service process set changed", {"service": service, "process_count": len(pid_set.pids)}))
+                process_identity = (
+                    _process_identity(start_identity, snapshot)
+                    if snapshot is not None
+                    else None
+                )
+                if process_identity is not None:
+                    identities_by_service[service] = process_identity
+                if pid_set.authoritative and process_identity is not None:
+                    local_events.extend(event_state.value_transition(f"service.pid_identity.{service}", process_identity, ts, "pid_replaced", "Managed service process set changed", {"service": service, "process_count": len(pid_set.pids)}))
                 if snapshot is not None:
                     previous_mono, previous_raw = _timed_state(conn, f"counter.process.{service}")
                     previous = _service_process_from_state(previous_raw)
@@ -1349,7 +1371,7 @@ def _service_and_tunnel_metrics(
             upsert_tunnel(conn, tunnel, ts)
             props = props_by_service.get(tunnel.service_name, {})
             pid_set = pid_sets_by_service.get(tunnel.service_name, ServicePidSet((), False))
-            process_identity = identities_by_service.get(tunnel.service_name, "")
+            process_identity = identities_by_service.get(tunnel.service_name)
             listener_authoritative = (
                 bool(props)
                 and bool(pid_set.pids)

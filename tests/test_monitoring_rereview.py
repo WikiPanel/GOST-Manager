@@ -67,6 +67,170 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             self.assertEqual(stored_metric(conn, "nginx.service", "established_sockets_total")[0], 2)
             self.assertEqual(stored_metric(conn, "nginx.service", "established_sockets_total")[2], "exact")
 
+    def test_incomplete_fast_snapshot_does_not_replace_authoritative_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fail_worker = [False]
+            mono = [10.0]
+            failed_stat = FIXTURES / "proc/3132/stat"
+
+            def reader(path):
+                if fail_worker[0] and path == failed_stat:
+                    raise OSError("transient process stat failure")
+                return path.read_text(encoding="utf-8")
+
+            def command(parts):
+                if parts[0] == "ss":
+                    return CommandResult(fixture("ss-nginx-multiprocess.txt"), "", 0)
+                return fixture("systemd-nginx.txt")
+
+            db = str(root / "metrics.sqlite3")
+            sources = integration_sources(root, command, mono, reader)
+            config = CollectorConfig(filesystem_paths=(Path("/"),))
+
+            collect_once(db, str(root / "env"), 1000, sources, config)
+            conn = init_db(db)
+            initial_socket_cache = get_json_state(
+                conn, "socket_cache.service.nginx.service"
+            )
+            initial_slow_cache = get_json_state(
+                conn, "process_slow_cache.service.nginx.service"
+            )
+            conn.close()
+
+            fail_worker[0] = True
+            mono[0] += 5
+            collect_once(db, str(root / "env"), 1005, sources, config)
+            conn = init_db(db)
+            self.assertEqual(
+                get_json_state(conn, "socket_cache.service.nginx.service"),
+                initial_socket_cache,
+            )
+            self.assertEqual(
+                get_json_state(conn, "process_slow_cache.service.nginx.service"),
+                initial_slow_cache,
+            )
+            conn.close()
+
+            fail_worker[0] = False
+            mono[0] += 5
+            collect_once(db, str(root / "env"), 1010, sources, config)
+            conn = init_db(db)
+            qualities = conn.execute(
+                "SELECT p.ts,p.quality FROM metric_points p JOIN entities e "
+                "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                "AND p.metric_name='process_rss_bytes' ORDER BY p.ts"
+            ).fetchall()
+            self.assertEqual(
+                qualities,
+                [(1000, "exact"), (1005, "unavailable"), (1010, "exact")],
+            )
+            socket_qualities = conn.execute(
+                "SELECT p.ts,p.quality FROM metric_points p JOIN entities e "
+                "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                "AND p.metric_name='established_sockets_total' ORDER BY p.ts"
+            ).fetchall()
+            self.assertEqual(
+                socket_qualities,
+                [(1000, "exact"), (1005, "unavailable"), (1010, "estimated")],
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE code='pid_replaced'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE code='metric_source_unavailable' "
+                    "AND details_json LIKE '%process_fast:nginx.service:3132%'"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE code='metric_source_available' "
+                    "AND details_json LIKE '%process_fast:nginx.service:3132%'"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                get_json_state(conn, "socket_cache.service.nginx.service"),
+                initial_socket_cache,
+            )
+            self.assertEqual(
+                get_json_state(conn, "process_slow_cache.service.nginx.service"),
+                initial_slow_cache,
+            )
+
+    def test_real_worker_replacement_emits_one_pid_replaced_event(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            replaced = [False]
+            mono = [10.0]
+            cgroup_procs = (
+                FIXTURES
+                / "cgroup/system.slice/nginx.service/cgroup.procs"
+            )
+            replacement_stat = FIXTURES / "proc/4142/stat"
+
+            def reader(path):
+                if path == cgroup_procs and replaced[0]:
+                    return "3131\n4142\n3133\n"
+                if path == replacement_stat:
+                    return fixture("proc/3132/stat").replace(
+                        "3132 (nginx worker)",
+                        "4142 (nginx worker)",
+                        1,
+                    ).replace(" 10001 ", " 20001 ", 1)
+                return path.read_text(encoding="utf-8")
+
+            def command(parts):
+                if parts[0] == "ss":
+                    return CommandResult(fixture("ss-nginx-multiprocess.txt"), "", 0)
+                return fixture("systemd-nginx.txt")
+
+            db = str(root / "metrics.sqlite3")
+            sources = integration_sources(root, command, mono, reader)
+            config = CollectorConfig(filesystem_paths=(Path("/"),))
+            collect_once(db, str(root / "env"), 1000, sources, config)
+            replaced[0] = True
+            mono[0] += 5
+            collect_once(db, str(root / "env"), 1005, sources, config)
+            mono[0] += 5
+            collect_once(db, str(root / "env"), 1010, sources, config)
+
+            conn = init_db(db)
+            events = conn.execute(
+                "SELECT details_json FROM events WHERE code='pid_replaced'"
+            ).fetchall()
+            self.assertEqual(len(events), 1)
+            self.assertIn("4142", events[0][0])
+            self.assertEqual(
+                conn.execute(
+                    "SELECT p.quality FROM metric_points p JOIN entities e "
+                    "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                    "AND p.metric_name='process_rss_bytes' AND p.ts=1005"
+                ).fetchone()[0],
+                "exact",
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT p.quality FROM metric_points p JOIN entities e "
+                    "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                    "AND p.metric_name='process_open_fds' AND p.ts=1005"
+                ).fetchone()[0],
+                "unavailable",
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT p.quality FROM metric_points p JOIN entities e "
+                    "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                    "AND p.metric_name='established_sockets_total' AND p.ts=1005"
+                ).fetchone()[0],
+                "unavailable",
+            )
+
     def test_service_total_and_tunnel_remote_socket_counts_are_distinct(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

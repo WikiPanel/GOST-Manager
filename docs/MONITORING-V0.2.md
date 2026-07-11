@@ -348,17 +348,30 @@ Secret state is never included in monitoring export.
 
 ### Representative storage budget
 
-The planning profile is one NGINX unit with one master and two workers plus six managed GOST services. It assumes five-second fast samples, 30-second full socket snapshots, 60-second FD/limit/filesystem samples, and 48-hour raw retention.
+The planning profile is one NGINX unit with one master and two workers plus six managed GOST services. It assumes five-second fast samples, 30-second full socket snapshots, 60-second FD/limit/filesystem samples, 48-hour raw retention, and 30-day minute-rollup retention.
 
-The current metric-family model, measured with deterministic fixtures for that exact service profile, records 522 points per fast cycle, 9 additional points per full socket cycle, and 52 additional points per slow cycle. This is approximately:
+The current metric-family model, measured with deterministic fixtures for that exact service profile, records 522 points per fast cycle, 9 additional points per full socket cycle, and 52 additional points per slow cycle. The completed-minute rollup has approximately 583 metric series. The resulting retained row counts are:
 
 - 9,120,960 metric points per day;
 - 18,241,920 raw metric points over 48 hours;
-- 3.75 GiB of SQLite storage using a conservative 192 bytes per indexed point plus 15 percent for entities, state, events, rollups, and ordinary WAL variance.
+- 25,185,600 minute-rollup rows over 30 days;
+- 34,560 `sample_cycles` rows and 241,920 `metric_samples` rows over 48 hours;
+- a planning allowance of 150,000 deduplicated event rows over 30 days and 2,048 entity rows.
 
-Operators should reserve at least 5 GiB for the monitoring database under this profile. Actual page occupancy varies with interface count, disk count, unavailable sources, event frequency, and SQLite checkpoint timing. Retention cleanup still provides the hard growth bound.
+The deterministic capacity estimate uses 128 bytes per raw metric row and 160 bytes per minute-rollup row before indexes. It reserves 128 bytes per sample-cycle row, 192 bytes per metric-sample row, and 512 bytes per event or entity row. Small schema, tunnel, and collector-state tables are covered by the entity allowance and the free-page factor. It then adds 50 percent of table bytes for SQLite primary-key and secondary indexes, B-tree fill variance, and reusable free pages, followed by 20 percent for WAL growth, checkpoints, and operational headroom.
 
-Process CPU/stat and aggregate RSS/thread observations remain on the fast cadence. `/proc/<pid>/fd`, process limits, cgroup file memory, filesystem capacity, and database-size observations use the slow cadence. A service PID set comes from `cgroup.procs`; MainPID fallback totals are estimated rather than exact. Inactive historical source-error keys are retained for at most 48 hours and capped at 64 keys, while the global error total remains cumulative.
+Under those conservative assumptions the estimated occupancy is:
+
+- 2.17 GiB for the raw `metric_points` table;
+- 3.75 GiB for the `minute_rollups` table;
+- 0.12 GiB for `sample_cycles`, `metric_samples`, events, and entities;
+- 3.02 GiB for indexes and free-page overhead;
+- 1.81 GiB for WAL and operational headroom;
+- 10.89 GiB estimated total database footprint.
+
+Operators should reserve at least 12 GiB for the monitoring database under this profile. A 5 GiB reservation is not sufficient once 30-day minute rollups are included. Hosts with more interfaces, disks, services, metric cardinality, or event volume need additional space; reducing raw/rollup retention or metric cardinality reduces the requirement. The 150,000-event allowance is a 30-day planning horizon, so unusually high long-term event volume must be budgeted separately.
+
+Process CPU/stat and aggregate RSS/thread observations remain on the fast cadence. `/proc/<pid>/fd`, process limits, cgroup file memory, filesystem capacity, and database-size observations use the slow cadence. A service PID set comes from `cgroup.procs`; MainPID fallback totals are estimated rather than exact. Only a complete authoritative cgroup PID set plus complete fast process snapshots advances process-set transition state. A missing fast snapshot makes process metrics unavailable for that cycle without emitting `pid_replaced`, and non-authoritative MainPID fallback never overwrites the last authoritative identity. Identity-bound socket and slow-process caches are neither read nor replaced when the current identity cannot be confirmed. Inactive historical source-error keys are retained for at most 48 hours and capped at 64 keys, while the global error total remains cumulative.
 
 The deterministic performance suite parses and attributes a synthetic 20,000-row socket snapshot within the five-second cycle budget and verifies that a synthetic 10,000-entry FD directory is enumerated once, not six times, across six five-second cycles.
 
