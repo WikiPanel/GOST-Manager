@@ -74,7 +74,15 @@ def _required_event_codes(
             )
             if source not in required_host_sources and not required_service_source:
                 continue
-        codes.add(str(event.get("code", "")))
+        code = str(event.get("code", ""))
+        severity = str(event.get("severity", "")).lower()
+        if code == "service_state_changed":
+            current = str(details.get("current", "")).lower()
+            if severity not in {"warning", "error", "critical"}:
+                continue
+            if current not in {"failed", "inactive"}:
+                continue
+        codes.add(code)
     return codes
 
 
@@ -191,6 +199,15 @@ def evaluate_node(
         if status == "healthy":
             status = "degraded"
         reasons.append(("recent_monitoring_event", "A recent service or source transition was recorded"))
+    if bool(snapshot.get("health_events_truncated")):
+        if status == "healthy":
+            status = "degraded"
+        reasons.append(
+            (
+                "health_event_overflow",
+                "Health event volume exceeded the bounded evaluation window",
+            )
+        )
     if not reasons:
         reasons.append(("observations_current", "Current observations are within configured thresholds"))
     return _result(status, reasons, now, age, _quality(host), "node", "local")
@@ -238,6 +255,17 @@ def evaluate_services(
             status = "healthy"
             reasons.append(("service_observed", "Service is active and observations are current"))
         results[entity_id] = _result(status, reasons, now, age, _quality(values), "service", entity_id)
+    if bool(snapshot.get("current_membership_authoritative")):
+        for entity_id in required_services - set(results):
+            results[entity_id] = _result(
+                "unknown",
+                [("service_data_unavailable", "Required service observations are unavailable")],
+                now,
+                None,
+                "unavailable",
+                "service",
+                entity_id,
+            )
     return results
 
 

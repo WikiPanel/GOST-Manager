@@ -177,6 +177,64 @@ class ReadOnlyDatabase:
         }
 
     @staticmethod
+    def rollup_watermark(conn: sqlite3.Connection) -> int | None:
+        row = conn.execute(
+            "SELECT value FROM collector_state WHERE key='minute_rollup_watermark'"
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            value = int(str(row[0]))
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+
+    @staticmethod
+    def current_entities(
+        conn: sqlite3.Connection,
+        max_rows: int = 256,
+    ) -> list[dict[str, object]]:
+        rows = conn.execute(
+            "WITH last_success AS ("
+            "SELECT cycle_id FROM sample_cycles WHERE success=1 "
+            "ORDER BY collected_at DESC LIMIT 1), current_tunnels AS ("
+            "SELECT DISTINCT p.entity_pk FROM metric_points p "
+            "JOIN entities e ON e.entity_pk=p.entity_pk JOIN last_success c "
+            "ON c.cycle_id=p.cycle_id WHERE e.entity_type='tunnel' "
+            "AND p.metric_name='env_source_valid' AND p.numeric_value=1 "
+            "AND p.quality='exact'), current_entities AS ("
+            "SELECT entity_pk FROM current_tunnels UNION "
+            "SELECT DISTINCT p.entity_pk FROM metric_points p JOIN entities e "
+            "ON e.entity_pk=p.entity_pk JOIN last_success c ON c.cycle_id=p.cycle_id "
+            "WHERE e.entity_type='service' AND p.metric_name='service_active' UNION "
+            "SELECT service.entity_pk FROM current_tunnels current "
+            "JOIN tunnels t ON t.entity_pk=current.entity_pk JOIN entities service "
+            "ON service.entity_type='service' AND service.entity_id=t.service_name) "
+            "SELECT e.entity_type,e.entity_id,e.display_name,e.metadata_json,e.updated_at "
+            "FROM entities e JOIN current_entities c ON c.entity_pk=e.entity_pk "
+            "ORDER BY e.entity_type,e.entity_id LIMIT ?",
+            (max_rows + 1,),
+        ).fetchall()
+        if len(rows) > max_rows:
+            raise QueryLimitError("current entity query exceeds the safe row limit")
+        result = []
+        for row in rows:
+            try:
+                metadata = json.loads(str(row[3] or "{}"))
+            except json.JSONDecodeError:
+                metadata = {}
+            result.append(
+                {
+                    "entity_type": str(row[0]),
+                    "entity_id": str(row[1]),
+                    "display_name": row[2],
+                    "metadata": sanitize_mapping(metadata) if isinstance(metadata, dict) else {},
+                    "updated_at": int(row[4]),
+                }
+            )
+        return result
+
+    @staticmethod
     def list_entities(
         conn: sqlite3.Connection,
         entity_type: str | Sequence[str] | None = None,
@@ -282,6 +340,47 @@ class ReadOnlyDatabase:
             raise QueryLimitError("raw query exceeds the safe row limit")
         return [MetricPoint(*tuple(row)) for row in rows]
 
+    def iter_raw_points(
+        self,
+        conn: sqlite3.Connection,
+        start: int,
+        end: int,
+        seed_seconds: int,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        metric_names: Sequence[str] | None = None,
+        batch_size: int = 500,
+    ) -> Iterator[MetricPoint]:
+        filters, params = self._filter_clause(entity_type, entity_id, metric_names)
+        columns = (
+            "e.entity_type,e.entity_id,p.metric_name,p.ts,p.numeric_value,"
+            "p.text_value,p.unit,p.quality,p.reset,p.gap"
+        )
+        sql = (
+            "WITH in_window AS (SELECT " + columns + " FROM metric_points p "
+            "JOIN entities e ON e.entity_pk=p.entity_pk WHERE p.ts>=? AND p.ts<?"
+            + filters
+            + "), seed_ranked AS (SELECT " + columns
+            + ",ROW_NUMBER() OVER(PARTITION BY p.entity_pk,p.metric_name ORDER BY p.ts DESC) rn "
+            "FROM metric_points p JOIN entities e ON e.entity_pk=p.entity_pk "
+            "WHERE p.ts>=? AND p.ts<?" + filters
+            + ") SELECT entity_type,entity_id,metric_name,ts,numeric_value,text_value,"
+            "unit,quality,reset,gap FROM (SELECT *,0 rn FROM in_window UNION ALL "
+            "SELECT * FROM seed_ranked WHERE rn=1) "
+            "ORDER BY entity_type,entity_id,metric_name,ts"
+        )
+        query_params: list[object] = [start, end]
+        query_params.extend(params)
+        query_params.extend([start - seed_seconds, start])
+        query_params.extend(params)
+        cursor = conn.execute(sql, query_params)
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                return
+            for row in rows:
+                yield MetricPoint(*tuple(row))
+
     def bounded_point_count(
         self,
         conn: sqlite3.Connection,
@@ -298,6 +397,18 @@ class ReadOnlyDatabase:
             table, column = "metric_points", "ts"
         elif source == "rollup":
             table, column = "minute_rollups", "minute_start"
+        elif source == "raw_minute":
+            query_params: list[object] = [start, end]
+            query_params.extend(params)
+            query_params.append(limit + 1)
+            row = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM metric_points p "
+                "JOIN entities e ON e.entity_pk=p.entity_pk WHERE p.ts>=? AND p.ts<?"
+                + filters
+                + " GROUP BY p.entity_pk,p.metric_name,(p.ts/60) LIMIT ?)",
+                query_params,
+            ).fetchone()
+            return int(row[0])
         else:
             raise QueryInputError("invalid query source")
         query_params: list[object] = [start, end]
@@ -345,6 +456,7 @@ class ReadOnlyDatabase:
         entity_id: str | None = None,
         metric_names: Sequence[str] | None = None,
         max_entities: int = 256,
+        current_only: bool = False,
     ) -> list[MetricPoint]:
         entity_clauses: list[str] = []
         entity_params: list[object] = []
@@ -359,10 +471,33 @@ class ReadOnlyDatabase:
             entity_clauses.append("entity_id=?")
             entity_params.append(validate_filter(entity_id, "entity id"))
         entity_where = " AND ".join(entity_clauses)
+        membership = ""
+        membership_ctes = ""
+        if current_only:
+            membership_ctes = (
+                "last_success AS (SELECT cycle_id FROM sample_cycles WHERE success=1 "
+                "ORDER BY collected_at DESC LIMIT 1),current_tunnels AS ("
+                "SELECT DISTINCT p.entity_pk FROM metric_points p JOIN entities ce "
+                "ON ce.entity_pk=p.entity_pk JOIN last_success c ON c.cycle_id=p.cycle_id "
+                "WHERE ce.entity_type='tunnel' AND p.metric_name='env_source_valid' "
+                "AND p.numeric_value=1 AND p.quality='exact'),current_membership AS ("
+                "SELECT entity_pk FROM current_tunnels UNION SELECT DISTINCT p.entity_pk "
+                "FROM metric_points p JOIN entities ce ON ce.entity_pk=p.entity_pk "
+                "JOIN last_success c ON c.cycle_id=p.cycle_id WHERE ce.entity_type='service' "
+                "AND p.metric_name='service_active' UNION SELECT service.entity_pk "
+                "FROM current_tunnels current JOIN tunnels t ON t.entity_pk=current.entity_pk "
+                "JOIN entities service ON service.entity_type='service' "
+                "AND service.entity_id=t.service_name),"
+            )
+            membership = (
+                " AND (entity_type NOT IN ('service','tunnel') OR entity_pk IN "
+                "(SELECT entity_pk FROM current_membership))"
+            )
         count_params = [*entity_params, max_entities + 1]
         entity_count = len(
             conn.execute(
-                "SELECT 1 FROM entities WHERE " + entity_where + " LIMIT ?",
+                ("WITH " + membership_ctes[:-1] + " " if membership_ctes else "")
+                + "SELECT 1 FROM entities WHERE " + entity_where + membership + " LIMIT ?",
                 count_params,
             ).fetchall()
         )
@@ -392,9 +527,10 @@ class ReadOnlyDatabase:
         values_sql = ",".join("(?,?)" for _ in specs)
         spec_params = [value for spec in specs for value in spec]
         sql = (
-            "WITH desired(entity_type,metric_name) AS (VALUES " + values_sql + "),"
+            "WITH " + membership_ctes + "desired(entity_type,metric_name) AS (VALUES " + values_sql + "),"
             "active AS (SELECT entity_pk,entity_type,entity_id FROM entities WHERE "
             + entity_where
+            + membership
             + "), latest AS (SELECT a.entity_type,a.entity_id,d.metric_name,("
             "SELECT p.point_id FROM metric_points p WHERE p.entity_pk=a.entity_pk "
             "AND p.metric_name=d.metric_name ORDER BY p.ts DESC LIMIT 1) point_id "
@@ -415,7 +551,7 @@ class ReadOnlyDatabase:
         start: int,
         end: int,
         max_rows: int,
-    ) -> list[EventRecord]:
+    ) -> tuple[list[EventRecord], bool]:
         params: list[object] = [start, end, *HEALTH_EVENT_CODES, max_rows + 1]
         rows = conn.execute(
             "SELECT ts,severity,code,message,details_json FROM events WHERE ts>=? AND ts<? "
@@ -423,8 +559,8 @@ class ReadOnlyDatabase:
             "ORDER BY ts DESC,event_id DESC LIMIT ?",
             params,
         ).fetchall()
-        if len(rows) > max_rows:
-            raise QueryLimitError("health-event query exceeds the safe row limit")
+        truncated = len(rows) > max_rows
+        rows = rows[:max_rows]
         result: list[EventRecord] = []
         for row in rows:
             try:
@@ -438,7 +574,7 @@ class ReadOnlyDatabase:
                     sanitize_mapping(details) if isinstance(details, dict) else {},
                 )
             )
-        return result
+        return result, truncated
 
     @staticmethod
     def events(
@@ -535,7 +671,7 @@ class ReadOnlyDatabase:
             columns = (
                 "e.entity_type,e.entity_id,p.metric_name,p.ts AS timestamp,NULL AS minute_start,"
                 "p.numeric_value,p.text_value,p.unit,p.quality,p.reset,p.gap,"
-                "NULL AS samples,NULL AS expected_samples,NULL AS coverage"
+                "NULL AS samples,NULL AS expected_samples,NULL AS coverage,NULL AS unavailable_count"
             )
         elif source == "rollup":
             table = "minute_rollups"
@@ -543,8 +679,13 @@ class ReadOnlyDatabase:
             columns = (
                 "e.entity_type,e.entity_id,p.metric_name,NULL AS timestamp,p.minute_start,"
                 "p.avg_value AS numeric_value,NULL AS text_value,p.unit,p.quality,"
-                "p.reset_count AS reset,p.gap_count AS gap,p.samples,p.expected_samples,p.coverage"
+                "p.reset_count AS reset,p.gap_count AS gap,p.samples,p.expected_samples,p.coverage,"
+                "p.unavailable_count"
             )
+        elif source == "raw_minute":
+            table = "metric_points"
+            time_column = "ts"
+            columns = ""
         else:
             raise QueryInputError("invalid export source")
         query_params: list[object] = [start, end]
@@ -563,13 +704,30 @@ class ReadOnlyDatabase:
             raise QueryLimitError(
                 f"export estimate {estimated} rows exceeds the safe limit {max_rows}"
             )
-        cursor = conn.execute(
-            f"SELECT {columns} FROM {table} p JOIN entities e ON e.entity_pk=p.entity_pk "
-            f"WHERE p.{time_column}>=? AND p.{time_column}<?"
-            + filters
-            + f" ORDER BY p.{time_column},e.entity_type,e.entity_id,p.metric_name",
-            query_params,
-        )
+        if source == "raw_minute":
+            cursor = conn.execute(
+                "SELECT e.entity_type,e.entity_id,p.metric_name,NULL,(p.ts/60)*60,"
+                "AVG(CASE WHEN p.quality!='unavailable' THEN p.numeric_value END),NULL,"
+                "MAX(p.unit),CASE MAX(CASE p.quality WHEN 'exact' THEN 0 WHEN 'derived' "
+                "THEN 1 WHEN 'estimated' THEN 2 ELSE 3 END) WHEN 0 THEN 'exact' "
+                "WHEN 1 THEN 'derived' WHEN 2 THEN 'estimated' ELSE 'unavailable' END,"
+                "SUM(p.reset),SUM(p.gap),COUNT(*),NULL,NULL,"
+                "SUM(CASE WHEN p.quality='unavailable' OR "
+                "(p.numeric_value IS NULL AND p.text_value IS NULL) THEN 1 ELSE 0 END) "
+                "FROM metric_points p JOIN entities e ON e.entity_pk=p.entity_pk "
+                "WHERE p.ts>=? AND p.ts<?" + filters
+                + " GROUP BY p.entity_pk,p.metric_name,(p.ts/60) "
+                "ORDER BY (p.ts/60),e.entity_type,e.entity_id,p.metric_name",
+                query_params,
+            )
+        else:
+            cursor = conn.execute(
+                f"SELECT {columns} FROM {table} p JOIN entities e ON e.entity_pk=p.entity_pk "
+                f"WHERE p.{time_column}>=? AND p.{time_column}<?"
+                + filters
+                + f" ORDER BY p.{time_column},e.entity_type,e.entity_id,p.metric_name",
+                query_params,
+            )
         emitted = 0
         while True:
             rows = cursor.fetchmany(batch_size)
@@ -594,5 +752,8 @@ class ReadOnlyDatabase:
                     "samples": None if row[11] is None else int(row[11]),
                     "expected_samples": None if row[12] is None else int(row[12]),
                     "coverage": None if row[13] is None else float(row[13]),
+                    "unavailable_count": (
+                        int(row[14]) if len(row) > 14 and row[14] is not None else None
+                    ),
                     "source_mode": source,
                 }

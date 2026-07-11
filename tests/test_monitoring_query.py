@@ -112,6 +112,11 @@ class QueryDatabaseFixture:
                 quality,
             ),
         )
+        self.conn.execute(
+            "INSERT INTO collector_state(key,value) VALUES('minute_rollup_watermark',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),excluded.value)",
+            (str(minute + 60),),
+        )
 
     def cycle(self, ts=NOW - 2, success=True):
         _cycle(self.conn, ts, float(ts), float(ts) + 0.1, 0.1, success, False)

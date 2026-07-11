@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Made monitoring queries rollup-watermark aware, preserved lagging raw tails with bounded streaming, limited current health to active collector membership, made health events direction/overflow aware, corrected unavailable rollup weighting, and centralized metric statistics semantics.
 - Corrected the monitoring query UI after technical review with mixed-cadence latest-per-series snapshots, coherent read transactions, cost-aware 583-series history planning, required/optional service health, independent health events, complete CSV metadata/summary parity, and bounded concurrent exports.
 - Added an independent read-only monitoring query layer with raw/rollup/hybrid summaries, observational health views, plain and ANSI dashboards, detail/event commands, and bounded atomic JSON/CSV export.
 - Hardened the monitoring collector core for the issue #8 compatibility contract: production `MAPPINGS`/`TUNNEL_PORT` env parsing, SQLite WAL/busy-timeout storage, versioned v1-to-v2 migrations, quality-labelled metrics, structured events, bounded retention, incremental minute rollups, and deterministic collector tests.

@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 
+from monitoring.metric_semantics import classify_metric
 from monitoring.models import QUALITY_RANK
 from monitoring.query_db import ReadOnlyDatabase
 from monitoring.query_models import (
@@ -22,9 +23,6 @@ from monitoring.query_models import (
 )
 from monitoring.query_window import RetentionPolicy, plan_window
 from monitoring.schema import DEFAULT_SAMPLE_INTERVAL_SECONDS
-
-TEXT_UNITS = {"state", "endpoint", "text"}
-
 
 @dataclasses.dataclass(frozen=True)
 class QueryLimits:
@@ -91,6 +89,116 @@ def weighted_percentile(values: list[tuple[float, float]], percentile: float) ->
     return positive[-1][0]
 
 
+class _StreamingRawSummary:
+    def __init__(
+        self,
+        key: tuple[str, str, str],
+        start: int,
+        end: int,
+        cadence: float,
+        now: int,
+        max_gap_multiplier: float,
+    ):
+        self.key = key
+        self.start = start
+        self.end = end
+        self.cadence = cadence
+        self.now = now
+        self.max_gap = cadence * max_gap_multiplier
+        self.summary: SeriesSummary | None = None
+        self.previous: MetricPoint | None = None
+        self.previous_transition: float | str | None = None
+        self.weighted_total = 0.0
+
+    def _segment(self, point: MetricPoint, next_ts: int) -> None:
+        if point.numeric_value is None or point.quality == "unavailable":
+            return
+        if point.ts < self.start and self.start - point.ts > self.max_gap:
+            return
+        segment_start = max(self.start, point.ts)
+        segment_end = min(self.end, next_ts, int(point.ts + self.max_gap))
+        if segment_end <= segment_start:
+            return
+        seconds = segment_end - segment_start
+        assert self.summary is not None
+        self.summary.weighted_seconds += seconds
+        self.weighted_total += float(point.numeric_value) * seconds
+
+    def add(self, point: MetricPoint) -> None:
+        if self.previous is not None:
+            self._segment(self.previous, point.ts)
+        if self.summary is None:
+            semantics = classify_metric(point.metric_name, point.unit)
+            self.summary = SeriesSummary(
+                entity_type=self.key[0],
+                entity_id=self.key[1],
+                metric_name=self.key[2],
+                unit=point.unit,
+                source_mode="raw",
+                quality="unavailable",
+                metric_semantics=semantics.category,
+                expected_sample_count=max(
+                    1, math.ceil(max(0, self.end - self.start) / self.cadence)
+                ),
+                numeric=point.text_value is None,
+            )
+        if self.start <= point.ts < self.end:
+            summary = self.summary
+            first_sample = summary.sample_count == 0
+            summary.sample_count += 1
+            summary.coverage = min(
+                1.0, summary.sample_count / summary.expected_sample_count
+            )
+            summary.quality = (
+                point.quality
+                if first_sample else worst_quality([summary.quality, point.quality])
+            )
+            unavailable = (
+                point.quality == "unavailable"
+                or (point.numeric_value is None and point.text_value is None)
+            )
+            summary.unavailable_count += int(unavailable)
+            summary.reset_count += int(point.reset)
+            summary.gap_count += int(point.gap)
+            summary.first_timestamp = (
+                point.ts if summary.first_timestamp is None else summary.first_timestamp
+            )
+            summary.last_timestamp = point.ts
+            summary.latest = (
+                point.numeric_value
+                if point.numeric_value is not None else point.text_value
+            )
+            summary.latest_timestamp = point.ts
+            summary.data_age_seconds = max(0, self.now - point.ts)
+            semantics = classify_metric(point.metric_name, point.unit)
+            if semantics.supports_range and point.numeric_value is not None and not unavailable:
+                value = float(point.numeric_value)
+                summary.minimum = value if summary.minimum is None else min(summary.minimum, value)
+                summary.maximum = value if summary.maximum is None else max(summary.maximum, value)
+            if semantics.supports_transitions:
+                value = (
+                    point.numeric_value
+                    if point.numeric_value is not None else point.text_value
+                )
+                if value is not None:
+                    if self.previous_transition is not None and value != self.previous_transition:
+                        summary.transition_count = (summary.transition_count or 0) + 1
+                    elif summary.transition_count is None:
+                        summary.transition_count = 0
+                    self.previous_transition = value
+        self.previous = point
+
+    def finish(self) -> SeriesSummary:
+        assert self.summary is not None
+        if self.previous is not None:
+            self._segment(self.previous, self.end)
+        semantics = classify_metric(self.summary.metric_name, self.summary.unit)
+        if semantics.supports_average and self.summary.weighted_seconds:
+            self.summary.average = self.weighted_total / self.summary.weighted_seconds
+        self.summary.p95 = None
+        return self.summary
+
+
 def _raw_summary(
     key: tuple[str, str, str],
     points: list[MetricPoint],
@@ -99,12 +207,14 @@ def _raw_summary(
     cadence: float,
     now: int,
     max_gap_multiplier: float = 2.5,
+    allow_p95: bool = True,
 ) -> SeriesSummary:
     entity_type, entity_id, metric_name = key
     ordered = sorted(points, key=lambda item: item.ts)
     inside = [item for item in ordered if start <= item.ts < end]
     unit = (inside or ordered)[-1].unit
-    numeric = unit not in TEXT_UNITS and not any(item.text_value is not None for item in inside)
+    semantics = classify_metric(metric_name, unit)
+    numeric = not any(item.text_value is not None for item in inside)
     expected = max(1, math.ceil(max(0, end - start) / cadence))
     qualities = [item.quality for item in inside]
     summary = SeriesSummary(
@@ -114,6 +224,7 @@ def _raw_summary(
         unit=unit,
         source_mode="raw",
         quality=worst_quality(qualities),
+        metric_semantics=semantics.category,
         sample_count=len(inside),
         expected_sample_count=expected,
         coverage=min(1.0, len(inside) / expected),
@@ -131,14 +242,21 @@ def _raw_summary(
     )
     if inside:
         latest = inside[-1]
-        summary.latest = latest.numeric_value if numeric else latest.text_value
+        summary.latest = (
+            latest.numeric_value if latest.numeric_value is not None else latest.text_value
+        )
         summary.latest_timestamp = latest.ts
         summary.data_age_seconds = max(0, now - latest.ts)
-    if not numeric:
-        values = [item.text_value for item in inside if item.text_value is not None]
+    if semantics.supports_transitions:
+        values = [
+            item.numeric_value if item.numeric_value is not None else item.text_value
+            for item in inside
+            if item.numeric_value is not None or item.text_value is not None
+        ]
         summary.transition_count = sum(
             1 for previous, current in zip(values, values[1:]) if previous != current
         )
+    if not semantics.supports_range:
         return summary
 
     numeric_values = [
@@ -164,7 +282,8 @@ def _raw_summary(
     summary.weighted_seconds = total_weight
     if total_weight > 0:
         summary.average = sum(value * weight for value, weight in weighted) / total_weight
-        summary.p95 = weighted_percentile(weighted, 0.95)
+        if allow_p95 and semantics.supports_p95:
+            summary.p95 = weighted_percentile(weighted, 0.95)
     return summary
 
 
@@ -178,29 +297,35 @@ def _rollup_summary(
     entity_type, entity_id, metric_name = key
     ordered = sorted(points, key=lambda item: item.minute_start)
     unit = ordered[-1].unit
+    semantics = classify_metric(metric_name, unit)
     represented_rows_seconds = len(ordered) * 60
     missing_seconds = max(0, end - start - represented_rows_seconds)
     expected = sum(item.expected_samples for item in ordered)
     if missing_seconds:
         expected += max(1, math.ceil(missing_seconds / cadence))
     expected = max(1, expected)
-    if unit in TEXT_UNITS:
+    if not semantics.supports_range:
         return SeriesSummary(
             entity_type=entity_type,
             entity_id=entity_id,
             metric_name=metric_name,
             unit=unit,
             source_mode="rollup",
-            quality="unavailable",
+            quality=(
+                "unavailable"
+                if semantics.supports_transitions
+                else worst_quality([item.quality for item in ordered])
+            ),
+            metric_semantics=semantics.category,
             sample_count=sum(item.samples for item in ordered),
             expected_sample_count=expected,
-            coverage=0.0,
+            coverage=min(1.0, sum(item.samples for item in ordered) / expected),
             unavailable_count=sum(item.unavailable_count for item in ordered),
             reset_count=sum(item.reset_count for item in ordered),
             gap_count=sum(item.gap_count for item in ordered),
             first_timestamp=ordered[0].minute_start,
             last_timestamp=ordered[-1].minute_start + 59,
-            numeric=False,
+            numeric=unit not in {"state", "endpoint", "text"},
         )
     samples = sum(item.samples for item in ordered)
     weighted_total = 0.0
@@ -210,7 +335,9 @@ def _rollup_summary(
             0,
             min(end, item.minute_start + 60) - max(start, item.minute_start),
         )
-        covered = seconds * max(0.0, min(1.0, item.coverage))
+        valid_samples = max(0, item.samples - item.unavailable_count)
+        numeric_coverage = min(1.0, valid_samples / max(1, item.expected_samples))
+        covered = seconds * numeric_coverage
         if item.avg_value is not None and covered > 0:
             weighted_total += float(item.avg_value) * covered
             weighted_seconds += covered
@@ -223,6 +350,7 @@ def _rollup_summary(
         unit=unit,
         source_mode="rollup",
         quality=worst_quality([item.quality for item in ordered]),
+        metric_semantics=semantics.category,
         minimum=min(minimums) if minimums else None,
         average=weighted_total / weighted_seconds if weighted_seconds else None,
         maximum=max(maximums) if maximums else None,
@@ -256,6 +384,7 @@ def _combine_hybrid(
     base = raw or rollup
     assert base is not None
     numeric = all(item.numeric for item in parts)
+    semantics = classify_metric(key[2], base.unit)
     weighted_seconds = sum(item.weighted_seconds for item in parts)
     averages = sum(
         float(item.average) * item.weighted_seconds
@@ -281,11 +410,15 @@ def _combine_hybrid(
         unit=base.unit,
         source_mode="hybrid",
         quality=worst_quality([item.quality for item in parts]),
+        metric_semantics=semantics.category,
         latest=raw.latest if raw is not None else None,
         latest_timestamp=raw.latest_timestamp if raw is not None else None,
-        minimum=min(minimums) if minimums else None,
-        average=averages / weighted_seconds if weighted_seconds else None,
-        maximum=max(maximums) if maximums else None,
+        minimum=min(minimums) if minimums and semantics.supports_range else None,
+        average=(
+            averages / weighted_seconds
+            if weighted_seconds and semantics.supports_average else None
+        ),
+        maximum=max(maximums) if maximums and semantics.supports_range else None,
         p95=None,
         sample_count=samples,
         expected_sample_count=expected,
@@ -330,31 +463,101 @@ class QueryEngine:
         entity_id: str | None,
         metric_names: Sequence[str] | None,
     ):
-        if plan.raw_start is None or plan.raw_end is None:
-            return plan
-        raw_count = self.database.bounded_point_count(
-            conn,
-            "raw",
-            plan.raw_start,
-            plan.raw_end,
-            self.limits.max_query_rows,
-            entity_type,
-            entity_id,
-            metric_names,
-        )
-        if raw_count <= self.limits.max_query_rows:
-            return dataclasses.replace(plan, estimated_rows=raw_count)
-        raw_tail_start = int(math.floor(window.effective_end / 60.0) * 60)
-        raw_tail_start = max(window.effective_start, raw_tail_start)
-        source_mode = "hybrid" if raw_tail_start < window.effective_end else "rollup"
+        now = int(self.clock())
+        start, end = window.effective_start, window.effective_end
+        raw_cutoff = now - self.retention.raw_seconds
+        watermark = self.database.rollup_watermark(conn)
+
+        if start >= raw_cutoff:
+            full_raw_count = self.database.bounded_point_count(
+                conn,
+                "raw",
+                start,
+                end,
+                self.limits.max_query_rows,
+                entity_type,
+                entity_id,
+                metric_names,
+            )
+            if full_raw_count <= self.limits.max_query_rows:
+                return type(plan)(
+                    "raw",
+                    raw_start=start,
+                    raw_end=end,
+                    estimated_rows=full_raw_count,
+                    reason="raw_within_budget",
+                    rollup_watermark=watermark,
+                )
+
+        finalized_end = start
+        if watermark is not None:
+            finalized_end = min(end, max(start, watermark))
+        raw_start = start if watermark is None else max(start, finalized_end)
+        if watermark is not None and raw_start < raw_cutoff:
+            raw_start = min(end, raw_cutoff)
+        rollup_start = start if watermark is not None and finalized_end > start else None
+        rollup_end = finalized_end if rollup_start is not None else None
+        raw_end = end if raw_start < end else None
+        raw_count = 0
+        stream_raw = False
+        if raw_end is not None:
+            raw_count = self.database.bounded_point_count(
+                conn,
+                "raw",
+                raw_start,
+                raw_end,
+                self.limits.max_query_rows,
+                entity_type,
+                entity_id,
+                metric_names,
+            )
+            stream_raw = raw_count > self.limits.max_query_rows
+        if (
+            not stream_raw
+            and raw_end is not None
+            and rollup_start is not None
+            and rollup_end is not None
+        ):
+            complete_start = int(math.ceil(rollup_start / 60.0) * 60)
+            complete_end = int(math.floor(rollup_end / 60.0) * 60)
+            if complete_start < complete_end:
+                remaining = max(0, self.limits.max_materialized_rows - raw_count)
+                rollup_count = self.database.bounded_point_count(
+                    conn,
+                    "rollup",
+                    complete_start,
+                    complete_end,
+                    remaining,
+                    entity_type,
+                    entity_id,
+                    metric_names,
+                )
+                stream_raw = rollup_count > remaining
+        if rollup_start is not None and raw_end is not None:
+            source_mode = "hybrid"
+        elif rollup_start is not None:
+            source_mode = "rollup"
+        else:
+            source_mode = "raw"
+        if watermark is None:
+            reason = (
+                "missing_rollup_watermark_streaming"
+                if stream_raw else "missing_rollup_watermark"
+            )
+        elif stream_raw:
+            reason = "rollup_watermark_streaming"
+        else:
+            reason = "rollup_watermark"
         return type(plan)(
             source_mode,
-            raw_start=raw_tail_start if raw_tail_start < window.effective_end else None,
-            raw_end=window.effective_end if raw_tail_start < window.effective_end else None,
-            rollup_start=window.effective_start,
-            rollup_end=raw_tail_start,
+            raw_start=raw_start if raw_end is not None else None,
+            raw_end=raw_end,
+            rollup_start=rollup_start,
+            rollup_end=rollup_end,
             estimated_rows=raw_count,
-            reason="raw_cost_limit",
+            reason=reason,
+            stream_raw=stream_raw,
+            rollup_watermark=watermark,
         )
 
     def query_plan(
@@ -386,24 +589,70 @@ class QueryEngine:
                 conn, window, plan, entity_type, entity_id, metric_names
             )
             raw_points: list[MetricPoint] = []
+            raw_summaries: dict[tuple[str, str, str], SeriesSummary] = {}
             rollup_points: list[RollupPoint] = []
             categorical_catalog: list[MetricPoint] = []
+            rows_scanned = 0
+            maximum_rows_buffered = 0
             if plan.raw_start is not None and plan.raw_end is not None:
                 seed = min(
                     self.limits.max_seed_seconds,
                     int(max(registry.values(), default=60.0) * self.limits.max_gap_multiplier),
                 )
-                raw_points = self.database.raw_points(
-                    conn,
-                    plan.raw_start,
-                    plan.raw_end,
-                    seed,
-                    self.limits.max_query_rows,
-                    self.limits.max_series,
-                    entity_type,
-                    entity_id,
-                    metric_names,
-                )
+                if plan.stream_raw:
+                    current_key: tuple[str, str, str] | None = None
+                    accumulator: _StreamingRawSummary | None = None
+
+                    def finish_group() -> None:
+                        if current_key is None or accumulator is None:
+                            return
+                        if len(raw_summaries) >= self.limits.max_series:
+                            raise QueryLimitError("query exceeds the safe series limit")
+                        raw_summaries[current_key] = accumulator.finish()
+
+                    for point in self.database.iter_raw_points(
+                        conn,
+                        plan.raw_start,
+                        plan.raw_end,
+                        seed,
+                        entity_type,
+                        entity_id,
+                        metric_names,
+                    ):
+                        rows_scanned += 1
+                        key = (point.entity_type, point.entity_id, point.metric_name)
+                        if current_key is not None and key != current_key:
+                            finish_group()
+                            accumulator = None
+                        if accumulator is None:
+                            accumulator = _StreamingRawSummary(
+                                key,
+                                plan.raw_start,
+                                plan.raw_end,
+                                cadence_for(key[0], key[2], registry),
+                                now,
+                                self.limits.max_gap_multiplier,
+                            )
+                        current_key = key
+                        accumulator.add(point)
+                    finish_group()
+                    maximum_rows_buffered = max(
+                        maximum_rows_buffered, len(raw_summaries) + int(accumulator is not None)
+                    )
+                else:
+                    raw_points = self.database.raw_points(
+                        conn,
+                        plan.raw_start,
+                        plan.raw_end,
+                        seed,
+                        self.limits.max_query_rows,
+                        self.limits.max_series,
+                        entity_type,
+                        entity_id,
+                        metric_names,
+                    )
+                    rows_scanned += len(raw_points)
+                    maximum_rows_buffered = len(raw_points)
             if plan.rollup_start is not None and plan.rollup_end is not None:
                 complete_start = int(math.ceil(plan.rollup_start / 60.0) * 60)
                 complete_end = int(math.floor(plan.rollup_end / 60.0) * 60)
@@ -417,6 +666,13 @@ class QueryEngine:
                         entity_id,
                         metric_names,
                     )
+                    rows_scanned += len(rollup_points)
+                    maximum_rows_buffered = max(
+                        maximum_rows_buffered,
+                        len(rollup_points) + (
+                            len(raw_summaries) if plan.stream_raw else len(raw_points)
+                        ),
+                    )
                 if plan.source_mode == "rollup":
                     categorical_catalog = [
                         point
@@ -427,10 +683,10 @@ class QueryEngine:
                             entity_id,
                             metric_names,
                         )
-                        if point.unit in TEXT_UNITS
+                        if not classify_metric(point.metric_name, point.unit).supports_range
                     ]
             schema_version = self.database.schema_version(conn)
-        materialized_rows = len(raw_points) + len(rollup_points)
+        materialized_rows = len(raw_points) + len(rollup_points) + len(raw_summaries)
         if materialized_rows > self.limits.max_materialized_rows:
             raise QueryLimitError("combined query exceeds the safe row limit")
 
@@ -444,7 +700,9 @@ class QueryEngine:
             (point.entity_type, point.entity_id, point.metric_name): point
             for point in categorical_catalog
         }
-        keys = sorted(set(raw_groups) | set(rollup_groups) | set(catalog_keys))
+        keys = sorted(
+            set(raw_groups) | set(raw_summaries) | set(rollup_groups) | set(catalog_keys)
+        )
         if len(keys) > self.limits.max_series:
             raise QueryLimitError("query exceeds the safe series limit")
         if require_match and not keys:
@@ -462,6 +720,7 @@ class QueryEngine:
                         unit=point.unit,
                         source_mode=plan.source_mode,
                         quality="unavailable",
+                        metric_semantics=classify_metric(point.metric_name, point.unit).category,
                         expected_sample_count=max(
                             1,
                             math.ceil(
@@ -469,13 +728,15 @@ class QueryEngine:
                                 / cadence_for(key[0], key[2], registry)
                             ),
                         ),
-                        numeric=False,
+                        numeric=point.text_value is None,
                     )
                 )
                 continue
             raw_summary = None
             rollup_summary = None
-            if key in raw_groups and plan.raw_start is not None and plan.raw_end is not None:
+            if key in raw_summaries:
+                raw_summary = raw_summaries[key]
+            elif key in raw_groups and plan.raw_start is not None and plan.raw_end is not None:
                 raw_summary = _raw_summary(
                     key,
                     raw_groups[key],
@@ -484,6 +745,11 @@ class QueryEngine:
                     cadence_for(key[0], key[2], registry),
                     now,
                     self.limits.max_gap_multiplier,
+                    allow_p95=(
+                        plan.source_mode == "raw"
+                        and not plan.stream_raw
+                        and plan.raw_start <= window.effective_start
+                    ),
                 )
             if key in rollup_groups and plan.rollup_start is not None and plan.rollup_end is not None:
                 rollup_summary = _rollup_summary(
@@ -521,8 +787,11 @@ class QueryEngine:
                 "entity_id": entity_id,
                 "metrics": list(metric_names or ()),
                 "plan_reason": plan.reason,
+                "rollup_watermark": plan.rollup_watermark,
             },
             materialized_rows=materialized_rows,
+            rows_scanned=rows_scanned,
+            maximum_rows_buffered=maximum_rows_buffered,
         )
 
     def events(
@@ -546,10 +815,15 @@ class QueryEngine:
             if self.read_hook is not None:
                 self.read_hook("after_cycle")
             registry = self.database.cadence_registry(conn)
+            entities = self.database.current_entities(
+                conn,
+                max_rows=self.limits.max_entities,
+            )
             points = self.database.latest_points(
                 conn,
                 self.limits.max_series,
                 max_entities=self.limits.max_entities,
+                current_only=True,
             )
             events = self.database.events(
                 conn,
@@ -558,16 +832,11 @@ class QueryEngine:
                 min(50, self.limits.max_events),
                 truncate=True,
             )
-            health_events = self.database.health_events(
+            health_events, health_events_truncated = self.database.health_events(
                 conn,
                 now - recent_event_seconds,
                 now + 1,
                 self.limits.max_health_events,
-            )
-            entities = self.database.list_entities(
-                conn,
-                ("service", "tunnel"),
-                max_rows=self.limits.max_entities,
             )
             schema_version = self.database.schema_version(conn)
         metric_values = []
@@ -593,6 +862,8 @@ class QueryEngine:
             "entities": entities,
             "events": [event.to_dict() for event in events],
             "health_events": [event.to_dict() for event in health_events],
+            "health_events_truncated": health_events_truncated,
+            "current_membership_authoritative": True,
         }
 
     def entities(self, entity_type: str | None = None) -> list[dict[str, object]]:

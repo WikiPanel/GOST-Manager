@@ -14,7 +14,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TextIO
 
-from monitoring.query_engine import QueryEngine
+from monitoring.metric_semantics import classify_metric
+from monitoring.query_engine import QueryEngine, cadence_for
 from monitoring.query_models import QueryInputError, QueryLimitError, QueryWindow
 from monitoring.schema import SCHEMA_VERSION
 
@@ -44,6 +45,7 @@ CSV_FIELDS = (
     "entity_type",
     "entity_id",
     "metric_name",
+    "metric_semantics",
     "timestamp",
     "minute_start",
     "numeric_value",
@@ -123,6 +125,7 @@ def _summary_rows(engine: QueryEngine, window: QueryWindow, filters: dict[str, o
             "entity_type": item.entity_type,
             "entity_id": item.entity_id,
             "metric_name": item.metric_name,
+            "metric_semantics": item.metric_semantics,
             "timestamp": item.latest_timestamp,
             "minute_start": None,
             "numeric_value": item.average if item.numeric else None,
@@ -167,40 +170,33 @@ def _export_selection(
     )
     selected = granularity
     if selected == "auto":
-        selected = "raw" if plan.source_mode == "raw" and window.duration_seconds <= 3600 else plan.source_mode
-    if selected == "raw" and plan.source_mode != "raw":
-        if plan.reason == "raw_cost_limit":
+        selected = (
+            "raw"
+            if plan.source_mode == "raw"
+            and not plan.stream_raw
+            and window.duration_seconds <= 3600
+            else "minute"
+        )
+    if selected == "raw" and (plan.source_mode != "raw" or plan.stream_raw):
+        if plan.stream_raw or "watermark" in plan.reason:
             raise QueryLimitError("raw export exceeds the safe row budget; use auto or minute")
         raise QueryInputError("raw export is unavailable for data outside raw retention")
 
-    if selected in {"rollup", "minute"}:
-        sources = [
-            (
-                "rollup",
-                int(math.ceil(window.effective_start / 60.0) * 60),
-                int(math.floor(window.effective_end / 60.0) * 60),
-            )
-        ]
-    elif selected == "raw":
+    if selected == "raw":
         sources = [("raw", window.effective_start, window.effective_end)]
-    elif selected == "hybrid":
-        assert plan.rollup_start is not None and plan.rollup_end is not None
-        assert plan.raw_start is not None and plan.raw_end is not None
-        sources = [
-            (
+    elif selected in {"rollup", "minute"}:
+        sources = []
+        if plan.rollup_start is not None and plan.rollup_end is not None:
+            sources.append((
                 "rollup",
                 int(math.ceil(plan.rollup_start / 60.0) * 60),
                 int(math.floor(plan.rollup_end / 60.0) * 60),
-            ),
-            ("raw", plan.raw_start, plan.raw_end),
-        ]
+            ))
+        if plan.raw_start is not None and plan.raw_end is not None:
+            sources.append(("raw_minute", plan.raw_start, plan.raw_end))
     else:
         raise QueryInputError("granularity must be summary, raw, minute, or auto")
-    actual_source = (
-        "rollup" if selected in {"rollup", "minute"}
-        else "raw" if selected == "raw"
-        else "hybrid"
-    )
+    actual_source = plan.source_mode
     return selected, actual_source, sources
 
 
@@ -210,6 +206,7 @@ def _point_rows(
     sources: list[tuple[str, int, int]],
     filters: dict[str, object],
     expected_rows: int,
+    cadence_registry: dict[str, float],
 ) -> Iterator[dict[str, object]]:
     entity_type = filters.get("entity_type") if isinstance(filters.get("entity_type"), str) else None
     entity_id = filters.get("entity_id") if isinstance(filters.get("entity_id"), str) else None
@@ -227,7 +224,22 @@ def _point_rows(
             metric_names,
         ):
             emitted += 1
+            semantics = classify_metric(str(row["metric_name"]), str(row["unit"]))
+            row["metric_semantics"] = semantics.category
             row["record_type"] = source
+            if source == "raw_minute":
+                minute = int(row["minute_start"])
+                seconds = max(0, min(end, minute + 60) - max(start, minute))
+                cadence = cadence_for(
+                    str(row["entity_type"]),
+                    str(row["metric_name"]),
+                    cadence_registry,
+                )
+                expected = max(1, math.ceil(seconds / cadence))
+                samples = int(row["samples"] or 0)
+                row["expected_samples"] = expected
+                row["coverage"] = min(1.0, samples / expected)
+                row["source_mode"] = "raw"
             yield row
 
 
@@ -291,8 +303,14 @@ def export_data(
             row_count = _count_point_rows(
                 engine, point_conn, sources, active_filters
             )
+            cadence_registry = engine.database.cadence_registry(point_conn)
             rows = _point_rows(
-                engine, point_conn, sources, active_filters, row_count
+                engine,
+                point_conn,
+                sources,
+                active_filters,
+                row_count,
+                cadence_registry,
             )
         except Exception as exc:
             point_context.__exit__(type(exc), exc, exc.__traceback__)

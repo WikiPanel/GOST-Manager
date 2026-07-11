@@ -233,12 +233,15 @@ def render_summary(result: QueryResult, width: int = 120) -> str:
     lines = [
         f"SUMMARY source={result.source_mode} truncated={str(result.window.truncated).lower()}",
         f"requested={_utc(result.window.requested_start)}..{_utc(result.window.requested_end)}",
-        f"effective={_utc(result.window.effective_start)}..{_utc(result.window.effective_end)} materialized_rows={result.materialized_rows}",
-        "ENTITY | METRIC | LATEST@TIME | MIN | AVG | MAX | P95 | FIRST..LAST | TRANSITIONS | SAMPLES/EXPECTED | COVERAGE | UNAVAILABLE | RESET | GAP | AGE | QUALITY | UNIT | SOURCE",
+        f"effective={_utc(result.window.effective_start)}..{_utc(result.window.effective_end)} "
+        f"materialized_rows={result.materialized_rows} rows_scanned={result.rows_scanned} "
+        f"max_buffered={result.maximum_rows_buffered}",
+        "ENTITY | METRIC | SEMANTICS | LATEST@TIME | MIN | AVG | MAX | P95 | FIRST..LAST | TRANSITIONS | SAMPLES/EXPECTED | COVERAGE | UNAVAILABLE | RESET | GAP | AGE | QUALITY | UNIT | SOURCE",
     ]
     for item in result.series:
         values = (
-            f"{item.entity_type}:{item.entity_id} | {item.metric_name} | {_display(item.latest)}@{_utc(item.latest_timestamp)} | "
+            f"{item.entity_type}:{item.entity_id} | {item.metric_name} | {item.metric_semantics} | "
+            f"{_display(item.latest)}@{_utc(item.latest_timestamp)} | "
             f"{_display(item.minimum)} | {_display(item.average)} | {_display(item.maximum)} | "
             f"{_display(item.p95)} | "
             f"{_utc(item.first_timestamp)}..{_utc(item.last_timestamp)} | "

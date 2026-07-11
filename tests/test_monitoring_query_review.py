@@ -391,6 +391,10 @@ class ProductionProfileQueryTests(unittest.TestCase):
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rollup_rows(),
             )
+            conn.execute(
+                "INSERT OR REPLACE INTO collector_state(key,value) VALUES(?,?)",
+                ("minute_rollup_watermark", str(math.floor((NOW - 15 * 60) / 60) * 60)),
+            )
             conn.commit()
             conn.close()
 
@@ -418,10 +422,15 @@ class ProductionProfileQueryTests(unittest.TestCase):
                 self.assertTrue(all(item.p95 is None for item in results[duration].series))
             self.assertTrue(all(len(result.series) == 583 for result in results.values()))
             maximum = max(result.materialized_rows for result in results.values())
-            self.assertEqual(72_048, maximum)
+            self.assertEqual(105_843, maximum)
             self.assertLessEqual(maximum, engine.limits.max_materialized_rows)
+            self.assertEqual(158_313, max(result.rows_scanned for result in results.values()))
+            self.assertEqual(
+                105_843,
+                max(result.maximum_rows_buffered for result in results.values()),
+            )
             self.assertLess(elapsed, 12.0)
-            self.assertEqual(7, max(statement_counts))
+            self.assertEqual(10, max(statement_counts))
 
             explain_conn = sqlite3.connect(path)
             plans = []
@@ -435,7 +444,9 @@ class ProductionProfileQueryTests(unittest.TestCase):
                 ReadOnlyDatabase(path, trace_callback=statements.append), clock=lambda: NOW
             )
             snapshot_engine.snapshot()
-            snapshot_sql = next(sql for sql in reversed(statements) if "WITH desired" in sql)
+            snapshot_sql = next(
+                sql for sql in reversed(statements) if "desired(entity_type" in sql
+            )
             snapshot_plan = " ".join(
                 str(row[3])
                 for row in explain_conn.execute("EXPLAIN QUERY PLAN " + snapshot_sql)
@@ -506,6 +517,10 @@ class ProductionProfileQueryTests(unittest.TestCase):
             conn.execute(
                 "INSERT OR REPLACE INTO collector_state(key,value) VALUES(?,?)",
                 ("metric_cadence_seconds", json.dumps({"host:cadence_changed": 60})),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO collector_state(key,value) VALUES(?,?)",
+                ("minute_rollup_watermark", str(start + 120)),
             )
             conn.close()
             window = QueryWindow(start, start + 120, start, start + 120)

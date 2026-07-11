@@ -56,6 +56,8 @@ class QueryPlan:
     rollup_end: int | None = None
     estimated_rows: int | None = None
     reason: str = "retention"
+    stream_raw: bool = False
+    rollup_watermark: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,6 +101,7 @@ class SeriesSummary:
     unit: str
     source_mode: str
     quality: str
+    metric_semantics: str = "unknown"
     latest: float | str | None = None
     latest_timestamp: int | None = None
     minimum: float | None = None
@@ -161,6 +164,8 @@ class QueryResult:
     granularity: str = "summary"
     filters: dict[str, object] = dataclasses.field(default_factory=dict)
     materialized_rows: int = 0
+    rows_scanned: int = 0
+    maximum_rows_buffered: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -171,5 +176,7 @@ class QueryResult:
             "granularity": self.granularity,
             "filters": self.filters,
             "materialized_rows": self.materialized_rows,
+            "rows_scanned": self.rows_scanned,
+            "maximum_rows_buffered": self.maximum_rows_buffered,
             "series": [item.to_dict() for item in self.series],
         }
