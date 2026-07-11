@@ -361,3 +361,20 @@ The accepted collector core uses `/var/lib/gost-manager/metrics.sqlite3` by defa
 Legacy Direct Mode discovery is intentionally narrow.  Iran env files read listen/target ports only from validated `MAPPINGS`; Kharej env files read the listener only from validated `TUNNEL_PORT`.  The collector never scans arbitrary env values, so IP addresses, credentials, UUIDs, and tokens are not treated as ports.  Malformed env files produce structured `env_parse_error` events and do not stop the rest of the collection cycle.  Monitoring does not write to existing env files.
 
 Metric samples store a unit and one of `exact`, `derived`, `estimated`, or `unavailable`.  Optional kernel sources that are missing are stored as NULL/unavailable instead of fake zeroes.  Loopback interface counters are recorded separately from external interface counters.  `/proc/<pid>/io` is not used as a network source.
+
+## Issue #11 metric coverage status
+
+The collector implementation is split into independently testable standard-library modules:
+
+- `models` and `entities` for stable models and secret-safe Direct Mode discovery;
+- `schema` for schema v4 migration, persistence, retention, rollups, and WAL maintenance;
+- `proc_readers` and `network_readers` for host, process, disk, interface, and TCP/IP counters;
+- `systemd_readers` and `socket_readers` for managed-service, cgroup, listener, and connection observations;
+- `event_state` for persisted transition state and deduplicated events;
+- `collector` and `scheduler` for fault-isolated collection and monotonic cadence.
+
+CPU, network, TCP/IP, memory, swap, filesystem, diskstats, conntrack, file-handle, GOST, NGINX, process, cgroup, listener, tunnel, and collector-self metrics now use the quality labels defined above. Counter rates are calculated only from persisted counter deltas and monotonic elapsed time. Reset and gap samples are marked and never converted into negative rates or spikes.
+
+Every filesystem, procfs, command, clock, process, and statvfs source used by the collector is injectable. A failed source or managed entity records unavailable metrics and a source-error counter while unrelated sources continue. Source, service, PID, listener, interface, cycle, maintenance, and checkpoint events are transition-aware, so an unchanged warning is not written every sample.
+
+Tunnel metadata may contain only the remote `host:port` endpoint. Env usernames and passwords are not copied into metrics, events, entity metadata, collector state, or test exports.

@@ -16,6 +16,8 @@ Passwords must not be committed to GitHub. Keep real credentials only on the ser
 
 The systemd service uses `EnvironmentFile` so secrets are not embedded directly in the service unit file.
 
+The monitoring collector parses only the Direct Mode fields needed for topology and listener checks. It may store a remote `host:port` endpoint, but it never stores env usernames, passwords, tokens, or other credentials in metrics, events, entity metadata, collector state, or exports.
+
 ## Firewall Design
 
 The Kharej service exposes a SOCKS5 listener. That listener must be restricted to the Iran server IP.

@@ -13,6 +13,13 @@
 
 ```bash
 bash tests/run-tests.sh
+python3 -m unittest discover -s tests -p 'test_monitoring*.py'
+```
+
+Compile every monitoring module and test before running the suite:
+
+```bash
+python3 -m py_compile monitoring/*.py tests/test_monitoring*.py
 ```
 
 The tests do not require root and do not modify:
@@ -28,7 +35,7 @@ iptables
 ## Run Shellcheck
 
 ```bash
-shellcheck gost-manager.sh install.sh uninstall.sh lib/gost-run-iran.sh lib/gost-run-kharej.sh tests/run-tests.sh
+shellcheck -x -P SCRIPTDIR gost-manager.sh install.sh uninstall.sh lib/gost-run-iran.sh lib/gost-run-kharej.sh tests/run-tests.sh
 ```
 
 Or:
