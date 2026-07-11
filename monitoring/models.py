@@ -82,6 +82,13 @@ class Clock:
 
 
 @dataclasses.dataclass(frozen=True)
+class CommandResult:
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+@dataclasses.dataclass(frozen=True)
 class CpuCounters:
     user: int
     nice: int

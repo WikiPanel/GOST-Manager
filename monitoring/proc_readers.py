@@ -247,10 +247,12 @@ def filesystem_metrics(path: Path, statvfs: Callable[[str], os.statvfs_result]) 
     stats = statvfs(str(path))
     block_size = stats.f_frsize or stats.f_bsize
     total = stats.f_blocks * block_size
-    free = stats.f_bavail * block_size
+    free = stats.f_bfree * block_size
+    available = stats.f_bavail * block_size
     used = max(0, total - free)
     inode_total = stats.f_files
-    inode_free = stats.f_favail
+    inode_free = stats.f_ffree
+    inode_available = stats.f_favail
     inode_used = max(0, inode_total - inode_free)
     labels = {"path": str(path)}
     entity_id = f"fs:{path}"
@@ -258,10 +260,12 @@ def filesystem_metrics(path: Path, statvfs: Callable[[str], os.statvfs_result]) 
         ("filesystem_total_bytes", total, "bytes", "exact"),
         ("filesystem_used_bytes", used, "bytes", "derived"),
         ("filesystem_free_bytes", free, "bytes", "exact"),
+        ("filesystem_available_bytes", available, "bytes", "exact"),
         ("filesystem_used_percent", used * 100.0 / total if total else None, "percent", "derived" if total else "unavailable"),
         ("filesystem_inode_total", inode_total, "count", "exact"),
         ("filesystem_inode_used", inode_used, "count", "derived"),
         ("filesystem_inode_free", inode_free, "count", "exact"),
+        ("filesystem_inode_available", inode_available, "count", "exact"),
         ("filesystem_inode_used_percent", inode_used * 100.0 / inode_total if inode_total else None, "percent", "derived" if inode_total else "unavailable"),
     )
     return [

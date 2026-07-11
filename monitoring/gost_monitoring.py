@@ -15,6 +15,8 @@ from monitoring.collector import (
     CollectionCycleError,
     CollectorConfig,
     CollectorSources,
+    CommandExecutionError,
+    command_stdout,
     collect_once as collect_once_with_sources,
     collect_tunnel_observation,
     run_command,
@@ -28,6 +30,7 @@ from monitoring.entities import (
 )
 from monitoring.models import (
     Clock,
+    CommandResult,
     CounterDelta,
     Event,
     Metric,
@@ -89,45 +92,59 @@ _run = run_command
 def collect_sample(
     tunnel: Tunnel,
     now: int | None = None,
-    runner: Callable[[Sequence[str]], str] = _run,
+    runner: Callable[[Sequence[str]], str | CommandResult] = _run,
 ) -> MetricSample:
     timestamp = int(Clock().wall() if now is None else now)
     properties = parse_systemd_properties(
-        runner(
-            [
-                "systemctl",
-                "--no-pager",
-                "show",
-                tunnel.service_name,
-                "--property=ActiveState,SubState,NRestarts,MainPID,ExecMainStartTimestampMonotonic",
-            ]
+        command_stdout(
+            runner(
+                [
+                    "systemctl",
+                    "--no-pager",
+                    "show",
+                    tunnel.service_name,
+                    "--property=ActiveState,SubState,NRestarts,MainPID,ExecMainStartTimestampMonotonic",
+                ]
+            )
         )
     )
-    listeners = parse_ss_listeners(runner(["ss", "-H", "-lntp"]))
+    listeners = parse_ss_listeners(
+        command_stdout(runner(["ss", "-H", "-lntp"]))
+    )
     sample, _quality = collect_tunnel_observation(tunnel, timestamp, properties, listeners)
     return sample
 
 
 def listener_quality(
     tunnel: Tunnel,
-    runner: Callable[[Sequence[str]], str] = _run,
+    runner: Callable[[Sequence[str]], str | CommandResult] = _run,
 ) -> str:
-    properties = parse_systemd_properties(
-        runner(
-            [
-                "systemctl",
-                "--no-pager",
-                "show",
-                tunnel.service_name,
-                "--property=MainPID",
-            ]
+    try:
+        properties = parse_systemd_properties(
+            command_stdout(
+                runner(
+                    [
+                        "systemctl",
+                        "--no-pager",
+                        "show",
+                        tunnel.service_name,
+                        "--property=MainPID",
+                    ]
+                )
+            )
         )
-    )
+        listeners = parse_ss_listeners(
+            command_stdout(runner(["ss", "-H", "-lntp"]))
+        )
+    except CommandExecutionError:
+        return "unavailable"
     pid_raw = properties.get("MainPID", "")
     pid = int(pid_raw) if pid_raw.isdigit() else 0
-    for listener in parse_ss_listeners(runner(["ss", "-H", "-lntp"])):
+    if pid <= 0:
+        return "unavailable"
+    for listener in listeners:
         if listener.get("port") in tunnel.listen_ports and (
-            listener.get("pid") is None or pid <= 0
+            listener.get("pid") is None
         ):
             return "unavailable"
     return "exact"
@@ -242,7 +259,7 @@ def collect_once(
     db_path: str,
     env_dir: str,
     now: int | None = None,
-    runner: Callable[[Sequence[str]], str] = _run,
+    runner: Callable[[Sequence[str]], str | CommandResult] = _run,
     proc: Path = Path("/proc"),
     clock: Clock = Clock(),
     maintenance: bool = False,
@@ -279,7 +296,7 @@ def run_daemon(
     env_dir: str,
     interval: float = DEFAULT_SAMPLE_INTERVAL_SECONDS,
     maintenance_interval: float = MAINTENANCE_INTERVAL_SECONDS,
-    runner: Callable[[Sequence[str]], str] = _run,
+    runner: Callable[[Sequence[str]], str | CommandResult] = _run,
     clock: Clock = Clock(),
     sleeper: Callable[[float], None] = time.sleep,
     stop_requested: Callable[[], bool] | None = None,

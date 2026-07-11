@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 import time
@@ -758,6 +759,7 @@ def rollup_completed_minutes(
     now: int,
     interval: float = DEFAULT_SAMPLE_INTERVAL_SECONDS,
     batch_minutes: int = ROLLUP_BATCH_MINUTES,
+    cadence_registry: dict[str, float] | None = None,
 ) -> None:
     complete_before = (now // 60) * 60
     state = get_state(conn, "minute_rollup_watermark")
@@ -771,24 +773,42 @@ def rollup_completed_minutes(
     end = min(complete_before, start + batch_minutes * 60)
     if end <= start:
         return
-    expected = max(1, int(60 / interval))
+    if cadence_registry is None:
+        stored_cadences = get_json_state(conn, "metric_cadence_seconds")
+        cadence_registry = {
+            str(key): float(value)
+            for key, value in stored_cadences.items()
+            if isinstance(value, (int, float)) and float(value) > 0
+        } if isinstance(stored_cadences, dict) else {}
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT entity_pk,metric_name,ts,numeric_value,unit,quality,reset,gap "
-        "FROM metric_points WHERE ts>=? AND ts<?",
+        "SELECT p.entity_pk,e.entity_type,p.metric_name,p.ts,p.numeric_value,p.unit,"
+        "p.quality,p.reset,p.gap FROM metric_points p "
+        "JOIN entities e ON e.entity_pk=p.entity_pk WHERE p.ts>=? AND p.ts<?",
         (start, end),
     ).fetchall()
     conn.row_factory = None
-    groups: dict[tuple[int, str, int, str], list[sqlite3.Row]] = {}
+    groups: dict[tuple[int, str, str, int, str], list[sqlite3.Row]] = {}
     for row in rows:
         key = (
             int(row["entity_pk"]),
+            str(row["entity_type"]),
             str(row["metric_name"]),
             (int(row["ts"]) // 60) * 60,
             str(row["unit"]),
         )
         groups.setdefault(key, []).append(row)
-    for (entity_pk, metric_name, minute, unit), points in groups.items():
+    for (entity_pk, entity_type, metric_name, minute, unit), points in groups.items():
+        cadence = interval
+        for registry_key, seconds in cadence_registry.items():
+            registered_type, separator, pattern = registry_key.partition(":")
+            if not separator or registered_type != entity_type:
+                continue
+            if pattern.endswith("*") and metric_name.startswith(pattern[:-1]):
+                cadence = seconds
+            elif pattern == metric_name:
+                cadence = seconds
+        expected = max(1, math.ceil(60 / cadence))
         values = [float(point["numeric_value"]) for point in points if point["numeric_value"] is not None]
         quality = quality_worst(str(point["quality"]) for point in points)
         unavailable = sum(1 for point in points if point["quality"] == "unavailable")
