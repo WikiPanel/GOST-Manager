@@ -58,6 +58,7 @@ from monitoring.proc_readers import (
     parse_proc_stat,
     process_metrics,
     read_process_snapshot,
+    service_process_metrics,
 )
 from monitoring.schema import (
     init_db,
@@ -575,7 +576,7 @@ class TechnicalReviewRegressionTests(unittest.TestCase):
                 "missing-process-metadata",
                 CommandResult(
                     "LISTEN 0 128 0.0.0.0:2052 0.0.0.0:*\n"
-                    "ESTAB 0 0 127.0.0.1:2052 198.51.100.20:443\n",
+                    "ESTAB 0 0 127.0.0.1:2052 198.51.100.20:28420\n",
                     "",
                     0,
                 ),
@@ -616,7 +617,7 @@ class TechnicalReviewRegressionTests(unittest.TestCase):
                 service_established = stored_metric(
                     conn,
                     "gost-iran-1.service",
-                    "established_remote_sockets",
+                    "established_sockets_total",
                 )
                 self.assertEqual(ownership[2], expected_quality)
                 self.assertEqual(ownership[0], expected_value)
@@ -744,7 +745,8 @@ class TechnicalReviewRegressionTests(unittest.TestCase):
             current = collector_module._service_socket_metrics(
                 conn,
                 "gost-iran-1.service",
-                100,
+                (100,),
+                True,
                 "100:10",
                 True,
                 records,
@@ -752,15 +754,16 @@ class TechnicalReviewRegressionTests(unittest.TestCase):
             replaced = collector_module._service_socket_metrics(
                 conn,
                 "gost-iran-1.service",
-                101,
+                (101,),
+                True,
                 "101:20",
                 False,
                 None,
             )
-            self.assertEqual(metric(current, "established_remote_sockets").value, 1)
-            self.assertEqual(metric(current, "established_remote_sockets").quality, "exact")
-            self.assertIsNone(metric(replaced, "established_remote_sockets").value)
-            self.assertEqual(metric(replaced, "established_remote_sockets").quality, "unavailable")
+            self.assertEqual(metric(current, "established_sockets_total").value, 1)
+            self.assertEqual(metric(current, "established_sockets_total").quality, "exact")
+            self.assertIsNone(metric(replaced, "established_sockets_total").value)
+            self.assertEqual(metric(replaced, "established_sockets_total").quality, "unavailable")
 
     def test_service_metric_families_cover_runtime_and_unavailable_states(self):
         variants = (
@@ -807,7 +810,7 @@ class TechnicalReviewRegressionTests(unittest.TestCase):
                 expected_process_quality = "unavailable" if process_fails or properties is None or "MainPID=0" in (properties or "") else "exact"
                 self.assertEqual(rows["process_rss_bytes"], expected_process_quality)
                 self.assertEqual(rows["listener_owned_count"], ownership_quality)
-                self.assertEqual(rows["established_remote_sockets"], established_quality)
+                self.assertEqual(rows["established_sockets_total"], established_quality)
                 self.assertEqual(stored_metric(conn, "iran-1", "listener_ownership_exact")[2], ownership_quality)
                 self.assertEqual(
                     conn.execute(
@@ -868,9 +871,9 @@ class TechnicalReviewRegressionTests(unittest.TestCase):
                     return CommandResult("", "", 0)
                 return fixture("systemd-gost.txt")
 
-            original = process_metrics
+            original = service_process_metrics
 
-            def fail_one(service, snapshot, previous, elapsed, ticks_per_second, max_gap):
+            def fail_one(service, snapshot, previous, elapsed, ticks_per_second, max_gap, authoritative=True, slow_quality="unavailable"):
                 if service == "gost-iran-1.service":
                     raise ValueError("injected service transform failure")
                 return original(
@@ -880,10 +883,12 @@ class TechnicalReviewRegressionTests(unittest.TestCase):
                     elapsed,
                     ticks_per_second,
                     max_gap,
+                    authoritative,
+                    slow_quality,
                 )
 
             db = str(root / "metrics.sqlite3")
-            with patch("monitoring.collector.process_metrics", side_effect=fail_one):
+            with patch("monitoring.collector.service_process_metrics", side_effect=fail_one):
                 collect_once(
                     db,
                     str(env_dir),

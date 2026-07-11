@@ -152,9 +152,41 @@ class ProcessSnapshot:
     rss_anon_bytes: int | None
     rss_file_bytes: int | None
     threads: int
+    fd_count: int | None
+    fd_soft_limit: int | None
+    fd_hard_limit: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class ProcessSlowSnapshot:
+    pid: int
+    rss_bytes: int | None
+    rss_anon_bytes: int | None
+    rss_file_bytes: int | None
+    threads: int | None
     fd_count: int
     fd_soft_limit: int | None
     fd_hard_limit: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class ServiceProcessSnapshot:
+    identity: tuple[tuple[int, int], ...]
+    process_count: int
+    cpu_ticks: int
+    rss_bytes: int
+    rss_anon_bytes: int | None
+    rss_file_bytes: int | None
+    threads: int
+    fd_count: int | None
+    fd_soft_limit: int | None
+    fd_hard_limit: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class ServicePidSet:
+    pids: tuple[int, ...]
+    authoritative: bool
 
 
 @dataclasses.dataclass(frozen=True)

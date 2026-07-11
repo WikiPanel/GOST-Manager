@@ -118,6 +118,27 @@ def read_cgroup_memory(
     }
 
 
+def read_cgroup_pids(
+    control_group: str,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    read_text: Callable[[Path], str] | None = None,
+) -> tuple[int, ...]:
+    reader = read_text or (lambda path: path.read_text(encoding="utf-8"))
+    relative = Path(control_group.lstrip("/"))
+    if ".." in relative.parts:
+        raise ValueError("unsafe cgroup path")
+    text = reader(cgroup_root / relative / "cgroup.procs")
+    pids: set[int] = set()
+    for raw in text.splitlines():
+        value = raw.strip()
+        if not value:
+            continue
+        if not value.isdigit() or int(value) <= 0:
+            raise ValueError("invalid cgroup.procs entry")
+        pids.add(int(value))
+    return tuple(sorted(pids))
+
+
 def cgroup_memory_metrics(service: str, values: dict[str, int | None]) -> list[Metric]:
     labels = {"service": service}
     return [

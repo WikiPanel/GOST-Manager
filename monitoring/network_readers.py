@@ -36,18 +36,19 @@ def counter_delta(
 
 def parse_net_dev(text: str) -> dict[str, InterfaceCounters]:
     interfaces: dict[str, InterfaceCounters] = {}
-    for raw in text.splitlines():
-        if ":" not in raw:
-            continue
+    candidates = [raw for raw in text.splitlines() if ":" in raw]
+    if not candidates:
+        raise ValueError("missing /proc/net/dev interface rows")
+    for raw in candidates:
         name_raw, values_raw = raw.split(":", 1)
         name = name_raw.strip()
         values = values_raw.split()
         if not name or len(values) < 16:
-            continue
+            raise ValueError("malformed /proc/net/dev row")
         try:
             numbers = [int(value) for value in values[:16]]
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise ValueError("malformed /proc/net/dev counter") from exc
         interfaces[name] = InterfaceCounters(
             name=name,
             rx_bytes=numbers[0],
@@ -175,25 +176,57 @@ def parse_protocol_table(text: str) -> dict[str, dict[str, int]]:
     """Parse paired-header tables used by /proc/net/snmp and netstat."""
     result: dict[str, dict[str, int]] = {}
     lines = [line.split() for line in text.splitlines() if line.strip()]
+    if not lines or len(lines) % 2:
+        raise ValueError("malformed protocol table")
     index = 0
     while index + 1 < len(lines):
         header = lines[index]
         values = lines[index + 1]
         index += 2
         if not header or not values or header[0] != values[0]:
-            continue
+            raise ValueError("protocol header/value mismatch")
         protocol = header[0].rstrip(":")
         names = header[1:]
         raw_values = values[1:]
         if len(names) != len(raw_values):
-            continue
-        parsed: dict[str, int] = {}
+            raise ValueError("protocol counter length mismatch")
         try:
             parsed = {name: int(value) for name, value in zip(names, raw_values)}
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise ValueError("invalid protocol counter") from exc
         result[protocol] = parsed
     return result
+
+
+def parse_required_protocol_table(
+    text: str,
+    required_protocol: str,
+) -> dict[str, dict[str, int]]:
+    table = parse_protocol_table(text)
+    if required_protocol not in table:
+        raise ValueError(f"missing {required_protocol} protocol table")
+    return table
+
+
+def selected_tcp_counters_from_tables(
+    snmp: dict[str, dict[str, int]],
+    netstat: dict[str, dict[str, int]],
+) -> dict[str, int]:
+    tcp = snmp.get("Tcp", {})
+    tcp_ext = netstat.get("TcpExt", {})
+    selected = {
+        output: tcp[source]
+        for source, output in TCP_COUNTERS.items()
+        if source in tcp
+    }
+    selected.update(
+        {
+            output: tcp_ext[source]
+            for source, output in TCPEXT_COUNTERS.items()
+            if source in tcp_ext
+        }
+    )
+    return selected
 
 
 TCP_COUNTERS = {
@@ -216,21 +249,10 @@ TCPEXT_COUNTERS = {
 
 
 def selected_tcp_counters(snmp_text: str, netstat_text: str) -> dict[str, int]:
-    snmp = parse_protocol_table(snmp_text).get("Tcp", {})
-    netstat = parse_protocol_table(netstat_text).get("TcpExt", {})
-    selected = {
-        output: snmp[source]
-        for source, output in TCP_COUNTERS.items()
-        if source in snmp
-    }
-    selected.update(
-        {
-            output: netstat[source]
-            for source, output in TCPEXT_COUNTERS.items()
-            if source in netstat
-        }
+    return selected_tcp_counters_from_tables(
+        parse_protocol_table(snmp_text),
+        parse_protocol_table(netstat_text),
     )
-    return selected
 
 
 def tcp_counter_metrics(

@@ -167,12 +167,14 @@ Services include NGINX and every managed `gost-*` unit.
 Sources: systemd properties, cgroup files, `/proc/<pid>`, and local status endpoints.
 
 - active/sub state;
-- main PID and start time;
+- main PID and start time as systemd identity metadata;
+- authoritative service process count from `cgroup.procs`;
 - restart count;
-- CPU time and derived CPU percentage;
-- RSS, anonymous memory, file cache where available;
-- task/thread count;
-- open file-descriptor count and limit;
+- CPU time and derived CPU percentage aggregated across the cgroup PID set;
+- aggregate RSS, anonymous memory, file cache where available;
+- aggregate task/thread count;
+- aggregate open file-descriptor count and limits;
+- `established_sockets_total` across every authoritative service PID, without claiming that every socket is a remote tunnel leg;
 - cgroup memory/current and peak where available;
 - listener ownership;
 - recent unit failures;
@@ -226,6 +228,8 @@ For every managed tunnel:
 - process CPU/RSS/tasks/FDs;
 - unit IP-accounting counters when available;
 - restart count and recent errors.
+
+`established_remote_sockets` is exact only when the configured Kharej endpoint is a numeric IP and port, the full socket snapshot is authoritative, and socket ownership can be correlated to the service cgroup PID set. Hostname endpoints or missing PID attribution are reported as unavailable. Cached values between full snapshots are identity-bound and labelled estimated.
 
 ### Bytes and throughput attribution
 
@@ -342,6 +346,22 @@ Secret state is never included in monitoring export.
 - Collector CPU, RSS, database write latency, sample duration, and missed deadlines are themselves monitored.
 - A collector overrun skips or delays monitoring work; it never applies backpressure to traffic services.
 
+### Representative storage budget
+
+The planning profile is one NGINX unit with one master and two workers plus six managed GOST services. It assumes five-second fast samples, 30-second full socket snapshots, 60-second FD/limit/filesystem samples, and 48-hour raw retention.
+
+The current metric-family model, measured with deterministic fixtures for that exact service profile, records 522 points per fast cycle, 9 additional points per full socket cycle, and 52 additional points per slow cycle. This is approximately:
+
+- 9,120,960 metric points per day;
+- 18,241,920 raw metric points over 48 hours;
+- 3.75 GiB of SQLite storage using a conservative 192 bytes per indexed point plus 15 percent for entities, state, events, rollups, and ordinary WAL variance.
+
+Operators should reserve at least 5 GiB for the monitoring database under this profile. Actual page occupancy varies with interface count, disk count, unavailable sources, event frequency, and SQLite checkpoint timing. Retention cleanup still provides the hard growth bound.
+
+Process CPU/stat and aggregate RSS/thread observations remain on the fast cadence. `/proc/<pid>/fd`, process limits, cgroup file memory, filesystem capacity, and database-size observations use the slow cadence. A service PID set comes from `cgroup.procs`; MainPID fallback totals are estimated rather than exact. Inactive historical source-error keys are retained for at most 48 hours and capped at 64 keys, while the global error total remains cumulative.
+
+The deterministic performance suite parses and attributes a synthetic 20,000-row socket snapshot within the five-second cycle budget and verifies that a synthetic 10,000-entry FD directory is enumerated once, not six times, across six five-second cycles.
+
 ## Acceptance tests
 
 - Live view works with NGINX absent, GOST absent, and both present.
@@ -376,5 +396,7 @@ The collector implementation is split into independently testable standard-libra
 CPU, network, TCP/IP, memory, swap, filesystem, diskstats, conntrack, file-handle, GOST, NGINX, process, cgroup, listener, tunnel, and collector-self metrics now use the quality labels defined above. Counter rates are calculated only from persisted counter deltas and monotonic elapsed time. Reset and gap samples are marked and never converted into negative rates or spikes.
 
 Every filesystem, procfs, command, clock, process, and statvfs source used by the collector is injectable. A failed source or managed entity records unavailable metrics and a source-error counter while unrelated sources continue. Source, service, PID, listener, interface, cycle, maintenance, and checkpoint events are transition-aware, so an unchanged warning is not written every sample.
+
+Socket commands and proc network tables are structurally validated: a successful empty `ss` snapshot is authoritative, while non-empty malformed output is unavailable. Full socket collection stores separate attempt and success timestamps, so a failed heavy snapshot is not retried on every fast cycle. Collector totals include checkpoint duration on maintenance cycles; `metrics_written`, `events_written`, and row-attempt counts remain estimated because checkpoint result persistence occurs after the main sample transaction.
 
 Tunnel metadata may contain only the remote `host:port` endpoint. Env usernames and passwords are not copied into metrics, events, entity metadata, collector state, or test exports.

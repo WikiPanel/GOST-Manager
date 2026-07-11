@@ -6,7 +6,14 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
-from monitoring.models import CpuCounters, DiskCounters, Metric, ProcessSnapshot
+from monitoring.models import (
+    CpuCounters,
+    DiskCounters,
+    Metric,
+    ProcessSlowSnapshot,
+    ProcessSnapshot,
+    ServiceProcessSnapshot,
+)
 from monitoring.network_readers import counter_delta
 
 
@@ -337,7 +344,7 @@ def parse_process_stat(text: str, page_size: int = 4096) -> ProcessSnapshot:
         rss_anon_bytes=None,
         rss_file_bytes=None,
         threads=int(fields[17]),
-        fd_count=0,
+        fd_count=None,
         fd_soft_limit=None,
         fd_hard_limit=None,
     )
@@ -360,6 +367,40 @@ def parse_open_file_limits(text: str) -> tuple[int | None, int | None]:
     return None, None
 
 
+def read_process_fast_snapshot(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+    read_text: Callable[[Path], str] | None = None,
+    page_size: int = 4096,
+) -> ProcessSnapshot:
+    reader = read_text or (lambda path: path.read_text(encoding="utf-8"))
+    root = proc_root / str(pid)
+    return parse_process_stat(reader(root / "stat"), page_size)
+
+
+def read_process_slow_snapshot(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+    read_text: Callable[[Path], str] | None = None,
+    list_dir: Callable[[Path], list[str]] | None = None,
+) -> ProcessSlowSnapshot:
+    reader = read_text or (lambda path: path.read_text(encoding="utf-8"))
+    lister = list_dir or (lambda path: os.listdir(path))
+    root = proc_root / str(pid)
+    status = parse_process_status(reader(root / "status"))
+    soft, hard = parse_open_file_limits(reader(root / "limits"))
+    return ProcessSlowSnapshot(
+        pid=pid,
+        rss_bytes=status.get("VmRSS", 0) * 1024 if "VmRSS" in status else None,
+        rss_anon_bytes=status.get("RssAnon", 0) * 1024 if "RssAnon" in status else None,
+        rss_file_bytes=status.get("RssFile", 0) * 1024 if "RssFile" in status else None,
+        threads=status.get("Threads"),
+        fd_count=len(lister(root / "fd")),
+        fd_soft_limit=soft,
+        fd_hard_limit=hard,
+    )
+
+
 def read_process_snapshot(
     pid: int,
     proc_root: Path = Path("/proc"),
@@ -367,24 +408,107 @@ def read_process_snapshot(
     list_dir: Callable[[Path], list[str]] | None = None,
     page_size: int = 4096,
 ) -> ProcessSnapshot:
-    reader = read_text or (lambda path: path.read_text(encoding="utf-8"))
-    lister = list_dir or (lambda path: os.listdir(path))
-    root = proc_root / str(pid)
-    base = parse_process_stat(reader(root / "stat"), page_size)
-    status = parse_process_status(reader(root / "status"))
-    soft, hard = parse_open_file_limits(reader(root / "limits"))
+    base = read_process_fast_snapshot(pid, proc_root, read_text, page_size)
+    slow = read_process_slow_snapshot(pid, proc_root, read_text, list_dir)
     return ProcessSnapshot(
         pid=pid,
         start_ticks=base.start_ticks,
         cpu_ticks=base.cpu_ticks,
-        rss_bytes=status.get("VmRSS", base.rss_bytes // 1024) * 1024,
-        rss_anon_bytes=status.get("RssAnon", 0) * 1024 if "RssAnon" in status else None,
-        rss_file_bytes=status.get("RssFile", 0) * 1024 if "RssFile" in status else None,
-        threads=status.get("Threads", base.threads),
-        fd_count=len(lister(root / "fd")),
-        fd_soft_limit=soft,
-        fd_hard_limit=hard,
+        rss_bytes=slow.rss_bytes if slow.rss_bytes is not None else base.rss_bytes,
+        rss_anon_bytes=slow.rss_anon_bytes,
+        rss_file_bytes=slow.rss_file_bytes,
+        threads=slow.threads if slow.threads is not None else base.threads,
+        fd_count=slow.fd_count,
+        fd_soft_limit=slow.fd_soft_limit,
+        fd_hard_limit=slow.fd_hard_limit,
     )
+
+
+def aggregate_service_processes(
+    fast_snapshots: list[ProcessSnapshot],
+    slow_snapshots: dict[int, ProcessSlowSnapshot] | None = None,
+) -> ServiceProcessSnapshot:
+    if not fast_snapshots:
+        raise ValueError("service process set is empty")
+    ordered = sorted(fast_snapshots, key=lambda snapshot: snapshot.pid)
+    identity = tuple((snapshot.pid, snapshot.start_ticks) for snapshot in ordered)
+    slow = slow_snapshots or {}
+    complete_slow = len(slow) == len(ordered) and all(snapshot.pid in slow for snapshot in ordered)
+
+    def sum_optional(field: str) -> int | None:
+        if not complete_slow:
+            return None
+        values = [getattr(slow[snapshot.pid], field) for snapshot in ordered]
+        if any(value is None for value in values):
+            return None
+        return sum(int(value) for value in values)
+
+    return ServiceProcessSnapshot(
+        identity=identity,
+        process_count=len(ordered),
+        cpu_ticks=sum(snapshot.cpu_ticks for snapshot in ordered),
+        rss_bytes=sum(snapshot.rss_bytes for snapshot in ordered),
+        rss_anon_bytes=sum_optional("rss_anon_bytes"),
+        rss_file_bytes=sum_optional("rss_file_bytes"),
+        threads=sum(snapshot.threads for snapshot in ordered),
+        fd_count=sum_optional("fd_count"),
+        fd_soft_limit=sum_optional("fd_soft_limit"),
+        fd_hard_limit=sum_optional("fd_hard_limit"),
+    )
+
+
+def service_process_metrics(
+    service: str,
+    current: ServiceProcessSnapshot,
+    previous: ServiceProcessSnapshot | None,
+    elapsed: float | None,
+    ticks_per_second: int,
+    max_gap: float | None = None,
+    authoritative: bool = True,
+    slow_quality: str = "unavailable",
+) -> list[Metric]:
+    labels = {"service": service, "aggregation": "cgroup_pid_set"}
+    identity_changed = previous is not None and previous.identity != current.identity
+    delta = counter_delta(
+        previous.cpu_ticks if previous and not identity_changed else None,
+        current.cpu_ticks,
+        elapsed or 0.0,
+        max_gap,
+    )
+    cpu_percent = None
+    if delta.rate is not None and ticks_per_second > 0:
+        cpu_percent = delta.rate * 100.0 / ticks_per_second
+    fast_quality = "exact" if authoritative else "estimated"
+    cpu_quality = delta.quality
+    if cpu_percent is not None and not authoritative:
+        cpu_quality = "estimated"
+    values: list[tuple[str, int | float | None, str, str]] = [
+        ("process_count", current.process_count, "count", fast_quality),
+        ("process_cpu_ticks", current.cpu_ticks, "ticks", fast_quality),
+        ("process_cpu_percent", cpu_percent, "percent", cpu_quality),
+        ("process_rss_bytes", current.rss_bytes, "bytes", fast_quality),
+        ("process_rss_anon_bytes", current.rss_anon_bytes, "bytes", slow_quality if current.rss_anon_bytes is not None else "unavailable"),
+        ("process_rss_file_bytes", current.rss_file_bytes, "bytes", slow_quality if current.rss_file_bytes is not None else "unavailable"),
+        ("process_threads", current.threads, "count", fast_quality),
+        ("process_open_fds", current.fd_count, "count", slow_quality if current.fd_count is not None else "unavailable"),
+        ("process_fd_soft_limit", current.fd_soft_limit, "count", slow_quality if current.fd_soft_limit is not None else "unavailable"),
+        ("process_fd_hard_limit", current.fd_hard_limit, "count", slow_quality if current.fd_hard_limit is not None else "unavailable"),
+    ]
+    return [
+        Metric(
+            "service",
+            name,
+            value,
+            unit,
+            quality,
+            labels,
+            "service",
+            service,
+            identity_changed or (name == "process_cpu_percent" and delta.reset),
+            name == "process_cpu_percent" and delta.gap,
+        )
+        for name, value, unit, quality in values
+    ]
 
 
 def process_metrics(
@@ -416,7 +540,7 @@ def process_metrics(
         ("process_rss_anon_bytes", current.rss_anon_bytes, "bytes", "exact" if current.rss_anon_bytes is not None else "unavailable"),
         ("process_rss_file_bytes", current.rss_file_bytes, "bytes", "exact" if current.rss_file_bytes is not None else "unavailable"),
         ("process_threads", current.threads, "count", "exact"),
-        ("process_open_fds", current.fd_count, "count", "exact"),
+        ("process_open_fds", current.fd_count, "count", "exact" if current.fd_count is not None else "unavailable"),
         ("process_fd_soft_limit", current.fd_soft_limit, "count", "exact" if current.fd_soft_limit is not None else "unavailable"),
         ("process_fd_hard_limit", current.fd_hard_limit, "count", "exact" if current.fd_hard_limit is not None else "unavailable"),
     ]

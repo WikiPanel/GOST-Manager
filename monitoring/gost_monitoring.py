@@ -136,7 +136,7 @@ def listener_quality(
         listeners = parse_ss_listeners(
             command_stdout(runner(["ss", "-H", "-lntp"]))
         )
-    except CommandExecutionError:
+    except (CommandExecutionError, ValueError):
         return "unavailable"
     pid_raw = properties.get("MainPID", "")
     pid = int(pid_raw) if pid_raw.isdigit() else 0
