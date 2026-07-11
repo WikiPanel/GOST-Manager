@@ -246,7 +246,7 @@ class MonitoringIssue13Tests(unittest.TestCase):
                 return '\n'.join(f'LISTEN 0 1 0.0.0.0:{p} 0.0.0.0:* users:(("gost",pid=1,fd=1))' for p in (80,81,82))
             collect_once(db,td,100,run)
             self.assertEqual(sum(1 for c in calls if c[:2]==('ss','-H')),1)
-            self.assertEqual(sum(1 for c in calls if c and c[0]=='systemctl'),3)
+            self.assertEqual(sum(1 for c in calls if c and c[0]=='systemctl'),4)
 
     def test_concurrent_readers_no_corruption(self):
         with tempfile.TemporaryDirectory() as td:
