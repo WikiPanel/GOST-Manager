@@ -41,10 +41,12 @@ iptables
 
 ```bash
 shellcheck -x -P SCRIPTDIR gost-manager.sh install.sh uninstall.sh \
-  lib/gost-run-iran.sh lib/gost-run-kharej.sh \
+  lib/gost-run-iran.sh lib/gost-run-kharej.sh lib/gost-run-gateway-exit.sh \
   packaging/gost-monitor packaging/gost-monitor-admin packaging/gost-monitor-collector \
+  packaging/gost-gateway packaging/gost-gateway-runtime \
   tests/run-tests.sh tests/integration-test-lib.sh tests/test-install.sh \
-  tests/test-menu.sh tests/test-uninstall.sh tests/test-systemd-linux.sh
+  tests/test-menu.sh tests/test-uninstall.sh tests/test-systemd-linux.sh \
+  tests/test-gateway-runner.sh
 ```
 
 The temporary-root Issue #6 suites are:
@@ -54,6 +56,7 @@ bash tests/test-install.sh
 bash tests/test-menu.sh
 bash tests/test-uninstall.sh
 bash tests/test-systemd-linux.sh
+bash tests/test-gateway-runner.sh
 ```
 
 They use command stubs and never write to the host's real `/etc`, `/usr/local`, `/var/lib`, systemd, packages, NGINX, firewall, or GOST services.
@@ -70,7 +73,15 @@ resolve its physical path, and pass every path override to
 `python3 -m gateway.cli`. Do not use the production defaults during development.
 The full CLI and schema contract is in `docs/GATEWAY-STATE-V0.2.md`.
 
-`tests/test-systemd-linux.sh` skips clearly on non-Linux hosts. On Linux it requires the real `systemd-analyze`, verifies a temporary unit against the complete host unit environment, checks every temporary executable/config path, audits production traffic isolation, and runs the temporary-root installer with real unit verification. The Ubuntu 22.04/24.04 matrix is defined in `.github/workflows/monitoring-integration.yml`.
+Gateway runtime tests use explicit absolute temporary paths and injected
+systemctl/`ss` runners. They cover strict secret input and storage, non-secret
+rendering, exact listener ownership, first/unchanged/single-Exit apply,
+service-state rollback, exact service control, Direct Mode isolation, and a
+256-Exit allocation/time bound. The runtime contract and a manual temporary-root
+workflow are in `docs/GATEWAY-RUNTIME-V0.2.md`. Never use production defaults or
+start a real Gateway Exit service on a development host.
+
+`tests/test-systemd-linux.sh` skips clearly on non-Linux hosts. On Linux it requires the real `systemd-analyze`, verifies temporary Monitoring and generated Gateway Exit units against complete fixture paths, rejects malformed controls, audits traffic isolation, and runs the temporary-root installer with real unit verification. The Ubuntu 22.04/24.04 matrix is defined in `.github/workflows/monitoring-integration.yml`.
 
 Installer rollback failures retain the printed backup paths. Follow the emitted commands in order: stop only `gost-monitor-collector.service`, remove each candidate destination, copy each retained `original` back with `cp -a`, run `systemctl daemon-reload`, restore the recorded enable/disable and start/stop state, then confirm `systemctl status gost-monitor-collector.service --no-pager`. No recovery command targets traffic.
 

@@ -165,6 +165,21 @@ Select tunnel number:
 
 Each numbered tunnel is independent. Deleting `iran-2` does not affect `iran-1`; deleting `kharej-2` does not affect `kharej-1`.
 
+## Local Gateway Exit runtime
+
+The v0.2 Gateway runtime can prepare independent loopback-only GOST Exit
+services before the public NGINX milestone. It is intentionally available only
+through the installed `gost-gateway` desired-state CLI and
+`gost-gateway-runtime` secret/runtime CLI; the main menu is unchanged.
+
+Credentials live in private `0600` files below
+`/etc/gost-manager/secrets`, never in desired state or generated runtime files.
+Use hidden prompts or strict JSON on stdin, inspect `runtime plan`, then confirm
+activation with `runtime apply --yes`. Unchanged active Exit services are not
+restarted. See [Gateway Local Exit Runtime v0.2](docs/GATEWAY-RUNTIME-V0.2.md)
+for exact paths, ownership checks, rollback, and secret rotation. This milestone
+does not install or activate NGINX or firewall rules.
+
 ## Local Monitoring
 
 Option `10` opens the compact Monitoring Lite workflow:
@@ -232,6 +247,11 @@ Option `11`, `Native GOST Gateway (Coming soon)`, only prints a message and retu
 Run `sudo bash uninstall.sh`. Every component defaults to No and is confirmed independently: manager CLI, monitoring service, monitoring code, monitoring config, monitoring history, managed traffic services, `/etc/gost` credentials/backups, and the GOST binary. A final plan is shown before changes.
 
 Removing monitoring only leaves tunnel units, active traffic, runners, `/etc/gost`, the GOST binary, firewall state, and NGINX unchanged. History and config are separate choices. Monitoring code cannot be removed while its service remains; runners are retained while managed traffic units remain. If history/config are retained, a later `sudo bash install.sh` restores the monitoring code and validates/migrates the retained database.
+
+Gateway runtime, desired state, private secrets, and the Gateway package are
+four separate default-No removal choices. Private secret deletion requires the
+exact phrase `DELETE GATEWAY SECRETS`; package removal is refused while any
+exact Gateway Exit service remains.
 
 Removal decisions are rechecked against actual post-action state. If any exact managed traffic unit survives, both runners, `/etc/gost`, and `/usr/local/bin/gost` are preserved even when deletion was selected. If the collector is active, enabled, or loaded despite a missing unit file, removal still attempts to stop/disable it; a failure preserves monitoring code, launchers, config, and history. History removal uses the configured DB captured before optional config deletion and never guesses the default path.
 

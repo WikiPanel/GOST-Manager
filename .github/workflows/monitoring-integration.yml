@@ -1,10 +1,11 @@
-name: Monitoring integration
+name: Monitoring and gateway integration
 
 on:
   pull_request:
   push:
     branches:
       - feat/monitoring-integration
+      - feat/gateway-gost-runtime
 
 permissions:
   contents: read

@@ -142,6 +142,20 @@ Available GOST tunnels:
 Select tunnel number:
 ```
 
+## Runtime محلی Exitهای Gateway
+
+در milestone فعلی v0.2 هر Exit یک سرویس مستقل GOST با listener فقط روی
+`127.0.0.1` دارد. این قابلیت فعلاً فقط با CLIهای نصب‌شدهٔ `gost-gateway` و
+`gost-gateway-runtime` در دسترس است و به منوی اصلی اضافه نشده است.
+
+Credentialها در فایل‌های خصوصی با mode برابر `0600` زیر
+`/etc/gost-manager/secrets` نگهداری می‌شوند و وارد desired state، env تولیدشده،
+unit یا manifest نمی‌شوند. ابتدا `runtime plan` را بررسی و سپس
+`runtime apply --yes` را اجرا کنید. سرویس فعال و بدون تغییر restart نمی‌شود.
+قرارداد کامل مسیرها، rotation، تشخیص مالک port و rollback در
+[Gateway Local Exit Runtime v0.2](docs/GATEWAY-RUNTIME-V0.2.md) آمده است. در این
+مرحله NGINX عمومی و firewall نصب یا فعال نمی‌شوند.
+
 ## مانیتورینگ محلی
 
 گزینه‌های جدید منوی اصلی بدون تغییر شماره‌های ۱ تا ۹ اضافه شده‌اند:
@@ -210,6 +224,11 @@ daemon، اجرای one-shot و حذف مخرب history از lock خصوصی `/r
 سرویس collector restart محدود، اولویت CPU/I/O پایین، UMask خصوصی و state mode برابر 0700 دارد و هیچ وابستگی یا hook توقف/restart/reload برای NGINX یا سرویس‌های GOST ندارد. خرابی collector، DB، maintenance یا حذف مانیتورینگ باعث توقف Direct Mode نمی‌شود.
 
 گزینه Native GOST Gateway فقط پیام `Coming soon` چاپ می‌کند و هیچ package، فایل، directory، service، database، firewall، NGINX یا GOST را تغییر نمی‌دهد.
+
+حذف runtime، desired state، secretهای خصوصی و package مربوط به Gateway چهار
+انتخاب مستقل با پاسخ پیش‌فرض No هستند. حذف secret به عبارت دقیق
+`DELETE GATEWAY SECRETS` نیاز دارد و تا وقتی سرویس دقیق Gateway Exit باقی مانده
+باشد package و runner حذف نمی‌شوند.
 
 ## حذف امن
 
