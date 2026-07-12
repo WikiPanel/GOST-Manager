@@ -35,7 +35,6 @@ def _global_parser() -> SafeArgumentParser:
     parser.add_argument("--runtime-lock-file", default=DEFAULT_RUNTIME_LOCK_FILE)
     parser.add_argument("--systemd-dir", default=DEFAULT_SYSTEMD_DIR)
     parser.add_argument("--runner-path", default=DEFAULT_RUNNER_PATH)
-    parser.add_argument("--gost-bin", default=DEFAULT_GOST_BIN)
     parser.add_argument("--format", choices=("human", "json"), default="human")
     parser.add_argument("--debug", action="store_true")
     return parser
@@ -82,7 +81,7 @@ def _stores(global_args: argparse.Namespace) -> tuple[GatewayStateStore, SecretS
     runtime_paths = RuntimePaths.from_values(
         global_args.secret_dir, global_args.generated_dir,
         global_args.runtime_backup_dir, global_args.runtime_lock_file,
-        global_args.systemd_dir, global_args.runner_path, global_args.gost_bin,
+        global_args.systemd_dir, global_args.runner_path, DEFAULT_GOST_BIN,
     )
     state_store = GatewayStateStore(state_paths)
     secret_store = SecretStore(runtime_paths)

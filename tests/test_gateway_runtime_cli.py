@@ -28,7 +28,6 @@ class RuntimeCLITests(unittest.TestCase):
             "--runtime-lock-file", str(root / "runtime.lock"),
             "--systemd-dir", str(root / "systemd"),
             "--runner-path", str(root / "runner"),
-            "--gost-bin", str(root / "gost"),
         ]
 
     def tearDown(self) -> None:

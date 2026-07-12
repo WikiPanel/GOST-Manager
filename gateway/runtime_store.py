@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from gateway.errors import OperationalError, StateError, ValidationError
+from gateway.errors import ConflictError, OperationalError, StateError, ValidationError
 from gateway.paths import ensure_private_directory, reject_symlink_components
 from gateway.runtime_paths import ENV_FILE_RE, SERVICE_RE, RuntimePaths
 
@@ -121,7 +121,7 @@ class RuntimeStore:
         self.fsync_directory(self.paths.runtime_backup_dir)
         return transaction
 
-    def remove_backup(self, transaction: Path) -> None:
+    def remove_backup_tree(self, transaction: Path) -> None:
         try:
             transaction.relative_to(self.paths.runtime_backup_dir)
         except ValueError as exc:
@@ -129,20 +129,28 @@ class RuntimeStore:
         reject_symlink_components(transaction)
         if transaction.exists():
             shutil.rmtree(transaction)
-            self.fsync_directory(self.paths.runtime_backup_dir)
 
-    def prune_backups(self, keep: int = 3) -> None:
+    def fsync_backup_parent(self) -> None:
+        self.fsync_directory(self.paths.runtime_backup_dir)
+
+    def remove_backup(self, transaction: Path) -> None:
+        self.remove_backup_tree(transaction)
+        self.fsync_backup_parent()
+
+    def prune_backups(self, keep: int = 3, exclude: Path | None = None) -> None:
         ensure_private_directory(self.paths.runtime_backup_dir)
         candidates = []
         for path in self.paths.runtime_backup_dir.iterdir():
+            if path == exclude:
+                continue
             if not path.name.startswith("txn-") or path.is_symlink() or not path.is_dir():
                 continue
             candidates.append(path)
         for path in sorted(candidates, key=lambda item: item.stat().st_mtime_ns)[:-keep]:
             self.remove_backup(path)
 
-    def managed_exit_ids(self) -> set[str]:
-        by_kind: list[set[str]] = []
+    def managed_file_ids(self) -> tuple[frozenset[str], frozenset[str]]:
+        values: list[frozenset[str]] = []
         for directory, pattern in (
             (self.paths.exits_dir, ENV_FILE_RE),
             (self.paths.systemd_dir, SERVICE_RE),
@@ -152,14 +160,36 @@ class RuntimeStore:
                 reject_symlink_components(directory)
                 entries = list(directory.iterdir())
             except FileNotFoundError:
-                by_kind.append(current)
+                values.append(frozenset())
                 continue
             for path in entries:
                 match = pattern.fullmatch(path.name)
-                if match and path.is_file() and not path.is_symlink():
-                    current.add(match.group(1))
-            by_kind.append(current)
-        return by_kind[0] & by_kind[1]
+                if not match:
+                    continue
+                metadata = path.lstat()
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                ):
+                    raise ConflictError("managed runtime discovery found an unsafe path")
+                current.add(match.group(1))
+            values.append(frozenset(current))
+        return values[0], values[1]
+
+    def validate_dependency(self, path: Path, label: str) -> None:
+        reject_symlink_components(path)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as exc:
+            raise StateError(f"{label} is missing") from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not metadata.st_mode & 0o111
+        ):
+            raise StateError(f"{label} is unsafe or not executable")
 
     @staticmethod
     def fsync_directory(path: Path) -> None:

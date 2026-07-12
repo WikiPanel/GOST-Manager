@@ -30,6 +30,9 @@ class ScaleInspector:
     def listeners(self):
         return ()
 
+    def discover_service_ids(self):
+        return frozenset()
+
     def service_state(self, exit_id: str) -> ServiceState:
         from gateway.runtime_paths import service_name
         return ServiceState(service_name(exit_id), False, False, False, None)
@@ -78,6 +81,9 @@ def benchmark_256_runtime() -> ScaleResult:
             root / "secrets", root / "generated", root / "backups", root / "runtime.lock",
             root / "systemd", root / "runner", root / "gost",
         )
+        for dependency in (paths.runner_path, paths.gost_bin):
+            dependency.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            dependency.chmod(0o755)
         state_paths = StatePaths.from_values(
             root / "state.json", root / "node.json", root / "state-backups", root / "state.lock"
         )

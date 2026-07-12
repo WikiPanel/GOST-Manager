@@ -10,7 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from gateway.errors import ConflictError, StateError, ValidationError
+from gateway.errors import ConflictError, OperationalError, StateError, ValidationError
 from gateway.runtime_models import Credentials
 from gateway.runtime_paths import RuntimePaths
 from gateway.secrets import SecretStore, parse_secret, parse_secret_json, render_secret
@@ -99,6 +99,44 @@ class SecretStoreTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             failing.set("secret-primary", credentials())
         self.assertEqual(before, path.read_bytes())
+
+    def test_coarse_timestamp_rotations_advance_generation_each_time(self) -> None:
+        self.store.set("secret-primary", credentials())
+        path = self.paths.secret_file("secret-primary")
+
+        def coarse_replace(source: str, destination: str) -> None:
+            previous = Path(destination).stat().st_mtime_ns
+            os.replace(source, destination)
+            os.utime(destination, ns=(previous, previous))
+
+        coarse = SecretStore(self.paths, replace=coarse_replace)
+        generations = [self.store.read("secret-primary")[1]]
+        for _index in range(2):
+            coarse.set("secret-primary", credentials())
+            generations.append(coarse.read("secret-primary")[1])
+        self.assertEqual(sorted(set(generations)), generations)
+        self.assertEqual(generations[0] + 2, generations[-1])
+
+    def test_unadvanceable_generation_restores_previous_secret(self) -> None:
+        original = credentials()
+        self.store.set("secret-primary", original)
+        path = self.paths.secret_file("secret-primary")
+        generation = path.stat().st_mtime_ns
+
+        def coarse_replace(source: str, destination: str) -> None:
+            os.replace(source, destination)
+            os.utime(destination, ns=(generation, generation))
+
+        def frozen_utime(target, *args, **kwargs) -> None:
+            os.utime(target, ns=(generation, generation), follow_symlinks=False)
+
+        frozen = SecretStore(
+            self.paths, replace=coarse_replace, utime=frozen_utime
+        )
+        with self.assertRaises(OperationalError):
+            frozen.set("secret-primary", credentials())
+        self.assertEqual(original, self.store.read("secret-primary")[0])
+        self.assertEqual(generation, path.stat().st_mtime_ns)
 
     def test_delete_refuses_references_and_removes_only_exact_file(self) -> None:
         self.store.set("secret-primary", credentials())

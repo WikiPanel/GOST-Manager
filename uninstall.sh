@@ -140,7 +140,21 @@ managed_gateway_units() {
 }
 
 gateway_candidate_services() {
-  local record directory file base manifest
+  local record directory file base manifest output line name
+  if ! output="$("${SYSTEMCTL_BIN}" list-units --all --type=service --no-legend 'gost-gateway-exit-*.service' 2>/dev/null)"; then
+    return 1
+  fi
+  while IFS= read -r line; do
+    name="${line%%[[:space:]]*}"
+    [[ "${name}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] && printf '%s\n' "${name}"
+  done <<< "${output}"
+  if ! output="$("${SYSTEMCTL_BIN}" list-unit-files --no-legend 'gost-gateway-exit-*.service' 2>/dev/null)"; then
+    return 1
+  fi
+  while IFS= read -r line; do
+    name="${line%%[[:space:]]*}"
+    [[ "${name}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] && printf '%s\n' "${name}"
+  done <<< "${output}"
   while IFS= read -r record; do
     [[ -n "${record}" ]] || continue
     printf '%s\n' "${record%%|*}"
@@ -172,7 +186,7 @@ PY
 gateway_service_present() {
   local service="$1"
   local unit state
-  [[ "${service}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] || return 0
+  [[ "${service}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] || return 1
   unit="$(path_for "/etc/systemd/system/${service}")"
   [[ -e "${unit}" ]] && return 0
   "${SYSTEMCTL_BIN}" is-active --quiet "${service}" >/dev/null 2>&1 && return 0
@@ -182,30 +196,59 @@ gateway_service_present() {
 }
 
 gateway_runtime_services_exist() {
-  local service
+  local service candidates
+  if ! candidates="$(gateway_candidate_services)"; then
+    return 0
+  fi
   while IFS= read -r service; do
     [[ -n "${service}" ]] || continue
     if gateway_service_present "${service}"; then
       return 0
     fi
-  done < <(gateway_candidate_services | LC_ALL=C sort -u)
+  done <<< "$(printf '%s\n' "${candidates}" | LC_ALL=C sort -u)"
   return 1
 }
 
-gateway_state_references_secrets() {
-  local node_file
+gateway_state_secret_status() {
+  local node_file package status
   node_file="$(path_for /etc/gost-manager/node.json)"
-  [[ -e "${node_file}" ]] || return 1
-  reject_symlink_path "${node_file}" || return 0
-  python3 - "${node_file}" <<'PY' >/dev/null 2>&1
-import json, pathlib, sys
+  if [[ -L "${node_file}" ]]; then
+    printf 'unsafe_or_invalid_state\n'
+    return 0
+  fi
+  if [[ ! -e "${node_file}" ]]; then
+    printf 'missing_state\n'
+    return 0
+  fi
+  if [[ ! -f "${node_file}" || ! -r "${node_file}" ]]; then
+    printf 'unsafe_or_invalid_state\n'
+    return 0
+  fi
+  package="$(path_for /usr/local/lib/gost-manager)"
+  if [[ ! -d "${package}/gateway" || -L "${package}/gateway" ]]; then
+    printf 'unsafe_or_invalid_state\n'
+    return 0
+  fi
+  if ! status="$(PYTHONPATH="${package}" python3 - "${node_file}" <<'PY' 2>/dev/null
+import pathlib
+import sys
+
+from gateway.models import MAX_NODE_BYTES
+from gateway.paths import read_regular_file
+from gateway.serialization import parse_node
+
 path = pathlib.Path(sys.argv[1])
-value = json.loads(path.read_text(encoding="utf-8"))
-bindings = value.get("bindings")
-if not isinstance(bindings, list):
-    raise SystemExit(2)
-raise SystemExit(0 if any(isinstance(item, dict) and item.get("secret_ref") for item in bindings) else 1)
+node = parse_node(read_regular_file(path, MAX_NODE_BYTES, "node state"))
+print("references_present" if any(item.secret_ref for item in node.bindings) else "no_references")
 PY
+)"; then
+    printf 'unsafe_or_invalid_state\n'
+    return 0
+  fi
+  case "${status}" in
+    references_present|no_references) printf '%s\n' "${status}" ;;
+    *) printf 'unsafe_or_invalid_state\n' ;;
+  esac
 }
 
 managed_traffic_units() {
@@ -267,6 +310,7 @@ capture_monitor_config() {
 }
 
 validate_dependencies() {
+  local gateway_secret_status
   if [[ "${REMOVE_MONITOR_CODE}" == "1" || "${REMOVE_MONITOR_CONFIG}" == "1" ]]; then
     if [[ "${REMOVE_MONITOR_SERVICE}" != "1" ]] && monitor_service_present; then
       die "monitoring code/config cannot be removed while the collector service is active, enabled, or loaded."
@@ -291,10 +335,27 @@ validate_dependencies() {
     die "gateway package and runner cannot be removed while gateway Exit services remain."
     return 1
   fi
-  if [[ "${REMOVE_GATEWAY_SECRETS}" == "1" && "${REMOVE_GATEWAY_STATE}" != "1" ]] && gateway_state_references_secrets; then
-    die "gateway secrets cannot be removed while remaining Bindings reference them."
+  if [[ "${REMOVE_GATEWAY_SECRETS}" == "1" && "${REMOVE_GATEWAY_STATE}" != "1" ]] && ! gateway_secret_deletion_allowed; then
+    gateway_secret_status="$(gateway_state_secret_status 2>/dev/null || printf 'unsafe_or_invalid_state')"
+    case "${gateway_secret_status}" in
+      references_present)
+        die "gateway secrets cannot be removed while remaining Bindings reference them."
+        ;;
+      *)
+        die "gateway secrets cannot be removed while gateway state is missing or invalid."
+        ;;
+    esac
     return 1
   fi
+}
+
+gateway_secret_deletion_allowed() {
+  local status
+  if [[ "${REMOVE_GATEWAY_STATE}" == "1" && "${REMOVE_GATEWAY_RUNTIME}" == "1" ]]; then
+    return 0
+  fi
+  status="$(gateway_state_secret_status 2>/dev/null || printf 'unsafe_or_invalid_state')"
+  [[ "${status}" == "no_references" ]]
 }
 
 yes_no() {
@@ -408,8 +469,8 @@ remove_gateway_secrets() {
     FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
     return 0
   fi
-  if [[ "${REMOVE_GATEWAY_STATE}" != "1" ]] && gateway_state_references_secrets; then
-    info "Gateway secrets were preserved because remaining Bindings reference them."
+  if ! gateway_secret_deletion_allowed; then
+    info "Gateway secrets were preserved because gateway state is missing, invalid, or still references them."
     FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
     return 0
   fi

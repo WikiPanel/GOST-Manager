@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from gateway.errors import OperationalError, ValidationError
 from gateway.runtime_models import Listener, ServiceState
-from gateway.runtime_paths import service_name
+from gateway.runtime_paths import SERVICE_RE, exit_id_from_service, service_name
 
 PID_RE = re.compile(r"pid=([1-9][0-9]*)")
 NAME_RE = re.compile(r'\(\("([^"\\]+)"')
@@ -66,11 +66,30 @@ def parse_ss_listeners(output: str) -> tuple[Listener, ...]:
         local_index = 3 if fields[0] == "LISTEN" else 2
         if len(fields) <= local_index:
             raise ValidationError("listener snapshot is malformed")
+        queue_index = 1 if fields[0] == "LISTEN" else 0
+        if len(fields) <= queue_index + 1 or not all(
+            fields[index].isdigit() for index in (queue_index, queue_index + 1)
+        ):
+            raise ValidationError("listener snapshot is malformed")
         address, port = _split_endpoint(fields[local_index])
         pids = tuple(sorted({int(value) for value in PID_RE.findall(line)}))
         names = tuple(sorted(set(NAME_RE.findall(line))))
         listeners.append(Listener(address, port, pids, names))
     return tuple(listeners)
+
+
+def parse_systemd_service_names(output: str) -> frozenset[str]:
+    result: set[str] = set()
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        name = line.split(None, 1)[0]
+        if SERVICE_RE.fullmatch(name):
+            exit_id = exit_id_from_service(name)
+            if exit_id is not None:
+                result.add(exit_id)
+    return frozenset(result)
 
 
 def verify_proc_listener(address: str, port: int, pid: int) -> bool:
@@ -147,6 +166,25 @@ class RuntimeInspector:
             values.get("ActiveState") in {"active", "activating", "reloading"},
             pid if pid > 0 else None,
         )
+
+    def discover_service_ids(self) -> frozenset[str]:
+        commands = (
+            (
+                "systemctl", "list-units", "--all", "--type=service",
+                "--no-legend", "gost-gateway-exit-*.service",
+            ),
+            (
+                "systemctl", "list-unit-files", "--no-legend",
+                "gost-gateway-exit-*.service",
+            ),
+        )
+        result: set[str] = set()
+        for command in commands:
+            completed = self.runner(command)
+            if completed.returncode != 0:
+                raise OperationalError("gateway systemd discovery failed")
+            result.update(parse_systemd_service_names(completed.stdout))
+        return frozenset(result)
 
     def systemctl(self, *arguments: str) -> None:
         result = self.runner(("systemctl", *arguments))

@@ -110,6 +110,7 @@ class SecretStore:
         lock_factory: Callable[[Path, float], GatewayRuntimeLock] | None = None,
         replace: Callable[[str, str], None] = os.replace,
         fsync: Callable[[int], None] = os.fsync,
+        utime: Callable[..., None] = os.utime,
         failure_hook: Callable[[str], None] | None = None,
     ) -> None:
         self.paths = paths
@@ -119,6 +120,7 @@ class SecretStore:
         )
         self.replace = replace
         self.fsync = fsync
+        self.utime = utime
         self.failure_hook = failure_hook
 
     def lock(self) -> GatewayRuntimeLock:
@@ -193,6 +195,7 @@ class SecretStore:
         path = self.paths.secret_file(secret_ref)
         old_metadata = self._safe_metadata(path, missing_ok=True)
         previous = self._read_data_unlocked(secret_ref)[2] if old_metadata is not None else None
+        previous_generation = old_metadata.st_mtime_ns if old_metadata is not None else None
         descriptor, temporary = tempfile.mkstemp(prefix=f".{secret_ref}.", dir=path.parent)
         try:
             os.fchmod(descriptor, 0o600)
@@ -206,11 +209,21 @@ class SecretStore:
             self.replace(temporary, str(path))
             self._fail("after_secret_replacement")
             self._fsync_directory(path.parent)
-            self._read_unlocked(secret_ref)
+            _installed, generation = self._read_unlocked(secret_ref)
+            if previous_generation is not None and generation <= previous_generation:
+                self.utime(
+                    path,
+                    ns=(previous_generation + 1, previous_generation + 1),
+                    follow_symlinks=False,
+                )
+                self._fsync_directory(path.parent)
+                _installed, generation = self._read_unlocked(secret_ref)
+                if generation <= previous_generation:
+                    raise OperationalError("secret generation could not be advanced safely")
             return "updated" if previous is not None else "created"
         except Exception:
             if previous is not None:
-                self._restore(path, previous)
+                self._restore(path, previous, previous_generation)
             else:
                 try:
                     path.unlink()
@@ -225,15 +238,21 @@ class SecretStore:
             except FileNotFoundError:
                 pass
 
-    def _restore(self, path: Path, data: bytes) -> None:
+    def _restore(self, path: Path, data: bytes, generation: int | None = None) -> None:
         descriptor, temporary = tempfile.mkstemp(prefix=".restore.", dir=path.parent)
         try:
             os.fchmod(descriptor, 0o600)
-            os.write(descriptor, data)
+            offset = 0
+            while offset < len(data):
+                offset += os.write(descriptor, data[offset:])
             self.fsync(descriptor)
             os.close(descriptor)
             descriptor = -1
             self.replace(temporary, str(path))
+            if generation is not None:
+                self.utime(
+                    path, ns=(generation, generation), follow_symlinks=False
+                )
             self._fsync_directory(path.parent)
         finally:
             if descriptor >= 0:

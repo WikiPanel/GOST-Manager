@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict
 
 from gateway.errors import StateError, ValidationError
-from gateway.runtime_models import DesiredExitRuntime, RuntimeEntry
+from gateway.models import MAX_EXITS
+from gateway.runtime_models import DesiredExitRuntime, RuntimeEntry, RuntimeManifest
 from gateway.runtime_paths import RuntimePaths, service_name
-from gateway.validation import canonical_host, validate_slug
+from gateway.validation import (
+    require_bool, require_int, require_string, validate_secret_ref,
+    validate_slug, validate_timestamp, validate_uuid, canonical_host,
+)
 
 MAX_RUNTIME_MANIFEST_BYTES = 512 * 1024
 
@@ -162,29 +167,88 @@ def render_manifest(
     return data
 
 
-def parse_manifest(data: bytes) -> dict[str, RuntimeEntry]:
+MANIFEST_KEYS = frozenset(
+    {"schema_version", "applied_at", "document_id", "shared_revision", "node_revision", "services"}
+)
+ENTRY_KEYS = frozenset(
+    {
+        "exit_id", "service_name", "env_path", "unit_path", "secret_ref",
+        "secret_mtime_ns", "env_sha256", "unit_sha256", "desired_enabled",
+    }
+)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _strict_json(data: bytes) -> object:
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    return json.loads(data.decode("utf-8"), object_pairs_hook=pairs)
+
+
+def parse_manifest_document(data: bytes, paths: RuntimePaths) -> RuntimeManifest:
     if len(data) > MAX_RUNTIME_MANIFEST_BYTES:
         raise StateError("runtime manifest exceeds its size limit")
     try:
-        value = json.loads(data.decode("utf-8"))
+        value = _strict_json(data)
         if (
             not isinstance(value, dict)
-            or set(value) != {
-                "schema_version", "applied_at", "document_id", "shared_revision",
-                "node_revision", "services",
-            }
+            or frozenset(value) != MANIFEST_KEYS
+            or type(value.get("schema_version")) is not int
             or value.get("schema_version") != 1
         ):
             raise ValueError
+        validate_timestamp(value["applied_at"])
+        validate_uuid(value["document_id"])
+        require_int(value["shared_revision"], "shared revision", 1, 2**63 - 1)
+        require_int(value["node_revision"], "node revision", 1, 2**63 - 1)
         services = value["services"]
-        if not isinstance(services, list):
+        if not isinstance(services, list) or len(services) > MAX_EXITS:
             raise ValueError
         result: dict[str, RuntimeEntry] = {}
         for item in services:
-            entry = RuntimeEntry(**item)
-            if entry.exit_id in result or entry.service_name != service_name(entry.exit_id):
+            if not isinstance(item, dict) or frozenset(item) != ENTRY_KEYS:
+                raise ValueError
+            exit_id = validate_slug(item["exit_id"], "exit ID")
+            name = require_string(item["service_name"], "service name")
+            env_path = require_string(item["env_path"], "environment path")
+            unit_path = require_string(item["unit_path"], "unit path")
+            secret_ref = validate_secret_ref(item["secret_ref"], True)
+            generation = require_int(item["secret_mtime_ns"], "secret generation", 0, 2**63 - 1)
+            env_hash = require_string(item["env_sha256"], "environment SHA-256")
+            unit_hash = require_string(item["unit_sha256"], "unit SHA-256")
+            enabled = require_bool(item["desired_enabled"], "desired enabled")
+            if (
+                name != service_name(exit_id)
+                or env_path != str(paths.env_file(exit_id))
+                or unit_path != str(paths.unit_file(exit_id))
+                or not SHA256_RE.fullmatch(env_hash)
+                or not SHA256_RE.fullmatch(unit_hash)
+            ):
+                raise ValueError
+            entry = RuntimeEntry(
+                exit_id, name, env_path, unit_path, secret_ref, generation,
+                env_hash, unit_hash, enabled,
+            )
+            if entry.exit_id in result:
                 raise ValueError
             result[entry.exit_id] = entry
-        return result
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        return RuntimeManifest(
+            applied_at=value["applied_at"],
+            document_id=value["document_id"],
+            shared_revision=value["shared_revision"],
+            node_revision=value["node_revision"],
+            entries=tuple(result[key] for key in sorted(result)),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError, ValidationError) as exc:
         raise StateError("runtime manifest is corrupt or unsupported") from exc
+
+
+def parse_manifest(data: bytes, paths: RuntimePaths) -> dict[str, RuntimeEntry]:
+    document = parse_manifest_document(data, paths)
+    return {item.exit_id: item for item in document.entries}

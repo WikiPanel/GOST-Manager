@@ -58,6 +58,7 @@ create_fixture() {
   printf 'collector\n' > "${root}/usr/local/sbin/gost-monitor-collector"
   printf 'python\n' > "${root}/usr/local/lib/gost-manager/monitoring/__init__.py"
   printf 'gateway\n' > "${root}/usr/local/lib/gost-manager/gateway/__init__.py"
+  cp -R "${ROOT_DIR}/gateway/." "${root}/usr/local/lib/gost-manager/gateway/"
   printf 'gateway-cli\n' > "${root}/usr/local/sbin/gost-gateway"
   printf 'gateway-runtime\n' > "${root}/usr/local/sbin/gost-gateway-runtime"
   printf 'gateway-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh"
@@ -71,7 +72,9 @@ create_fixture() {
   printf 'GATEWAY_EXIT_ID=ee-primary\n' > "${root}/etc/gost-manager/generated/gateway/exits/ee-primary.env"
   printf '{"schema_version":1,"services":[]}\n' > "${root}/etc/gost-manager/generated/gateway/runtime.json"
   printf 'state\n' > "${root}/etc/gost-manager/state.json"
-  printf '{"bindings":[{"exit_id":"ee-primary","secret_ref":"secret-ee-primary"}]}\n' > "${root}/etc/gost-manager/node.json"
+  printf '%s\n' \
+    '{"schema_version":1,"document_id":"12345678-1234-4234-8234-123456789abc","node_id":"iran-gateway-1","revision":1,"updated_at":"2026-07-12T00:00:00Z","bindings":[{"exit_id":"ee-primary","enabled":true,"listen_address":"127.0.0.1","listen_port":18081,"secret_ref":"secret-ee-primary"}]}' \
+    > "${root}/etc/gost-manager/node.json"
   printf 'backup\n' > "${root}/etc/gost-manager/backups/gateway/state.json"
   printf 'runtime-backup\n' > "${root}/etc/gost-manager/backups/gateway-runtime/runtime.json"
   printf 'GOST_USER=%s\nGOST_PASS=%s\n' "${gateway_user}" "${gateway_pass}" \
@@ -183,12 +186,66 @@ assert_file "gateway referenced secret preserved" "${gateway_secret_refusal_root
 
 gateway_secret_root="${TEST_HOME}/gateway-secret"
 create_fixture "${gateway_secret_root}"
-printf '{"bindings":[]}\n' > "${gateway_secret_root}/etc/gost-manager/node.json"
+printf '%s\n' \
+  '{"schema_version":1,"document_id":"12345678-1234-4234-8234-123456789abc","node_id":"iran-gateway-1","revision":1,"updated_at":"2026-07-12T00:00:00Z","bindings":[]}' \
+  > "${gateway_secret_root}/etc/gost-manager/node.json"
 rm -f "${gateway_secret_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service" \
   "${gateway_secret_root}/etc/gost-manager/generated/gateway/exits/ee-primary.env"
 run_plan "${gateway_secret_root}" gateway-secrets >/dev/null
 assert_absent "gateway unreferenced secrets removed" "${gateway_secret_root}/etc/gost-manager/secrets/secret-ee-primary.env"
 assert_file "gateway secret-only keeps state" "${gateway_secret_root}/etc/gost-manager/state.json"
+
+malformed_gateway_state_root="${TEST_HOME}/gateway-malformed-state"
+create_fixture "${malformed_gateway_state_root}"
+printf '{malformed\n' > "${malformed_gateway_state_root}/etc/gost-manager/node.json"
+if run_plan "${malformed_gateway_state_root}" gateway-secrets >/dev/null 2>&1; then
+  fail "malformed gateway state refuses secret deletion"
+else
+  pass "malformed gateway state refuses secret deletion"
+fi
+assert_file "malformed gateway state preserves secret" "${malformed_gateway_state_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+
+symlink_gateway_state_root="${TEST_HOME}/gateway-symlink-state"
+create_fixture "${symlink_gateway_state_root}"
+printf 'outside state\n' > "${TEST_HOME}/outside-node.json"
+rm -f "${symlink_gateway_state_root}/etc/gost-manager/node.json"
+ln -s "${TEST_HOME}/outside-node.json" "${symlink_gateway_state_root}/etc/gost-manager/node.json"
+if run_plan "${symlink_gateway_state_root}" gateway-secrets >/dev/null 2>&1; then
+  fail "symlinked gateway state refuses secret deletion"
+else
+  pass "symlinked gateway state refuses secret deletion"
+fi
+assert_file "symlinked gateway state preserves secret" "${symlink_gateway_state_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+
+state_with_runtime_root="${TEST_HOME}/gateway-state-runtime-remains"
+create_fixture "${state_with_runtime_root}"
+if run_plan "${state_with_runtime_root}" gateway-state gateway-secrets >/dev/null 2>&1; then
+  fail "gateway state deletion keeps secret while runtime remains"
+else
+  pass "gateway state deletion keeps secret while runtime remains"
+fi
+assert_absent "state deletion removes node with runtime remaining" "${state_with_runtime_root}/etc/gost-manager/node.json"
+assert_file "state deletion preserves secret with runtime remaining" "${state_with_runtime_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+
+fully_removed_invalid_state_root="${TEST_HOME}/gateway-invalid-full-removal"
+create_fixture "${fully_removed_invalid_state_root}"
+printf '{invalid\n' > "${fully_removed_invalid_state_root}/etc/gost-manager/node.json"
+run_plan "${fully_removed_invalid_state_root}" gateway-runtime gateway-state gateway-secrets >/dev/null
+assert_absent "fully removed invalid state permits secret deletion" "${fully_removed_invalid_state_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+
+systemd_only_root="${TEST_HOME}/gateway-systemd-only"
+create_fixture "${systemd_only_root}"
+rm -f \
+  "${systemd_only_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service" \
+  "${systemd_only_root}/etc/gost-manager/generated/gateway/exits/ee-primary.env" \
+  "${systemd_only_root}/etc/gost-manager/generated/gateway/runtime.json"
+(
+  export STUB_GATEWAY_LOADED_SERVICES=gost-gateway-exit-systemd-only.service
+  export STUB_GATEWAY_ACTIVE_SERVICES=gost-gateway-exit-systemd-only.service
+  run_plan "${systemd_only_root}" gateway-runtime gateway-state gateway-secrets gateway-package >/dev/null
+)
+assert_absent "systemd-only active gateway service is removed" "${systemd_only_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+assert_absent "systemd-only gateway package is removed" "${systemd_only_root}/usr/local/lib/gost-manager/gateway"
 
 gateway_package_refusal_root="${TEST_HOME}/gateway-package-refusal"
 create_fixture "${gateway_package_refusal_root}"
