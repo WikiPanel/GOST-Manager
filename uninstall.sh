@@ -139,21 +139,32 @@ managed_gateway_units() {
   shopt -u nullglob
 }
 
+gateway_service_name_from_line() {
+  local line="$1" bullet name
+  bullet=$'\342\227\217'
+  line="${line#"${line%%[![:space:]]*}"}"
+  if [[ "${line}" == "${bullet}"* ]]; then
+    line="${line#"${bullet}"}"
+    line="${line#"${line%%[![:space:]]*}"}"
+  fi
+  name="${line%%[[:space:]]*}"
+  [[ "${name}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] || return 0
+  printf '%s\n' "${name}"
+}
+
 gateway_candidate_services() {
-  local record directory file base manifest output line name
-  if ! output="$("${SYSTEMCTL_BIN}" list-units --all --type=service --no-legend 'gost-gateway-exit-*.service' 2>/dev/null)"; then
+  local record directory file base manifest output line
+  if ! output="$("${SYSTEMCTL_BIN}" list-units --all --type=service --no-legend --plain 'gost-gateway-exit-*.service' 2>/dev/null)"; then
     return 1
   fi
   while IFS= read -r line; do
-    name="${line%%[[:space:]]*}"
-    [[ "${name}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] && printf '%s\n' "${name}"
+    gateway_service_name_from_line "${line}"
   done <<< "${output}"
   if ! output="$("${SYSTEMCTL_BIN}" list-unit-files --no-legend 'gost-gateway-exit-*.service' 2>/dev/null)"; then
     return 1
   fi
   while IFS= read -r line; do
-    name="${line%%[[:space:]]*}"
-    [[ "${name}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] && printf '%s\n' "${name}"
+    gateway_service_name_from_line "${line}"
   done <<< "${output}"
   while IFS= read -r record; do
     [[ -n "${record}" ]] || continue

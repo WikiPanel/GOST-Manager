@@ -45,6 +45,7 @@ class FakeSystem:
         self.listener_verification_enabled = True
         self.missing_listeners: set[str] = set()
         self.listener_pids: dict[str, tuple[int, ...]] = {}
+        self.list_units_prefix = ""
         self.corrupt_on_start = False
         self.next_pid = 4000
 
@@ -73,7 +74,13 @@ class FakeSystem:
                 name for name, state in sorted(self.states.items())
                 if state.get("loaded", True)
             ]
-            return CommandResult(0, "".join(f"{name} loaded inactive dead test\n" for name in names))
+            return CommandResult(
+                0,
+                "".join(
+                    f"{self.list_units_prefix}{name} loaded inactive dead test\n"
+                    for name in names
+                ),
+            )
         if command[:2] == ("systemctl", "list-unit-files"):
             names = [
                 name for name, state in sorted(self.states.items())
@@ -232,11 +239,14 @@ class RuntimeRenderAndInspectionTests(unittest.TestCase):
     def test_systemd_discovery_parser_accepts_only_exact_service_names(self) -> None:
         parsed = parse_systemd_service_names(
             "gost-gateway-exit-ee-primary.service enabled\n"
+            "\u25cf gost-gateway-exit-failed.service loaded failed failed\n"
+            "  \u25cf gost-gateway-exit-spaced.service loaded failed failed\n"
             "gost-gateway-exit-BAD.service enabled\n"
             "gost-gateway-exit-ee-primary.service.bak enabled\n"
             "gost-iran-1.service enabled\n"
+            "custom-gost.service enabled\n"
         )
-        self.assertEqual(frozenset({"ee-primary"}), parsed)
+        self.assertEqual(frozenset({"ee-primary", "failed", "spaced"}), parsed)
 
 
 class RuntimePlanApplyTests(unittest.TestCase):
@@ -245,6 +255,18 @@ class RuntimePlanApplyTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.fixture.close()
+
+    def lifecycle_commands_for(self, exit_id: str) -> list[tuple[str, ...]]:
+        name = service_name(exit_id)
+        actions = {"enable", "disable", "start", "stop", "restart"}
+        return [
+            command for command in self.fixture.system.commands
+            if command
+            and command[0] == "systemctl"
+            and len(command) > 1
+            and command[1] in actions
+            and command[-1] == name
+        ]
 
     def test_first_apply_then_unchanged_is_noop_without_restart(self) -> None:
         plan = self.fixture.manager.plan()
@@ -374,6 +396,158 @@ class RuntimePlanApplyTests(unittest.TestCase):
         restored = self.fixture.system.states[service_name("ee-primary")]
         self.assertEqual(state_before["enabled"], restored["enabled"])
         self.assertEqual(state_before["active"], restored["active"])
+
+    def test_failed_restart_does_not_touch_unrelated_noop_exit(self) -> None:
+        pair = add_secondary(make_pair(route_enabled=False))
+        self.fixture.replace_pair(pair)
+        self.fixture.secrets.set("secret-de-backup", credentials())
+        self.fixture.system.ports[service_name("de-backup")] = 18082
+        self.fixture.manager.apply(yes=True)
+        noop_id = "de-backup"
+        changed_id = "ee-primary"
+        noop_env = self.fixture.paths.env_file(noop_id)
+        noop_unit = self.fixture.paths.unit_file(noop_id)
+        changed_env = self.fixture.paths.env_file(changed_id)
+        changed_unit = self.fixture.paths.unit_file(changed_id)
+        manifest_before = self.fixture.paths.manifest_file.read_bytes()
+        noop_env_before = noop_env.read_bytes()
+        noop_unit_before = noop_unit.read_bytes()
+        noop_env_stat = noop_env.stat()
+        noop_unit_stat = noop_unit.stat()
+        noop_state_before = dict(self.fixture.system.states[service_name(noop_id)])
+        noop_pid_before = noop_state_before["pid"]
+        changed_env_before = changed_env.read_bytes()
+        changed_unit_before = changed_unit.read_bytes()
+        changed_state_before = dict(self.fixture.system.states[service_name(changed_id)])
+        self.fixture.system.commands.clear()
+        self.fixture.state.mutate_shared(
+            lambda shared: replace(
+                shared,
+                exits=tuple(
+                    replace(item, host="192.0.2.55")
+                    if item.id == changed_id else item
+                    for item in shared.exits
+                ),
+            )
+        )
+        self.fixture.manager.failure_hook = lambda phase: (
+            (_ for _ in ()).throw(RuntimeError("restart failed"))
+            if phase == "after_changed_service_restart" else None
+        )
+        with self.assertRaises(RuntimeError):
+            self.fixture.manager.apply(yes=True)
+        self.assertEqual([], self.lifecycle_commands_for(noop_id))
+        self.assertEqual(noop_pid_before, self.fixture.system.states[service_name(noop_id)]["pid"])
+        self.assertEqual(noop_state_before, self.fixture.system.states[service_name(noop_id)])
+        self.assertEqual(noop_env_before, noop_env.read_bytes())
+        self.assertEqual(noop_unit_before, noop_unit.read_bytes())
+        self.assertEqual(noop_env_stat.st_ino, noop_env.stat().st_ino)
+        self.assertEqual(noop_env_stat.st_mtime_ns, noop_env.stat().st_mtime_ns)
+        self.assertEqual(noop_unit_stat.st_ino, noop_unit.stat().st_ino)
+        self.assertEqual(noop_unit_stat.st_mtime_ns, noop_unit.stat().st_mtime_ns)
+        self.assertEqual(changed_env_before, changed_env.read_bytes())
+        self.assertEqual(changed_unit_before, changed_unit.read_bytes())
+        self.assertEqual(changed_state_before["enabled"], self.fixture.system.states[service_name(changed_id)]["enabled"])
+        self.assertEqual(changed_state_before["active"], self.fixture.system.states[service_name(changed_id)]["active"])
+        self.assertEqual(manifest_before, self.fixture.paths.manifest_file.read_bytes())
+        flattened = "\n".join(" ".join(command) for command in self.fixture.system.commands)
+        self.assertNotIn("gost-iran-", flattened)
+        self.assertNotIn("nginx", flattened.lower())
+        self.assertNotIn("iptables", flattened.lower())
+
+    def test_noop_exit_is_untouched_when_create_fails(self) -> None:
+        self.fixture.manager.apply(yes=True)
+        pair = add_secondary(make_pair(route_enabled=False))
+        self.fixture.replace_pair(pair)
+        self.fixture.secrets.set("secret-de-backup", credentials())
+        self.fixture.system.ports[service_name("de-backup")] = 18082
+        noop_env = self.fixture.paths.env_file("ee-primary")
+        noop_unit = self.fixture.paths.unit_file("ee-primary")
+        env_before = noop_env.read_bytes()
+        unit_before = noop_unit.read_bytes()
+        state_before = dict(self.fixture.system.states[service_name("ee-primary")])
+        self.fixture.system.commands.clear()
+        self.fixture.manager.failure_hook = lambda phase: (
+            (_ for _ in ()).throw(RuntimeError("create failed"))
+            if phase == "after_new_service_enable" else None
+        )
+        with self.assertRaises(RuntimeError):
+            self.fixture.manager.apply(yes=True)
+        self.assertEqual([], self.lifecycle_commands_for("ee-primary"))
+        self.assertEqual(env_before, noop_env.read_bytes())
+        self.assertEqual(unit_before, noop_unit.read_bytes())
+        self.assertEqual(state_before, self.fixture.system.states[service_name("ee-primary")])
+        self.assertFalse(self.fixture.paths.env_file("de-backup").exists())
+        self.assertFalse(self.fixture.paths.unit_file("de-backup").exists())
+
+    def test_noop_exit_is_untouched_when_stale_removal_fails(self) -> None:
+        pair = add_secondary(make_pair(route_enabled=False))
+        self.fixture.replace_pair(pair)
+        self.fixture.secrets.set("secret-de-backup", credentials())
+        self.fixture.system.ports[service_name("de-backup")] = 18082
+        self.fixture.manager.apply(yes=True)
+        self.fixture.state.mutate_node(
+            lambda node: replace(
+                node,
+                bindings=tuple(
+                    replace(item, enabled=False) if item.exit_id == "de-backup" else item
+                    for item in node.bindings
+                ),
+            )
+        )
+        noop_env = self.fixture.paths.env_file("ee-primary")
+        noop_unit = self.fixture.paths.unit_file("ee-primary")
+        env_before = noop_env.read_bytes()
+        unit_before = noop_unit.read_bytes()
+        state_before = dict(self.fixture.system.states[service_name("ee-primary")])
+        stale_env_before = self.fixture.paths.env_file("de-backup").read_bytes()
+        manifest_before = self.fixture.paths.manifest_file.read_bytes()
+        self.fixture.system.commands.clear()
+        self.fixture.manager.failure_hook = lambda phase: (
+            (_ for _ in ()).throw(RuntimeError("remove failed"))
+            if phase == "after_stale_service_stop" else None
+        )
+        with self.assertRaises(RuntimeError):
+            self.fixture.manager.apply(yes=True)
+        self.assertEqual([], self.lifecycle_commands_for("ee-primary"))
+        self.assertEqual(env_before, noop_env.read_bytes())
+        self.assertEqual(unit_before, noop_unit.read_bytes())
+        self.assertEqual(state_before, self.fixture.system.states[service_name("ee-primary")])
+        self.assertEqual(stale_env_before, self.fixture.paths.env_file("de-backup").read_bytes())
+        self.assertEqual(manifest_before, self.fixture.paths.manifest_file.read_bytes())
+
+    def test_selected_apply_failure_does_not_touch_unselected_exit(self) -> None:
+        pair = add_secondary(make_pair(route_enabled=False))
+        self.fixture.replace_pair(pair)
+        self.fixture.secrets.set("secret-de-backup", credentials())
+        self.fixture.system.ports[service_name("de-backup")] = 18082
+        self.fixture.manager.apply(yes=True)
+        other_env = self.fixture.paths.env_file("de-backup")
+        other_unit = self.fixture.paths.unit_file("de-backup")
+        env_before = other_env.read_bytes()
+        unit_before = other_unit.read_bytes()
+        state_before = dict(self.fixture.system.states[service_name("de-backup")])
+        self.fixture.system.commands.clear()
+        self.fixture.state.mutate_shared(
+            lambda shared: replace(
+                shared,
+                exits=tuple(
+                    replace(item, socks_port=29999)
+                    if item.id == "ee-primary" else item
+                    for item in shared.exits
+                ),
+            )
+        )
+        self.fixture.manager.failure_hook = lambda phase: (
+            (_ for _ in ()).throw(RuntimeError("selected failure"))
+            if phase == "after_changed_service_restart" else None
+        )
+        with self.assertRaises(RuntimeError):
+            self.fixture.manager.apply(yes=True, exit_id="ee-primary")
+        self.assertEqual([], self.lifecycle_commands_for("de-backup"))
+        self.assertEqual(env_before, other_env.read_bytes())
+        self.assertEqual(unit_before, other_unit.read_bytes())
+        self.assertEqual(state_before, self.fixture.system.states[service_name("de-backup")])
 
     def test_partial_start_failure_is_stopped_disabled_and_removed(self) -> None:
         self.fixture.system.fail_after = ("systemctl", "start")
@@ -581,6 +755,33 @@ class RuntimePlanApplyTests(unittest.TestCase):
         )
         self.assertEqual("no-op", self.fixture.manager.plan("ee-primary").actions[0].action)
 
+    def test_explicit_start_after_secret_rotation_updates_generation_and_next_plan_noop(self) -> None:
+        pair = add_secondary(make_pair(route_enabled=False))
+        self.fixture.replace_pair(pair)
+        self.fixture.secrets.set("secret-de-backup", credentials())
+        self.fixture.system.ports[service_name("de-backup")] = 18082
+        self.fixture.manager.apply(yes=True)
+        self.fixture.manager.service_control("stop", "ee-primary", yes=True)
+        before = parse_manifest_document(
+            self.fixture.paths.manifest_file.read_bytes(), self.fixture.paths
+        )
+        self.fixture.secrets.set("secret-ee-primary", credentials())
+        self.assertEqual(
+            "update", self.fixture.manager.plan("ee-primary").actions[0].action
+        )
+        self.fixture.manager.service_control("start", "ee-primary")
+        after = parse_manifest_document(
+            self.fixture.paths.manifest_file.read_bytes(), self.fixture.paths
+        )
+        before_entries = {item.exit_id: item for item in before.entries}
+        after_entries = {item.exit_id: item for item in after.entries}
+        self.assertNotEqual(
+            before_entries["ee-primary"].secret_mtime_ns,
+            after_entries["ee-primary"].secret_mtime_ns,
+        )
+        self.assertEqual(before_entries["de-backup"], after_entries["de-backup"])
+        self.assertEqual("no-op", self.fixture.manager.plan("ee-primary").actions[0].action)
+
     def test_failed_explicit_restart_recovers_and_does_not_update_manifest(self) -> None:
         self.fixture.manager.apply(yes=True)
         self.fixture.secrets.set("secret-ee-primary", credentials())
@@ -599,6 +800,27 @@ class RuntimePlanApplyTests(unittest.TestCase):
         self.fixture.system.listener_verification_enabled = False
         with self.assertRaises(OperationalError):
             self.fixture.manager.service_control("restart", "ee-primary", yes=True)
+        self.assertEqual(before, self.fixture.paths.manifest_file.read_bytes())
+
+    def test_failed_explicit_start_does_not_update_manifest(self) -> None:
+        self.fixture.manager.apply(yes=True)
+        self.fixture.manager.service_control("stop", "ee-primary", yes=True)
+        self.fixture.secrets.set("secret-ee-primary", credentials())
+        before = self.fixture.paths.manifest_file.read_bytes()
+        self.fixture.system.fail_after = ("systemctl", "start")
+        with self.assertRaises(OperationalError):
+            self.fixture.manager.service_control("start", "ee-primary")
+        self.assertEqual(before, self.fixture.paths.manifest_file.read_bytes())
+        self.assertFalse(self.fixture.system.states[service_name("ee-primary")]["active"])
+
+    def test_failed_start_listener_verification_does_not_update_manifest(self) -> None:
+        self.fixture.manager.apply(yes=True)
+        self.fixture.manager.service_control("stop", "ee-primary", yes=True)
+        self.fixture.secrets.set("secret-ee-primary", credentials())
+        before = self.fixture.paths.manifest_file.read_bytes()
+        self.fixture.system.listener_verification_enabled = False
+        with self.assertRaises(OperationalError):
+            self.fixture.manager.service_control("start", "ee-primary")
         self.assertEqual(before, self.fixture.paths.manifest_file.read_bytes())
 
     def test_failed_restart_manifest_write_reports_without_secret_data(self) -> None:
@@ -621,6 +843,47 @@ class RuntimePlanApplyTests(unittest.TestCase):
         self.assertEqual(before, self.fixture.paths.manifest_file.read_bytes())
         self.assertNotIn(value.username, str(caught.exception))
         self.assertNotIn(value.password, str(caught.exception))
+
+    def test_failed_start_manifest_bookkeeping_restores_previous_bytes(self) -> None:
+        self.fixture.manager.apply(yes=True)
+        self.fixture.manager.service_control("stop", "ee-primary", yes=True)
+        value = credentials()
+        self.fixture.secrets.set("secret-ee-primary", value)
+        before = self.fixture.paths.manifest_file.read_bytes()
+        write_atomic = self.fixture.manager.runtime_store.write_atomic
+
+        def fail_manifest(path, data, mode=0o600):
+            if path == self.fixture.paths.manifest_file:
+                raise OperationalError("manifest write failed")
+            return write_atomic(path, data, mode)
+
+        with mock.patch.object(
+            self.fixture.manager.runtime_store, "write_atomic",
+            side_effect=fail_manifest,
+        ), self.assertRaises(OperationalError) as caught:
+            self.fixture.manager.service_control("start", "ee-primary")
+        self.assertEqual(before, self.fixture.paths.manifest_file.read_bytes())
+        self.assertNotIn(value.username, str(caught.exception))
+        self.assertNotIn(value.password, str(caught.exception))
+
+    def test_failed_start_manifest_fsync_restores_previous_bytes(self) -> None:
+        self.fixture.manager.apply(yes=True)
+        self.fixture.manager.service_control("stop", "ee-primary", yes=True)
+        self.fixture.secrets.set("secret-ee-primary", credentials())
+        before = self.fixture.paths.manifest_file.read_bytes()
+        fsync_directory = self.fixture.manager.runtime_store.fsync_directory
+
+        def fail_generated_fsync(path):
+            if path == self.fixture.paths.generated_dir:
+                raise OperationalError("manifest fsync failed")
+            return fsync_directory(path)
+
+        with mock.patch.object(
+            self.fixture.manager.runtime_store, "fsync_directory",
+            side_effect=fail_generated_fsync,
+        ), self.assertRaises(OperationalError):
+            self.fixture.manager.service_control("start", "ee-primary")
+        self.assertEqual(before, self.fixture.paths.manifest_file.read_bytes())
 
     def test_failed_explicit_start_restores_prior_inactive_state(self) -> None:
         self.fixture.manager.apply(yes=True)
@@ -715,6 +978,33 @@ class RuntimePlanApplyTests(unittest.TestCase):
                     self.assertFalse(state["loaded"])
                     self.assertFalse(state["enabled"])
                     self.assertFalse(state["active"])
+
+    def test_failed_bullet_prefixed_systemd_only_service_is_reconciled(self) -> None:
+        self.fixture.state.mutate_node(
+            lambda node: replace(
+                node, bindings=(replace(node.bindings[0], enabled=False),)
+            )
+        )
+        exit_id = "failed-only"
+        name = service_name(exit_id)
+        self.fixture.system.list_units_prefix = "\u25cf "
+        self.fixture.system.states[name] = {
+            "loaded": True, "enabled": False, "active": False, "pid": 0,
+        }
+        self.fixture.system.states["gost-gateway-exit-BAD.service"] = {
+            "loaded": True, "enabled": False, "active": False, "pid": 0,
+        }
+        selected = self.fixture.manager.plan(exit_id)
+        self.assertEqual([(exit_id, "remove")], [
+            (item.exit_id, item.action) for item in selected.actions
+        ])
+        full = self.fixture.manager.apply(yes=True)
+        self.assertEqual((exit_id,), full.removed)
+        self.assertFalse(self.fixture.system.states[name]["loaded"])
+        self.assertNotIn(
+            "gost-gateway-exit-BAD.service",
+            " ".join(" ".join(command) for command in self.fixture.system.commands),
+        )
 
     def test_manifest_only_runtime_is_removed(self) -> None:
         self.fixture.manager.apply(yes=True)

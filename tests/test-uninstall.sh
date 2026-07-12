@@ -239,13 +239,40 @@ rm -f \
   "${systemd_only_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service" \
   "${systemd_only_root}/etc/gost-manager/generated/gateway/exits/ee-primary.env" \
   "${systemd_only_root}/etc/gost-manager/generated/gateway/runtime.json"
-(
-  export STUB_GATEWAY_LOADED_SERVICES=gost-gateway-exit-systemd-only.service
-  export STUB_GATEWAY_ACTIVE_SERVICES=gost-gateway-exit-systemd-only.service
-  run_plan "${systemd_only_root}" gateway-runtime gateway-state gateway-secrets gateway-package >/dev/null
-)
+: > "${COMMAND_LOG}"
+export STUB_GATEWAY_LIST_PREFIX=$'\342\227\217 '
+export STUB_GATEWAY_LOADED_SERVICES="gost-gateway-exit-systemd-only.service gost-gateway-exit-BAD.service custom-gost.service"
+export STUB_GATEWAY_ACTIVE_SERVICES=gost-gateway-exit-systemd-only.service
+run_plan "${systemd_only_root}" gateway-runtime gateway-state gateway-secrets gateway-package >/dev/null
+unset STUB_GATEWAY_LIST_PREFIX STUB_GATEWAY_LOADED_SERVICES STUB_GATEWAY_ACTIVE_SERVICES
 assert_absent "systemd-only active gateway service is removed" "${systemd_only_root}/etc/gost-manager/secrets/secret-ee-primary.env"
 assert_absent "systemd-only gateway package is removed" "${systemd_only_root}/usr/local/lib/gost-manager/gateway"
+assert_not_contains "systemd-only ignores invalid uppercase gateway unit" "gost-gateway-exit-BAD.service" "${COMMAND_LOG}"
+
+systemd_only_failure_root="${TEST_HOME}/gateway-systemd-only-failure"
+create_fixture "${systemd_only_failure_root}"
+rm -f \
+  "${systemd_only_failure_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service" \
+  "${systemd_only_failure_root}/etc/gost-manager/generated/gateway/exits/ee-primary.env" \
+  "${systemd_only_failure_root}/etc/gost-manager/generated/gateway/runtime.json"
+export STUB_GATEWAY_LIST_PREFIX=$'\342\227\217 '
+export STUB_GATEWAY_LOADED_SERVICES=gost-gateway-exit-systemd-fail.service
+export STUB_GATEWAY_ACTIVE_SERVICES=gost-gateway-exit-systemd-fail.service
+export STUB_FAIL_SYSTEMCTL_ACTION=disable
+export STUB_FAIL_SYSTEMCTL_UNIT=gost-gateway-exit-systemd-fail.service
+if run_plan "${systemd_only_failure_root}" gateway-runtime gateway-state gateway-secrets gateway-package >/dev/null 2>&1; then
+  unset STUB_GATEWAY_LIST_PREFIX STUB_GATEWAY_LOADED_SERVICES STUB_GATEWAY_ACTIVE_SERVICES
+  unset STUB_FAIL_SYSTEMCTL_ACTION STUB_FAIL_SYSTEMCTL_UNIT
+  fail "bullet-prefixed systemd-only removal failure reports failure"
+else
+  unset STUB_GATEWAY_LIST_PREFIX STUB_GATEWAY_LOADED_SERVICES STUB_GATEWAY_ACTIVE_SERVICES
+  unset STUB_FAIL_SYSTEMCTL_ACTION STUB_FAIL_SYSTEMCTL_UNIT
+  pass "bullet-prefixed systemd-only removal failure reports failure"
+fi
+assert_file "bullet systemd-only failure preserves state" "${systemd_only_failure_root}/etc/gost-manager/state.json"
+assert_file "bullet systemd-only failure preserves secret" "${systemd_only_failure_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+assert_file "bullet systemd-only failure preserves package" "${systemd_only_failure_root}/usr/local/lib/gost-manager/gateway/__init__.py"
+assert_file "bullet systemd-only failure preserves runner" "${systemd_only_failure_root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh"
 
 gateway_package_refusal_root="${TEST_HOME}/gateway-package-refusal"
 create_fixture "${gateway_package_refusal_root}"

@@ -311,64 +311,110 @@ class RuntimeManager:
             os.chmod(staged_manifest, 0o600)
             self._fail("after_staging")
         self.runtime_store.prepare()
-        touched: set[Path] = {self.paths.manifest_file}
-        for action in plan.actions:
-            touched.add(self.paths.env_file(action.exit_id))
-            touched.add(self.paths.unit_file(action.exit_id))
-        snapshots = self.runtime_store.snapshot(touched)
         previous_states = {
             action.exit_id: self.inspector.service_state(action.exit_id)
             for action in plan.actions
+            if action.action != "no-op"
         }
+        env_write_ids: set[str] = set()
+        unit_write_ids: set[str] = set()
+        unit_reload_ids: set[str] = set()
+        lifecycle_target_ids: set[str] = set()
+        removed_ids: set[str] = set()
+        unchanged_ids = {
+            action.exit_id for action in plan.actions if action.action == "no-op"
+        }
+        for action in plan.actions:
+            if action.action in {"create", "update", "restart"}:
+                env, unit, _entry = rendered[action.exit_id]
+                if self.runtime_store.read_optional(
+                    self.paths.env_file(action.exit_id), 64 * 1024
+                ) != env:
+                    env_write_ids.add(action.exit_id)
+                if self.runtime_store.read_optional(
+                    self.paths.unit_file(action.exit_id), 64 * 1024
+                ) != unit:
+                    unit_write_ids.add(action.exit_id)
+                    unit_reload_ids.add(action.exit_id)
+                if not previous_states[action.exit_id].loaded:
+                    unit_reload_ids.add(action.exit_id)
+                lifecycle_target_ids.add(action.exit_id)
+            elif action.action == "start":
+                lifecycle_target_ids.add(action.exit_id)
+            elif action.action == "remove":
+                removed_ids.add(action.exit_id)
+                env_write_ids.add(action.exit_id)
+                unit_write_ids.add(action.exit_id)
+                state = previous_states[action.exit_id]
+                current_unit = self.runtime_store.read_optional(
+                    self.paths.unit_file(action.exit_id), 64 * 1024
+                )
+                if current_unit is not None or state.loaded:
+                    unit_reload_ids.add(action.exit_id)
+                if state.loaded or state.active or state.enabled:
+                    lifecycle_target_ids.add(action.exit_id)
+        file_mutated_ids = env_write_ids | unit_write_ids
+        if unchanged_ids & (file_mutated_ids | lifecycle_target_ids | removed_ids):
+            raise OperationalError("gateway runtime mutation scope included an unchanged Exit")
+        file_snapshot_paths: set[Path] = {self.paths.manifest_file}
+        for exit_id in sorted(env_write_ids):
+            file_snapshot_paths.add(self.paths.env_file(exit_id))
+        for exit_id in sorted(unit_write_ids):
+            file_snapshot_paths.add(self.paths.unit_file(exit_id))
+        snapshots = self.runtime_store.snapshot(file_snapshot_paths)
         backup = self.runtime_store.create_backup(snapshots)
-        changed_units = False
+        changed_units = bool(unit_reload_ids)
         restarted: list[str] = []
         started: list[str] = []
         removed: list[str] = []
-        mutation_attempted: set[str] = set()
+        lifecycle_mutated_ids: set[str] = set()
         first_file_replaced = False
         try:
             self._fail("after_backup_creation")
             for action in plan.actions:
                 if action.action in {"create", "update", "restart"}:
                     env, unit, _entry = rendered[action.exit_id]
-                    self.runtime_store.write_atomic(self.paths.env_file(action.exit_id), env)
-                    if not first_file_replaced:
-                        first_file_replaced = True
-                        self._fail("after_first_file_replacement")
-                    changed_units = True
-                    self.runtime_store.write_atomic(self.paths.unit_file(action.exit_id), unit, 0o644)
-                    self._fail("after_unit_replacement")
+                    if action.exit_id in env_write_ids:
+                        self.runtime_store.write_atomic(self.paths.env_file(action.exit_id), env)
+                        if not first_file_replaced:
+                            first_file_replaced = True
+                            self._fail("after_first_file_replacement")
+                    if action.exit_id in unit_write_ids:
+                        self.runtime_store.write_atomic(
+                            self.paths.unit_file(action.exit_id), unit, 0o644
+                        )
+                        if not first_file_replaced:
+                            first_file_replaced = True
+                            self._fail("after_first_file_replacement")
+                        self._fail("after_unit_replacement")
                 elif action.action == "remove":
                     state = previous_states[action.exit_id]
                     if state.loaded or state.active or state.enabled:
-                        mutation_attempted.add(action.exit_id)
+                        lifecycle_mutated_ids.add(action.exit_id)
                         self.inspector.systemctl("disable", "--now", action.service_name)
                     self._fail("after_stale_service_stop")
-                    if self.runtime_store.read_optional(
-                        self.paths.unit_file(action.exit_id), 64 * 1024
-                    ) is not None or state.loaded:
-                        changed_units = True
-                    self.runtime_store.remove_exact(self.paths.unit_file(action.exit_id))
-                    self.runtime_store.remove_exact(self.paths.env_file(action.exit_id))
+                    if action.exit_id in unit_write_ids:
+                        self.runtime_store.remove_exact(self.paths.unit_file(action.exit_id))
+                    if action.exit_id in env_write_ids:
+                        self.runtime_store.remove_exact(self.paths.env_file(action.exit_id))
                     removed.append(action.exit_id)
             if changed_units:
                 self.inspector.systemctl("daemon-reload")
             self._fail("after_daemon_reload")
             for action in plan.actions:
                 if action.action in {"create", "start"}:
-                    mutation_attempted.add(action.exit_id)
+                    lifecycle_mutated_ids.add(action.exit_id)
                     self.inspector.systemctl("enable", action.service_name)
                     self.inspector.systemctl("start", action.service_name)
                     started.append(action.exit_id)
                     self._fail("after_new_service_enable")
                 elif action.action == "update":
-                    mutation_attempted.add(action.exit_id)
+                    lifecycle_mutated_ids.add(action.exit_id)
                     self.inspector.systemctl("enable", action.service_name)
                     self.inspector.systemctl("start", action.service_name)
                     started.append(action.exit_id)
                 elif action.action == "restart":
-                    mutation_attempted.add(action.exit_id)
+                    lifecycle_mutated_ids.add(action.exit_id)
                     self.inspector.systemctl("enable", action.service_name)
                     self.inspector.systemctl("restart", action.service_name)
                     restarted.append(action.exit_id)
@@ -391,7 +437,7 @@ class RuntimeManager:
         except Exception:
             try:
                 self._rollback(
-                    snapshots, previous_states, mutation_attempted, changed_units
+                    snapshots, previous_states, lifecycle_mutated_ids, changed_units
                 )
             except Exception as exc:
                 if backup.exists():
@@ -464,17 +510,18 @@ class RuntimeManager:
             ):
                 raise OperationalError("gateway rollback service-state verification failed")
             env_snapshot = snapshot_by_path.get(self.paths.env_file(exit_id))
-            unit_snapshot = snapshot_by_path.get(self.paths.unit_file(exit_id))
+            env_data = env_snapshot.data if env_snapshot is not None else None
+            if env_data is None:
+                env_data = self.runtime_store.read_optional(
+                    self.paths.env_file(exit_id), 64 * 1024
+                )
             if (
                 expected.active
                 and expected.loaded
                 and restored.main_pid is not None
-                and env_snapshot is not None
-                and env_snapshot.data is not None
-                and unit_snapshot is not None
-                and unit_snapshot.data is not None
+                and env_data is not None
             ):
-                values = parse_env(env_snapshot.data, exit_id)
+                values = parse_env(env_data, exit_id)
                 self.inspector.verify_service_listener(
                     "127.0.0.1", int(values["GATEWAY_LISTEN_PORT"]),
                     restored.main_pid,
@@ -551,7 +598,7 @@ class RuntimeManager:
                         ) from recovery_error
                 raise
             if (
-                action == "restart"
+                action in {"start", "restart"}
                 and document is not None
                 and secret_generation is not None
             ):
@@ -593,6 +640,12 @@ class RuntimeManager:
     def _update_manifest_generation(
         self, document: RuntimeManifest, exit_id: str, generation: int,
     ) -> None:
+        previous_data = self.runtime_store.read_optional(
+            self.paths.manifest_file, MAX_RUNTIME_MANIFEST_BYTES
+        )
+        if previous_data is None:
+            raise StateError("gateway runtime manifest is missing")
+        parse_manifest_document(previous_data, self.paths)
         updated: list[RuntimeEntry] = []
         found = False
         for entry in document.entries:
@@ -610,12 +663,28 @@ class RuntimeManager:
             entries=tuple(updated),
         )
         parse_manifest_document(data, self.paths)
-        self.runtime_store.write_atomic(self.paths.manifest_file, data)
-        self._fail("after_service_manifest_replacement")
-        self.runtime_store.fsync_directory(self.paths.generated_dir)
-        installed = self.runtime_store.read_optional(
-            self.paths.manifest_file, MAX_RUNTIME_MANIFEST_BYTES
-        )
-        if installed != data:
-            raise OperationalError("gateway runtime manifest update was not durable")
-        parse_manifest_document(installed, self.paths)
+        if data == previous_data:
+            return
+        try:
+            self.runtime_store.write_atomic(self.paths.manifest_file, data)
+            self._fail("after_service_manifest_replacement")
+            self.runtime_store.fsync_directory(self.paths.generated_dir)
+            installed = self.runtime_store.read_optional(
+                self.paths.manifest_file, MAX_RUNTIME_MANIFEST_BYTES
+            )
+            if installed != data:
+                raise OperationalError("gateway runtime manifest update was not durable")
+            parse_manifest_document(installed, self.paths)
+        except Exception:
+            installed = self.runtime_store.read_optional(
+                self.paths.manifest_file, MAX_RUNTIME_MANIFEST_BYTES
+            )
+            if installed != previous_data:
+                try:
+                    self.runtime_store.write_atomic(self.paths.manifest_file, previous_data)
+                    self.runtime_store.fsync_directory(self.paths.generated_dir)
+                except Exception as restore_error:
+                    raise OperationalError(
+                        "gateway runtime manifest update failed and previous manifest could not be restored"
+                    ) from restore_error
+            raise

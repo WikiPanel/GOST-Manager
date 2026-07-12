@@ -84,7 +84,12 @@ def parse_systemd_service_names(output: str) -> frozenset[str]:
         line = raw.strip()
         if not line:
             continue
-        name = line.split(None, 1)[0]
+        fields = line.split(None, 2)
+        if fields and fields[0] == "\u25cf":
+            fields = fields[1:]
+        if not fields:
+            continue
+        name = fields[0]
         if SERVICE_RE.fullmatch(name):
             exit_id = exit_id_from_service(name)
             if exit_id is not None:
@@ -171,7 +176,7 @@ class RuntimeInspector:
         commands = (
             (
                 "systemctl", "list-units", "--all", "--type=service",
-                "--no-legend", "gost-gateway-exit-*.service",
+                "--no-legend", "--plain", "gost-gateway-exit-*.service",
             ),
             (
                 "systemctl", "list-unit-files", "--no-legend",

@@ -157,7 +157,7 @@ fi
 case "${action}" in
   list-units)
     for service in ${STUB_GATEWAY_LOADED_SERVICES:-}; do
-      gateway_removed "${service}" && printf '%s loaded inactive dead test\n' "${service}"
+      gateway_removed "${service}" && printf '%s%s loaded inactive dead test\n' "${STUB_GATEWAY_LIST_PREFIX:-}" "${service}"
     done
     ;;
   list-unit-files)
