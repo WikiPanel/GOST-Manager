@@ -160,6 +160,8 @@ assert_not_contains "purge cancellation runs no purge" "purge-history" "${COMMAN
 
 DISPATCH_LOG="${TEST_HOME}/dispatch.log"
 : > "${DISPATCH_LOG}"
+dispatch_stubs="${TEST_HOME}/dispatch-stubs.sh"
+cat > "${dispatch_stubs}" <<'STUB'
 install_or_update_gost() { printf 'install\n' >> "${DISPATCH_LOG}"; }
 create_kharej_tunnel() { printf 'kharej\n' >> "${DISPATCH_LOG}"; }
 create_iran_tunnel() { printf 'iran\n' >> "${DISPATCH_LOG}"; }
@@ -170,12 +172,6 @@ restart_tunnel() { printf 'restart\n' >> "${DISPATCH_LOG}"; }
 list_active_gost_services() { printf 'list\n' >> "${DISPATCH_LOG}"; }
 clean_old_broken_configs() { printf 'cleanup\n' >> "${DISPATCH_LOG}"; }
 native_gost_gateway_coming_soon() { printf 'native\n' >> "${DISPATCH_LOG}"; }
-(main_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n0' >/dev/null)
-assert_eq "legacy dispatch order unchanged" $'install\nkharej\niran\ndelete\nstatus\nlogs\nrestart\nlist\ncleanup' "$(sed -n '1,9p' "${DISPATCH_LOG}")"
-assert_contains "main option 10 dispatches Monitoring" '10) monitoring_menu ;;' "${ROOT_DIR}/gost-manager.sh"
-assert_contains "main option 11 dispatches Native placeholder" '11) native_gost_gateway_coming_soon ;;' "${ROOT_DIR}/gost-manager.sh"
-
-: > "${DISPATCH_LOG}"
 monitor_query() { printf 'query %s\n' "$*" >> "${DISPATCH_LOG}"; }
 monitor_custom_summary() { printf 'custom\n' >> "${DISPATCH_LOG}"; }
 monitor_service_detail() { printf 'service-detail\n' >> "${DISPATCH_LOG}"; }
@@ -187,6 +183,15 @@ monitoring_service_action() { printf 'service-%s\n' "$1" >> "${DISPATCH_LOG}"; }
 monitor_one_shot() { printf 'diagnostic\n' >> "${DISPATCH_LOG}"; }
 monitor_maintenance() { printf 'maintenance\n' >> "${DISPATCH_LOG}"; }
 monitor_purge_history() { printf 'purge\n' >> "${DISPATCH_LOG}"; }
+STUB
+# shellcheck source=/dev/null
+source "${dispatch_stubs}"
+(main_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n0' >/dev/null)
+assert_eq "legacy dispatch order unchanged" $'install\nkharej\niran\ndelete\nstatus\nlogs\nrestart\nlist\ncleanup' "$(sed -n '1,9p' "${DISPATCH_LOG}")"
+assert_contains "main option 10 dispatches Monitoring" '10) monitoring_menu ;;' "${ROOT_DIR}/gost-manager.sh"
+assert_contains "main option 11 dispatches Native placeholder" '11) native_gost_gateway_coming_soon ;;' "${ROOT_DIR}/gost-manager.sh"
+
+: > "${DISPATCH_LOG}"
 monitoring_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n0' >/dev/null
 assert_eq "Monitoring submenu dispatch count" "21" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
 for marker in \
