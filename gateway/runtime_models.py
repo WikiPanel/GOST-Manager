@@ -33,6 +33,9 @@ class ServiceState:
     enabled: bool
     active: bool
     main_pid: int | None
+    control_group: str = ""
+    pids: tuple[int, ...] = ()
+    pids_authoritative: bool = False
 
 
 @dataclass(frozen=True)

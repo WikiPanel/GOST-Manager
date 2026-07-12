@@ -94,3 +94,16 @@ class GatewayRuntimeLock(GatewayStateLock):
             marker=b"gateway-runtime\n",
             **kwargs,
         )
+
+
+class NginxGatewayLock(GatewayStateLock):
+    """Third lock in the state -> GOST runtime -> NGINX global order."""
+
+    def __init__(self, path: str | Path, timeout: float = 5.0, **kwargs: object) -> None:
+        super().__init__(
+            path,
+            timeout=timeout,
+            label="NGINX gateway",
+            marker=b"nginx-gateway\n",
+            **kwargs,
+        )

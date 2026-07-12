@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import os
 import subprocess
+import stat
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -14,6 +15,11 @@ from gateway.runtime_paths import SERVICE_RE, exit_id_from_service, service_name
 
 PID_RE = re.compile(r"pid=([1-9][0-9]*)")
 NAME_RE = re.compile(r'\(\("([^"\\]+)"')
+
+
+def _read_ascii_file(path: str) -> str:
+    with open(path, "r", encoding="ascii") as handle:
+        return handle.read()
 
 
 @dataclass(frozen=True)
@@ -133,9 +139,13 @@ class RuntimeInspector:
         self,
         runner: Callable[[Sequence[str]], CommandResult] = run_command,
         listener_verifier: Callable[[str, int, int], bool] = verify_proc_listener,
+        cgroup_root: str = "/sys/fs/cgroup",
+        cgroup_reader: Callable[[str], str] | None = None,
     ) -> None:
         self.runner = runner
         self.listener_verifier = listener_verifier
+        self.cgroup_root = cgroup_root
+        self.cgroup_reader = cgroup_reader or _read_ascii_file
         self.listener_calls = 0
 
     def listeners(self) -> tuple[Listener, ...]:
@@ -150,7 +160,7 @@ class RuntimeInspector:
         result = self.runner(
             (
                 "systemctl", "--no-pager", "show", name,
-                "--property=LoadState,UnitFileState,ActiveState,SubState,MainPID",
+                "--property=LoadState,UnitFileState,ActiveState,SubState,MainPID,ControlGroup",
             )
         )
         if result.returncode != 0:
@@ -164,13 +174,44 @@ class RuntimeInspector:
             pid = int(values.get("MainPID", "0"), 10)
         except ValueError:
             pid = 0
+        control_group = values.get("ControlGroup", "")
+        pids, authoritative = self._cgroup_pids(control_group)
         return ServiceState(
             name,
             values.get("LoadState") == "loaded",
             values.get("UnitFileState") in {"enabled", "enabled-runtime", "linked"},
             values.get("ActiveState") in {"active", "activating", "reloading"},
             pid if pid > 0 else None,
+            control_group,
+            pids,
+            authoritative,
         )
+
+    def _cgroup_pids(self, control_group: str) -> tuple[tuple[int, ...], bool]:
+        if (
+            not control_group.startswith("/")
+            or ".." in control_group.split("/")
+            or not re.fullmatch(r"/(?:[A-Za-z0-9_.@:-]+/)*[A-Za-z0-9_.@:-]+", control_group)
+        ):
+            return (), False
+        root = os.path.realpath(self.cgroup_root)
+        path = os.path.join(root, control_group.lstrip("/"), "cgroup.procs")
+        try:
+            parent = os.path.realpath(os.path.dirname(path))
+            if os.path.commonpath((root, parent)) != root:
+                return (), False
+            metadata = os.lstat(path)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                return (), False
+            values = self.cgroup_reader(path).splitlines()
+            if not values:
+                return (), False
+            pids = tuple(sorted({int(value) for value in values if value.isdigit() and int(value) > 0}))
+            if len(pids) != len(values):
+                return (), False
+            return pids, True
+        except (OSError, ValueError):
+            return (), False
 
     def discover_service_ids(self) -> frozenset[str]:
         commands = (

@@ -1,0 +1,37 @@
+[Unit]
+Description=GOST Manager NGINX Gateway
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStartPre=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --test
+ExecStart=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --start
+ExecReload=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --reload
+ExecStop=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --quit
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=300
+KillMode=mixed
+UMask=0077
+LimitNOFILE=200000
+TasksMax=4096
+RuntimeDirectory=gost-manager-nginx
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
