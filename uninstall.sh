@@ -18,6 +18,10 @@ REMOVE_MONITOR_HISTORY=0
 REMOVE_TRAFFIC=0
 REMOVE_CREDENTIALS=0
 REMOVE_GOST_BINARY=0
+REMOVE_GATEWAY_RUNTIME=0
+REMOVE_GATEWAY_STATE=0
+REMOVE_GATEWAY_SECRETS=0
+REMOVE_GATEWAY_PACKAGE=0
 UNIT_CHANGED=0
 FAILED_ACTIONS=0
 CONFIG_CAPTURED=0
@@ -100,12 +104,18 @@ remove_file() {
 
 remove_exact_tree() {
   local path="$1"
-  local allowed_config allowed_credentials allowed_package
+  local allowed_config allowed_credentials allowed_package allowed_gateway_package
+  local allowed_gateway_state_backups allowed_gateway_runtime_backups
   allowed_config="$(path_for /etc/gost-manager)"
   allowed_credentials="$(path_for /etc/gost)"
   allowed_package="$(path_for /usr/local/lib/gost-manager/monitoring)"
+  allowed_gateway_package="$(path_for /usr/local/lib/gost-manager/gateway)"
+  allowed_gateway_state_backups="$(path_for /etc/gost-manager/backups/gateway)"
+  allowed_gateway_runtime_backups="$(path_for /etc/gost-manager/backups/gateway-runtime)"
   case "${path}" in
-    "${allowed_config}"|"${allowed_credentials}"|"${allowed_package}") ;;
+    "${allowed_config}"|"${allowed_credentials}"|"${allowed_package}"| \
+    "${allowed_gateway_package}"|"${allowed_gateway_state_backups}"| \
+    "${allowed_gateway_runtime_backups}") ;;
     *)
       die "refusing unapproved recursive removal path: ${path}"
       return 1
@@ -113,6 +123,89 @@ remove_exact_tree() {
   esac
   reject_symlink_path "${path}" || return 1
   [[ ! -e "${path}" ]] || "${RM_BIN}" -rf -- "${path}"
+}
+
+managed_gateway_units() {
+  local directory file base
+  directory="$(path_for /etc/systemd/system)"
+  [[ -d "${directory}" && ! -L "${directory}" ]] || return 0
+  shopt -s nullglob
+  for file in "${directory}"/gost-gateway-exit-*.service; do
+    base="${file##*/}"
+    if [[ "${base}" =~ ^gost-gateway-exit-([a-z][a-z0-9-]{0,62})\.service$ && -f "${file}" && ! -L "${file}" ]]; then
+      printf '%s|%s|%s\n' "${base}" "${file}" "${BASH_REMATCH[1]}"
+    fi
+  done
+  shopt -u nullglob
+}
+
+gateway_candidate_services() {
+  local record directory file base manifest
+  while IFS= read -r record; do
+    [[ -n "${record}" ]] || continue
+    printf '%s\n' "${record%%|*}"
+  done < <(managed_gateway_units)
+  directory="$(path_for /etc/gost-manager/generated/gateway/exits)"
+  if [[ -d "${directory}" && ! -L "${directory}" ]]; then
+    shopt -s nullglob
+    for file in "${directory}"/*.env; do
+      base="${file##*/}"
+      if [[ "${base}" =~ ^([a-z][a-z0-9-]{0,62})\.env$ && -f "${file}" && ! -L "${file}" ]]; then
+        printf 'gost-gateway-exit-%s.service\n' "${BASH_REMATCH[1]}"
+      fi
+    done
+    shopt -u nullglob
+  fi
+  manifest="$(path_for /etc/gost-manager/generated/gateway/runtime.json)"
+  if [[ -f "${manifest}" && ! -L "${manifest}" ]]; then
+    python3 - "${manifest}" <<'PY' 2>/dev/null || true
+import json, re, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+for item in value.get("services", []):
+    name = item.get("service_name", "") if isinstance(item, dict) else ""
+    if re.fullmatch(r"gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service", name):
+        print(name)
+PY
+  fi
+}
+
+gateway_service_present() {
+  local service="$1"
+  local unit state
+  [[ "${service}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] || return 0
+  unit="$(path_for "/etc/systemd/system/${service}")"
+  [[ -e "${unit}" ]] && return 0
+  "${SYSTEMCTL_BIN}" is-active --quiet "${service}" >/dev/null 2>&1 && return 0
+  "${SYSTEMCTL_BIN}" is-enabled --quiet "${service}" >/dev/null 2>&1 && return 0
+  state="$(${SYSTEMCTL_BIN} show "${service}" --property=LoadState --value 2>/dev/null || true)"
+  [[ -n "${state}" && "${state}" != "not-found" ]]
+}
+
+gateway_runtime_services_exist() {
+  local service
+  while IFS= read -r service; do
+    [[ -n "${service}" ]] || continue
+    if gateway_service_present "${service}"; then
+      return 0
+    fi
+  done < <(gateway_candidate_services | LC_ALL=C sort -u)
+  return 1
+}
+
+gateway_state_references_secrets() {
+  local node_file
+  node_file="$(path_for /etc/gost-manager/node.json)"
+  [[ -e "${node_file}" ]] || return 1
+  reject_symlink_path "${node_file}" || return 0
+  python3 - "${node_file}" <<'PY' >/dev/null 2>&1
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text(encoding="utf-8"))
+bindings = value.get("bindings")
+if not isinstance(bindings, list):
+    raise SystemExit(2)
+raise SystemExit(0 if any(isinstance(item, dict) and item.get("secret_ref") for item in bindings) else 1)
+PY
 }
 
 managed_traffic_units() {
@@ -194,6 +287,14 @@ validate_dependencies() {
     die "history removal requires the installed monitoring admin to resolve the configured database safely."
     return 1
   fi
+  if [[ "${REMOVE_GATEWAY_PACKAGE}" == "1" && "${REMOVE_GATEWAY_RUNTIME}" != "1" ]] && gateway_runtime_services_exist; then
+    die "gateway package and runner cannot be removed while gateway Exit services remain."
+    return 1
+  fi
+  if [[ "${REMOVE_GATEWAY_SECRETS}" == "1" && "${REMOVE_GATEWAY_STATE}" != "1" ]] && gateway_state_references_secrets; then
+    die "gateway secrets cannot be removed while remaining Bindings reference them."
+    return 1
+  fi
 }
 
 yes_no() {
@@ -212,6 +313,10 @@ Monitoring history:            $(yes_no "${REMOVE_MONITOR_HISTORY}")
 Managed traffic services:      $(yes_no "${REMOVE_TRAFFIC}")
 /etc/gost credentials/backups: $(yes_no "${REMOVE_CREDENTIALS}")
 GOST binary:                   $(yes_no "${REMOVE_GOST_BINARY}")
+Gateway runtime/files:         $(yes_no "${REMOVE_GATEWAY_RUNTIME}")
+Gateway desired state/backups: $(yes_no "${REMOVE_GATEWAY_STATE}")
+Gateway private secrets:       $(yes_no "${REMOVE_GATEWAY_SECRETS}")
+Gateway package/launchers:     $(yes_no "${REMOVE_GATEWAY_PACKAGE}")
 PLAN
 }
 
@@ -232,7 +337,106 @@ collect_plan() {
     fi
   fi
   confirm "Delete /usr/local/bin/gost?" && REMOVE_GOST_BINARY=1
+  confirm "Remove gateway Exit services and generated runtime files?" && REMOVE_GATEWAY_RUNTIME=1
+  confirm "Remove gateway desired state and state backups?" && REMOVE_GATEWAY_STATE=1
+  if confirm "Delete private gateway secrets?"; then
+    read -r -p "Type DELETE GATEWAY SECRETS to confirm: " phrase
+    if [[ "${phrase}" == "DELETE GATEWAY SECRETS" ]]; then
+      REMOVE_GATEWAY_SECRETS=1
+    else
+      info "Gateway secret deletion cancelled."
+    fi
+  fi
+  confirm "Remove gateway package, launchers, and runner?" && REMOVE_GATEWAY_PACKAGE=1
   return 0
+}
+
+preserve_gateway_dependencies() {
+  REMOVE_GATEWAY_STATE=0
+  REMOVE_GATEWAY_SECRETS=0
+  REMOVE_GATEWAY_PACKAGE=0
+  info "Gateway runtime removal was incomplete; state, secrets, package, and runner were preserved."
+}
+
+remove_gateway_runtime() {
+  local service unit exit_id env_file directory file base
+  while IFS= read -r service; do
+    [[ -n "${service}" ]] || continue
+    exit_id="${service#gost-gateway-exit-}"
+    exit_id="${exit_id%.service}"
+    unit="$(path_for "/etc/systemd/system/${service}")"
+    env_file="$(path_for "/etc/gost-manager/generated/gateway/exits/${exit_id}.env")"
+    if ! gateway_service_present "${service}" || "${SYSTEMCTL_BIN}" disable --now "${service}"; then
+      remove_file "${unit}" || return 1
+      remove_file "${env_file}" || return 1
+      UNIT_CHANGED=1
+    else
+      info "Failed to remove gateway Exit service: ${service}"
+      FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    fi
+  done < <(gateway_candidate_services | LC_ALL=C sort -u)
+  if gateway_runtime_services_exist; then
+    preserve_gateway_dependencies
+    return 0
+  fi
+  directory="$(path_for /etc/gost-manager/generated/gateway/exits)"
+  if [[ -d "${directory}" && ! -L "${directory}" ]]; then
+    shopt -s nullglob
+    for file in "${directory}"/*.env; do
+      base="${file##*/}"
+      [[ "${base}" =~ ^[a-z][a-z0-9-]{0,62}\.env$ ]] || continue
+      remove_file "${file}" || return 1
+    done
+    shopt -u nullglob
+  fi
+  remove_file "$(path_for /etc/gost-manager/generated/gateway/runtime.json)" || return 1
+  remove_exact_tree "$(path_for /etc/gost-manager/backups/gateway-runtime)" || return 1
+  "${RMDIR_BIN}" "$(path_for /etc/gost-manager/generated/gateway/exits)" >/dev/null 2>&1 || true
+  "${RMDIR_BIN}" "$(path_for /etc/gost-manager/generated/gateway)" >/dev/null 2>&1 || true
+}
+
+remove_gateway_state() {
+  remove_file "$(path_for /etc/gost-manager/state.json)" || return 1
+  remove_file "$(path_for /etc/gost-manager/node.json)" || return 1
+  remove_exact_tree "$(path_for /etc/gost-manager/backups/gateway)" || return 1
+}
+
+remove_gateway_secrets() {
+  local directory file base
+  if gateway_runtime_services_exist; then
+    info "Gateway secrets were preserved because a gateway Exit service remains."
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  if [[ "${REMOVE_GATEWAY_STATE}" != "1" ]] && gateway_state_references_secrets; then
+    info "Gateway secrets were preserved because remaining Bindings reference them."
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  directory="$(path_for /etc/gost-manager/secrets)"
+  reject_symlink_path "${directory}" || return 1
+  if [[ -d "${directory}" ]]; then
+    shopt -s nullglob
+    for file in "${directory}"/*.env; do
+      base="${file##*/}"
+      [[ "${base}" =~ ^[a-z][a-z0-9-]{0,63}\.env$ ]] || continue
+      remove_file "${file}" || return 1
+    done
+    shopt -u nullglob
+    "${RMDIR_BIN}" "${directory}" >/dev/null 2>&1 || true
+  fi
+}
+
+remove_gateway_package() {
+  if gateway_runtime_services_exist; then
+    info "Gateway package and runner were preserved because a gateway Exit service remains."
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  remove_file "$(path_for /usr/local/sbin/gost-gateway)" || return 1
+  remove_file "$(path_for /usr/local/sbin/gost-gateway-runtime)" || return 1
+  remove_file "$(path_for /usr/local/lib/gost-manager/gost-run-gateway-exit.sh)" || return 1
+  remove_exact_tree "$(path_for /usr/local/lib/gost-manager/gateway)" || return 1
 }
 
 preserve_monitoring_dependencies() {
@@ -440,6 +644,18 @@ apply_plan() {
   if [[ "${REMOVE_TRAFFIC}" == "1" ]]; then
     remove_traffic_services || return 1
   fi
+  if [[ "${REMOVE_GATEWAY_RUNTIME}" == "1" ]]; then
+    remove_gateway_runtime || return 1
+  fi
+  if [[ "${REMOVE_GATEWAY_STATE}" == "1" ]]; then
+    remove_gateway_state || return 1
+  fi
+  if [[ "${REMOVE_GATEWAY_SECRETS}" == "1" ]]; then
+    remove_gateway_secrets || return 1
+  fi
+  if [[ "${REMOVE_GATEWAY_PACKAGE}" == "1" ]]; then
+    remove_gateway_package || return 1
+  fi
   remove_selected_traffic_dependencies || return 1
   if [[ "${UNIT_CHANGED}" == "1" ]]; then
     "${SYSTEMCTL_BIN}" daemon-reload || {
@@ -468,7 +684,7 @@ main() {
   require_safe_root
   collect_plan
   show_plan
-  if [[ "${REMOVE_MANAGER}${REMOVE_MONITOR_SERVICE}${REMOVE_MONITOR_CODE}${REMOVE_MONITOR_CONFIG}${REMOVE_MONITOR_HISTORY}${REMOVE_TRAFFIC}${REMOVE_CREDENTIALS}${REMOVE_GOST_BINARY}" == "00000000" ]]; then
+  if [[ "${REMOVE_MANAGER}${REMOVE_MONITOR_SERVICE}${REMOVE_MONITOR_CODE}${REMOVE_MONITOR_CONFIG}${REMOVE_MONITOR_HISTORY}${REMOVE_TRAFFIC}${REMOVE_CREDENTIALS}${REMOVE_GOST_BINARY}${REMOVE_GATEWAY_RUNTIME}${REMOVE_GATEWAY_STATE}${REMOVE_GATEWAY_SECRETS}${REMOVE_GATEWAY_PACKAGE}" == "000000000000" ]]; then
     info "No components selected; nothing changed."
     return 0
   fi

@@ -35,14 +35,21 @@ chmod 755 "${STUB_BIN}/gost-monitor-admin"
 
 create_fixture() {
   local root="$1"
+  local gateway_user gateway_pass
+  gateway_user="user-$(printf '%s' "${RANDOM}${RANDOM}" | shasum | cut -c1-12)"
+  gateway_pass="pass-$(printf '%s' "${RANDOM}${RANDOM}${RANDOM}" | shasum | cut -c1-16)"
   rm -f "${STUB_STATE_DIR}/active" "${STUB_STATE_DIR}/enabled"
   rm -rf "${STUB_STATE_DIR}/wants"
   mkdir -p \
     "${root}/usr/local/sbin" \
     "${root}/usr/local/lib/gost-manager/monitoring" \
+    "${root}/usr/local/lib/gost-manager/gateway" \
     "${root}/usr/local/bin" \
     "${root}/etc/systemd/system" \
-    "${root}/etc/gost-manager" \
+    "${root}/etc/gost-manager/secrets" \
+    "${root}/etc/gost-manager/generated/gateway/exits" \
+    "${root}/etc/gost-manager/backups/gateway" \
+    "${root}/etc/gost-manager/backups/gateway-runtime" \
     "${root}/etc/gost" \
     "${root}/var/lib/gost-manager"
   printf 'manager\n' > "${root}/usr/local/sbin/gost-manager"
@@ -50,12 +57,25 @@ create_fixture() {
   printf 'admin\n' > "${root}/usr/local/sbin/gost-monitor-admin"
   printf 'collector\n' > "${root}/usr/local/sbin/gost-monitor-collector"
   printf 'python\n' > "${root}/usr/local/lib/gost-manager/monitoring/__init__.py"
+  printf 'gateway\n' > "${root}/usr/local/lib/gost-manager/gateway/__init__.py"
+  printf 'gateway-cli\n' > "${root}/usr/local/sbin/gost-gateway"
+  printf 'gateway-runtime\n' > "${root}/usr/local/sbin/gost-gateway-runtime"
+  printf 'gateway-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh"
   printf 'iran-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-iran.sh"
   printf 'kharej-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-kharej.sh"
   printf 'gost\n' > "${root}/usr/local/bin/gost"
   printf '[Unit]\nDescription=monitor\n' > "${root}/etc/systemd/system/gost-monitor-collector.service"
   printf '[Unit]\nDescription=managed\n' > "${root}/etc/systemd/system/gost-iran-1.service"
   printf '[Unit]\nDescription=unmanaged\n' > "${root}/etc/systemd/system/custom-gost.service"
+  printf '[Unit]\nDescription=gateway\n' > "${root}/etc/systemd/system/gost-gateway-exit-ee-primary.service"
+  printf 'GATEWAY_EXIT_ID=ee-primary\n' > "${root}/etc/gost-manager/generated/gateway/exits/ee-primary.env"
+  printf '{"schema_version":1,"services":[]}\n' > "${root}/etc/gost-manager/generated/gateway/runtime.json"
+  printf 'state\n' > "${root}/etc/gost-manager/state.json"
+  printf '{"bindings":[{"exit_id":"ee-primary","secret_ref":"secret-ee-primary"}]}\n' > "${root}/etc/gost-manager/node.json"
+  printf 'backup\n' > "${root}/etc/gost-manager/backups/gateway/state.json"
+  printf 'runtime-backup\n' > "${root}/etc/gost-manager/backups/gateway-runtime/runtime.json"
+  printf 'GOST_USER=%s\nGOST_PASS=%s\n' "${gateway_user}" "${gateway_pass}" \
+    > "${root}/etc/gost-manager/secrets/secret-ee-primary.env"
   printf 'MAPPINGS=2052:2052\nPASSWORD=uninstall-secret-canary\n' > "${root}/etc/gost/iran-1.env"
   cp "${ROOT_DIR}/packaging/monitoring.env" "${root}/etc/gost-manager/monitoring.env"
   PYTHONPATH="${ROOT_DIR}" python3 -m monitoring.admin_cli --policy generic \
@@ -109,6 +129,10 @@ run_plan() {
         traffic) REMOVE_TRAFFIC=1 ;;
         credentials) REMOVE_CREDENTIALS=1 ;;
         binary) REMOVE_GOST_BINARY=1 ;;
+        gateway-runtime) REMOVE_GATEWAY_RUNTIME=1 ;;
+        gateway-state) REMOVE_GATEWAY_STATE=1 ;;
+        gateway-secrets) REMOVE_GATEWAY_SECRETS=1 ;;
+        gateway-package) REMOVE_GATEWAY_PACKAGE=1 ;;
         *) return 2 ;;
       esac
       shift
@@ -127,6 +151,87 @@ printf 'n\nn\nn\nn\nn\nn\nn\nn\n' | \
   bash "${ROOT_DIR}/uninstall.sh" >/dev/null
 assert_eq "cancel everything changes nothing" "${cancel_before}" "$(tree_digest "${cancel_root}")"
 assert_eq "cancel everything calls no commands" "0" "$(wc -l < "${COMMAND_LOG}" | tr -d ' ')"
+
+gateway_runtime_root="${TEST_HOME}/gateway-runtime"
+create_fixture "${gateway_runtime_root}"
+run_plan "${gateway_runtime_root}" gateway-runtime >/dev/null
+assert_absent "gateway runtime-only removes exact unit" "${gateway_runtime_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service"
+assert_absent "gateway runtime-only removes exact env" "${gateway_runtime_root}/etc/gost-manager/generated/gateway/exits/ee-primary.env"
+assert_file "gateway runtime-only keeps state" "${gateway_runtime_root}/etc/gost-manager/state.json"
+assert_file "gateway runtime-only keeps secret" "${gateway_runtime_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+assert_file "gateway runtime-only keeps package" "${gateway_runtime_root}/usr/local/lib/gost-manager/gateway/__init__.py"
+assert_file "gateway runtime-only keeps Direct unit" "${gateway_runtime_root}/etc/systemd/system/gost-iran-1.service"
+assert_file "gateway runtime-only keeps monitoring" "${gateway_runtime_root}/usr/local/sbin/gost-monitor"
+
+gateway_state_root="${TEST_HOME}/gateway-state"
+create_fixture "${gateway_state_root}"
+run_plan "${gateway_state_root}" gateway-state >/dev/null
+assert_absent "gateway state-only removes shared state" "${gateway_state_root}/etc/gost-manager/state.json"
+assert_absent "gateway state-only removes node state" "${gateway_state_root}/etc/gost-manager/node.json"
+assert_absent "gateway state-only removes state backups" "${gateway_state_root}/etc/gost-manager/backups/gateway"
+assert_file "gateway state-only keeps secret" "${gateway_state_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+assert_file "gateway state-only keeps runtime unit" "${gateway_state_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service"
+
+gateway_secret_refusal_root="${TEST_HOME}/gateway-secret-refusal"
+create_fixture "${gateway_secret_refusal_root}"
+if run_plan "${gateway_secret_refusal_root}" gateway-secrets >/dev/null 2>&1; then
+  fail "gateway referenced secret removal refused"
+else
+  pass "gateway referenced secret removal refused"
+fi
+assert_file "gateway referenced secret preserved" "${gateway_secret_refusal_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+
+gateway_secret_root="${TEST_HOME}/gateway-secret"
+create_fixture "${gateway_secret_root}"
+printf '{"bindings":[]}\n' > "${gateway_secret_root}/etc/gost-manager/node.json"
+rm -f "${gateway_secret_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service" \
+  "${gateway_secret_root}/etc/gost-manager/generated/gateway/exits/ee-primary.env"
+run_plan "${gateway_secret_root}" gateway-secrets >/dev/null
+assert_absent "gateway unreferenced secrets removed" "${gateway_secret_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+assert_file "gateway secret-only keeps state" "${gateway_secret_root}/etc/gost-manager/state.json"
+
+gateway_package_refusal_root="${TEST_HOME}/gateway-package-refusal"
+create_fixture "${gateway_package_refusal_root}"
+if run_plan "${gateway_package_refusal_root}" gateway-package >/dev/null 2>&1; then
+  fail "gateway package removal refused while service remains"
+else
+  pass "gateway package removal refused while service remains"
+fi
+assert_file "gateway package refusal preserves runner" "${gateway_package_refusal_root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh"
+
+gateway_full_root="${TEST_HOME}/gateway-full"
+create_fixture "${gateway_full_root}"
+run_plan "${gateway_full_root}" gateway-runtime gateway-state gateway-secrets gateway-package >/dev/null
+assert_absent "full gateway removal removes runtime unit" "${gateway_full_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service"
+assert_absent "full gateway removal removes state" "${gateway_full_root}/etc/gost-manager/state.json"
+assert_absent "full gateway removal removes secret" "${gateway_full_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+assert_absent "full gateway removal removes package" "${gateway_full_root}/usr/local/lib/gost-manager/gateway"
+assert_file "full gateway removal keeps Direct Mode" "${gateway_full_root}/etc/systemd/system/gost-iran-1.service"
+assert_file "full gateway removal keeps monitoring" "${gateway_full_root}/usr/local/lib/gost-manager/monitoring/__init__.py"
+assert_file "full gateway removal keeps unmanaged unit" "${gateway_full_root}/etc/systemd/system/custom-gost.service"
+
+gateway_partial_root="${TEST_HOME}/gateway-partial"
+create_fixture "${gateway_partial_root}"
+printf '[Unit]\nDescription=gateway backup\n' > "${gateway_partial_root}/etc/systemd/system/gost-gateway-exit-de-backup.service"
+printf 'GATEWAY_EXIT_ID=de-backup\n' > "${gateway_partial_root}/etc/gost-manager/generated/gateway/exits/de-backup.env"
+printf 'GOST_USER=%s\nGOST_PASS=%s\n' \
+  "user-$(printf '%s' "${RANDOM}${RANDOM}" | shasum | cut -c1-12)" \
+  "pass-$(printf '%s' "${RANDOM}${RANDOM}${RANDOM}" | shasum | cut -c1-16)" \
+  > "${gateway_partial_root}/etc/gost-manager/secrets/secret-de-backup.env"
+if STUB_FAIL_SYSTEMCTL_ACTION=disable \
+  STUB_FAIL_SYSTEMCTL_UNIT=gost-gateway-exit-ee-primary.service \
+  run_plan "${gateway_partial_root}" gateway-runtime gateway-state gateway-secrets gateway-package >/dev/null 2>&1; then
+  fail "partial gateway service removal reports failure"
+else
+  pass "partial gateway service removal reports failure"
+fi
+assert_absent "partial gateway removal removes successful service" "${gateway_partial_root}/etc/systemd/system/gost-gateway-exit-de-backup.service"
+assert_file "partial gateway removal preserves failed service" "${gateway_partial_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service"
+assert_file "partial gateway removal preserves failed env" "${gateway_partial_root}/etc/gost-manager/generated/gateway/exits/ee-primary.env"
+assert_file "partial gateway removal preserves referenced secret" "${gateway_partial_root}/etc/gost-manager/secrets/secret-ee-primary.env"
+assert_file "partial gateway removal preserves state" "${gateway_partial_root}/etc/gost-manager/state.json"
+assert_file "partial gateway removal preserves package" "${gateway_partial_root}/usr/local/lib/gost-manager/gateway/__init__.py"
+assert_file "partial gateway removal preserves runner" "${gateway_partial_root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh"
 
 manager_root="${TEST_HOME}/manager"
 create_fixture "${manager_root}"
