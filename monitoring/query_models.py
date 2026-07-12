@@ -58,6 +58,7 @@ class QueryPlan:
     reason: str = "retention"
     stream_raw: bool = False
     rollup_watermark: int | None = None
+    rollup_watermark_status: str = "missing"
 
 
 @dataclasses.dataclass(frozen=True)

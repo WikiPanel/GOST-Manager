@@ -64,9 +64,13 @@ SNAPSHOT_METRICS_BY_ENTITY = {
 }
 
 HEALTH_EVENT_CODES = (
-    "collection_failed", "database_retention_failed", "wal_checkpoint_failed",
-    "metric_source_unavailable", "service_state_changed", "pid_replaced",
-    "listener_disappeared", "sampling_gap",
+    "collection_failed", "collection_recovered",
+    "database_retention_failed", "database_retention_recovered",
+    "wal_checkpoint_failed", "wal_checkpoint_recovered",
+    "metric_source_unavailable", "metric_source_available",
+    "service_state_changed", "pid_replaced",
+    "listener_disappeared", "listener_returned", "sampling_gap",
+    "env_parse_error", "env_parse_recovered",
 )
 
 
@@ -177,17 +181,45 @@ class ReadOnlyDatabase:
         }
 
     @staticmethod
-    def rollup_watermark(conn: sqlite3.Connection) -> int | None:
+    def rollup_watermark_status(
+        conn: sqlite3.Connection,
+        now: int,
+    ) -> tuple[int | None, str]:
         row = conn.execute(
             "SELECT value FROM collector_state WHERE key='minute_rollup_watermark'"
         ).fetchone()
         if not row:
-            return None
+            return None, "missing"
         try:
             value = int(str(row[0]))
         except ValueError:
-            return None
-        return value if value >= 0 else None
+            return None, "invalid_nonnumeric"
+        if value < 0:
+            return None, "invalid_negative"
+        if value % 60:
+            return None, "invalid_misaligned"
+        completed = (int(now) // 60) * 60
+        if value > completed:
+            return None, "invalid_future"
+        return value, "valid"
+
+    @staticmethod
+    def rollup_watermark(
+        conn: sqlite3.Connection,
+        now: int | None = None,
+    ) -> int | None:
+        if now is None:
+            row = conn.execute(
+                "SELECT value FROM collector_state WHERE key='minute_rollup_watermark'"
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                value = int(str(row[0]))
+            except ValueError:
+                return None
+            return value if value >= 0 and value % 60 == 0 else None
+        return ReadOnlyDatabase.rollup_watermark_status(conn, now)[0]
 
     @staticmethod
     def current_entities(
@@ -230,6 +262,39 @@ class ReadOnlyDatabase:
                     "display_name": row[2],
                     "metadata": sanitize_mapping(metadata) if isinstance(metadata, dict) else {},
                     "updated_at": int(row[4]),
+                }
+            )
+        return result
+
+    @staticmethod
+    def invalid_managed_env_sources(
+        conn: sqlite3.Connection,
+        max_rows: int = 64,
+    ) -> list[dict[str, object]]:
+        rows = conn.execute(
+            "WITH last_success AS (SELECT cycle_id FROM sample_cycles WHERE success=1 "
+            "ORDER BY collected_at DESC LIMIT 1) "
+            "SELECT e.entity_id,e.metadata_json,p.ts FROM metric_points p "
+            "JOIN entities e ON e.entity_pk=p.entity_pk JOIN last_success c "
+            "ON c.cycle_id=p.cycle_id WHERE e.entity_type='tunnel_source' "
+            "AND p.metric_name='env_source_valid' AND p.numeric_value=0 "
+            "AND p.quality='exact' ORDER BY e.entity_id LIMIT ?",
+            (max_rows + 1,),
+        ).fetchall()
+        if len(rows) > max_rows:
+            raise QueryLimitError("invalid managed env source query exceeds the safe limit")
+        result = []
+        for row in rows:
+            try:
+                metadata = json.loads(str(row[1] or "{}"))
+            except json.JSONDecodeError:
+                metadata = {}
+            safe = sanitize_mapping(metadata) if isinstance(metadata, dict) else {}
+            result.append(
+                {
+                    "source_id": str(row[0]),
+                    "path": safe.get("path"),
+                    "observed_at": int(row[2]),
                 }
             )
         return result
@@ -490,7 +555,9 @@ class ReadOnlyDatabase:
                 "AND service.entity_id=t.service_name),"
             )
             membership = (
-                " AND (entity_type NOT IN ('service','tunnel') OR entity_pk IN "
+                " AND (entity_type NOT IN ('service','tunnel','interface') "
+                "OR (entity_type='interface' AND entity_id IN "
+                "('interface:external-total','interface:lo')) OR entity_pk IN "
                 "(SELECT entity_pk FROM current_membership))"
             )
         count_params = [*entity_params, max_entities + 1]
@@ -671,7 +738,9 @@ class ReadOnlyDatabase:
             columns = (
                 "e.entity_type,e.entity_id,p.metric_name,p.ts AS timestamp,NULL AS minute_start,"
                 "p.numeric_value,p.text_value,p.unit,p.quality,p.reset,p.gap,"
-                "NULL AS samples,NULL AS expected_samples,NULL AS coverage,NULL AS unavailable_count"
+                "NULL AS samples,NULL AS expected_samples,NULL AS coverage,NULL AS unavailable_count,"
+                "NULL AS minimum,NULL AS average,NULL AS maximum,p.numeric_value AS latest_numeric,"
+                "p.text_value AS latest_text,p.ts AS latest_timestamp"
             )
         elif source == "rollup":
             table = "minute_rollups"
@@ -680,7 +749,7 @@ class ReadOnlyDatabase:
                 "e.entity_type,e.entity_id,p.metric_name,NULL AS timestamp,p.minute_start,"
                 "p.avg_value AS numeric_value,NULL AS text_value,p.unit,p.quality,"
                 "p.reset_count AS reset,p.gap_count AS gap,p.samples,p.expected_samples,p.coverage,"
-                "p.unavailable_count"
+                "p.unavailable_count,p.min_value,p.avg_value,p.max_value,NULL,NULL,NULL"
             )
         elif source == "raw_minute":
             table = "metric_points"
@@ -706,18 +775,27 @@ class ReadOnlyDatabase:
             )
         if source == "raw_minute":
             cursor = conn.execute(
-                "SELECT e.entity_type,e.entity_id,p.metric_name,NULL,(p.ts/60)*60,"
-                "AVG(CASE WHEN p.quality!='unavailable' THEN p.numeric_value END),NULL,"
-                "MAX(p.unit),CASE MAX(CASE p.quality WHEN 'exact' THEN 0 WHEN 'derived' "
+                "WITH ranked AS (SELECT p.*,e.entity_type,e.entity_id,(p.ts/60)*60 minute,"
+                "ROW_NUMBER() OVER(PARTITION BY p.entity_pk,p.metric_name,(p.ts/60) "
+                "ORDER BY p.ts DESC,p.point_id DESC) latest_rank FROM metric_points p "
+                "JOIN entities e ON e.entity_pk=p.entity_pk WHERE p.ts>=? AND p.ts<?"
+                + filters
+                + ") SELECT r.entity_type,r.entity_id,r.metric_name,NULL,r.minute,"
+                "AVG(CASE WHEN r.quality!='unavailable' THEN r.numeric_value END),NULL,"
+                "MAX(r.unit),CASE MAX(CASE r.quality WHEN 'exact' THEN 0 WHEN 'derived' "
                 "THEN 1 WHEN 'estimated' THEN 2 ELSE 3 END) WHEN 0 THEN 'exact' "
                 "WHEN 1 THEN 'derived' WHEN 2 THEN 'estimated' ELSE 'unavailable' END,"
-                "SUM(p.reset),SUM(p.gap),COUNT(*),NULL,NULL,"
-                "SUM(CASE WHEN p.quality='unavailable' OR "
-                "(p.numeric_value IS NULL AND p.text_value IS NULL) THEN 1 ELSE 0 END) "
-                "FROM metric_points p JOIN entities e ON e.entity_pk=p.entity_pk "
-                "WHERE p.ts>=? AND p.ts<?" + filters
-                + " GROUP BY p.entity_pk,p.metric_name,(p.ts/60) "
-                "ORDER BY (p.ts/60),e.entity_type,e.entity_id,p.metric_name",
+                "SUM(r.reset),SUM(r.gap),COUNT(*),NULL,NULL,"
+                "SUM(CASE WHEN r.quality='unavailable' OR "
+                "(r.numeric_value IS NULL AND r.text_value IS NULL) THEN 1 ELSE 0 END),"
+                "MIN(CASE WHEN r.quality!='unavailable' THEN r.numeric_value END),"
+                "AVG(CASE WHEN r.quality!='unavailable' THEN r.numeric_value END),"
+                "MAX(CASE WHEN r.quality!='unavailable' THEN r.numeric_value END),"
+                "MAX(CASE WHEN r.latest_rank=1 THEN r.numeric_value END),"
+                "MAX(CASE WHEN r.latest_rank=1 THEN r.text_value END),"
+                "MAX(CASE WHEN r.latest_rank=1 THEN r.ts END) FROM ranked r "
+                "GROUP BY r.entity_pk,r.metric_name,r.minute "
+                "ORDER BY r.minute,r.entity_type,r.entity_id,r.metric_name",
                 query_params,
             )
         else:
@@ -755,5 +833,11 @@ class ReadOnlyDatabase:
                     "unavailable_count": (
                         int(row[14]) if len(row) > 14 and row[14] is not None else None
                     ),
+                    "minimum": None if row[15] is None else float(row[15]),
+                    "average": None if row[16] is None else float(row[16]),
+                    "maximum": None if row[17] is None else float(row[17]),
+                    "latest_numeric": None if row[18] is None else float(row[18]),
+                    "latest_text": None if row[19] is None else str(row[19]),
+                    "latest_timestamp": None if row[20] is None else int(row[20]),
                     "source_mode": source,
                 }

@@ -19,7 +19,7 @@ from monitoring.query_engine import QueryEngine, cadence_for
 from monitoring.query_models import QueryInputError, QueryLimitError, QueryWindow
 from monitoring.schema import SCHEMA_VERSION
 
-EXPORT_VERSION = 1
+EXPORT_VERSION = 2
 CSV_FIELDS = (
     "record_type",
     "export_version",
@@ -46,6 +46,8 @@ CSV_FIELDS = (
     "entity_id",
     "metric_name",
     "metric_semantics",
+    "aggregate_kind",
+    "value_available",
     "timestamp",
     "minute_start",
     "numeric_value",
@@ -126,6 +128,8 @@ def _summary_rows(engine: QueryEngine, window: QueryWindow, filters: dict[str, o
             "entity_id": item.entity_id,
             "metric_name": item.metric_name,
             "metric_semantics": item.metric_semantics,
+            "aggregate_kind": "summary",
+            "value_available": item.latest is not None or item.average is not None,
             "timestamp": item.latest_timestamp,
             "minute_start": None,
             "numeric_value": item.average if item.numeric else None,
@@ -227,6 +231,11 @@ def _point_rows(
             semantics = classify_metric(str(row["metric_name"]), str(row["unit"]))
             row["metric_semantics"] = semantics.category
             row["record_type"] = source
+            latest = (
+                row.get("latest_numeric")
+                if row.get("latest_numeric") is not None
+                else row.get("latest_text")
+            )
             if source == "raw_minute":
                 minute = int(row["minute_start"])
                 seconds = max(0, min(end, minute + 60) - max(start, minute))
@@ -240,6 +249,46 @@ def _point_rows(
                 row["expected_samples"] = expected
                 row["coverage"] = min(1.0, samples / expected)
                 row["source_mode"] = "raw"
+            if source == "raw":
+                row["aggregate_kind"] = "point"
+                row["value_available"] = (
+                    row.get("numeric_value") is not None
+                    or row.get("text_value") is not None
+                )
+                row["latest"] = latest
+                row["latest_timestamp"] = row.get("timestamp")
+            elif semantics.supports_average:
+                row["aggregate_kind"] = "minute_statistics"
+                row["numeric_value"] = row.get("average")
+                row["text_value"] = None
+                row["latest"] = latest if source == "raw_minute" else None
+                row["latest_timestamp"] = (
+                    row.get("latest_timestamp") if source == "raw_minute" else None
+                )
+                row["value_available"] = row.get("average") is not None
+                if not row["value_available"]:
+                    row["aggregate_kind"] = "historical_value_unavailable"
+            elif source == "raw_minute" and latest is not None:
+                row["aggregate_kind"] = "minute_latest"
+                row["value_available"] = True
+                row["numeric_value"] = row.get("latest_numeric")
+                row["text_value"] = row.get("latest_text")
+                row["latest"] = latest
+                row["minimum"] = None
+                row["average"] = None
+                row["maximum"] = None
+            else:
+                row["aggregate_kind"] = "historical_value_unavailable"
+                row["value_available"] = False
+                row["numeric_value"] = None
+                row["text_value"] = None
+                row["latest"] = None
+                row["latest_timestamp"] = None
+                row["minimum"] = None
+                row["average"] = None
+                row["maximum"] = None
+            row.pop("latest_numeric", None)
+            row.pop("latest_text", None)
             yield row
 
 
@@ -254,6 +303,22 @@ def _count_point_rows(
     metric_names = filters.get("metric_names") if isinstance(filters.get("metric_names"), list) else None
     count = 0
     for source, start, end in sources:
+        if source == "raw_minute":
+            scanned = engine.database.bounded_point_count(
+                conn,
+                "raw",
+                start,
+                end,
+                engine.limits.max_stream_scan_rows,
+                entity_type,
+                entity_id,
+                metric_names,
+            )
+            if scanned > engine.limits.max_stream_scan_rows:
+                raise QueryLimitError(
+                    "stream_scan_limit: minute export exceeds the maximum scan budget "
+                    f"of {engine.limits.max_stream_scan_rows} rows"
+                )
         remaining = engine.limits.max_export_rows - count
         value = engine.database.count_export_rows(
             conn, source, start, end, entity_type, entity_id, metric_names, remaining

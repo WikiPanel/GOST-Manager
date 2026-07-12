@@ -55,34 +55,111 @@ def _required_event_codes(
     policy: HealthPolicy,
 ) -> set[str]:
     required_services = _required_services(snapshot)
+    current_tunnels = {
+        str(entity.get("entity_id", "")): int(entity.get("updated_at", 0))
+        for entity in snapshot.get("entities", [])
+        if isinstance(entity, dict) and entity.get("entity_type") == "tunnel"
+    }
+    metrics = _metric_map(snapshot)
     codes: set[str] = set()
-    for event in snapshot.get("health_events", snapshot.get("events", [])):
+    resolved: set[tuple[str, str]] = set()
+    paired = {
+        "listener_disappeared": ("listener", True),
+        "listener_returned": ("listener", False),
+        "metric_source_unavailable": ("source", True),
+        "metric_source_available": ("source", False),
+        "collection_failed": ("collection", True),
+        "collection_recovered": ("collection", False),
+        "wal_checkpoint_failed": ("checkpoint", True),
+        "wal_checkpoint_recovered": ("checkpoint", False),
+        "database_retention_failed": ("retention", True),
+        "database_retention_recovered": ("retention", False),
+        "env_parse_error": ("managed_env", True),
+        "env_parse_recovered": ("managed_env", False),
+    }
+    events = sorted(
+        (
+            event for event in snapshot.get("health_events", snapshot.get("events", []))
+            if isinstance(event, dict)
+        ),
+        key=lambda event: int(event.get("ts", 0)),
+        reverse=True,
+    )
+    for event in events:
         if not isinstance(event, dict) or now - int(event.get("ts", 0)) > policy.recent_event_seconds:
             continue
         details = event.get("details")
         details = details if isinstance(details, dict) else {}
         service = str(details.get("service", ""))
         source = str(details.get("source", ""))
+        tunnel = str(details.get("tunnel_id", ""))
+        code = str(event.get("code", ""))
+        event_ts = int(event.get("ts", 0))
+        if tunnel and tunnel not in current_tunnels:
+            continue
+        if tunnel and event_ts < current_tunnels[tunnel]:
+            continue
         if service and service not in required_services:
             continue
         if "nginx.service" in source and "nginx.service" not in required_services:
             continue
-        if event.get("code") == "metric_source_unavailable" and source:
+        if code in {"metric_source_unavailable", "metric_source_available"} and source:
             required_host_sources = {"proc_stat", "proc_meminfo", "filesystem:/"}
             required_service_source = any(
                 required in source for required in required_services
             )
             if source not in required_host_sources and not required_service_source:
                 continue
-        code = str(event.get("code", ""))
-        severity = str(event.get("severity", "")).lower()
         if code == "service_state_changed":
+            identity = ("service", service or "unknown")
+            if identity in resolved:
+                continue
+            resolved.add(identity)
             current = str(details.get("current", "")).lower()
-            if severity not in {"warning", "error", "critical"}:
+            active = (
+                str(event.get("severity", "")).lower()
+                in {"warning", "error", "critical"}
+                and current in {"failed", "inactive"}
+            )
+            metric = metrics.get(("service", service, "service_active"))
+            if (
+                active
+                and metric is not None
+                and metric.get("quality") == "exact"
+                and metric.get("numeric_value") == 1
+                and int(metric.get("ts", 0)) >= event_ts
+            ):
+                active = False
+            if active:
+                codes.add(code)
+            continue
+        if code in paired:
+            family, active = paired[code]
+            identity_value = tunnel or service or source or str(details.get("path", "global"))
+            identity = (family, identity_value)
+            if identity in resolved:
                 continue
-            if current not in {"failed", "inactive"}:
-                continue
-        codes.add(code)
+            resolved.add(identity)
+            if family == "listener" and tunnel:
+                ownership = metrics.get(("tunnel", tunnel, "listener_ownership_exact"))
+                if (
+                    active
+                    and ownership is not None
+                    and ownership.get("quality") == "exact"
+                    and ownership.get("numeric_value") == 1
+                    and int(ownership.get("ts", 0)) >= event_ts
+                ):
+                    active = False
+            if family == "managed_env":
+                active = active and bool(snapshot.get("invalid_managed_env_sources"))
+            if active:
+                codes.add("managed_env_invalid" if family == "managed_env" else code)
+            continue
+        severity = str(event.get("severity", "")).lower()
+        if code == "pid_replaced" or severity in {"warning", "error", "critical"}:
+            codes.add(code)
+    if snapshot.get("invalid_managed_env_sources"):
+        codes.add("managed_env_invalid")
     return codes
 
 
@@ -199,6 +276,12 @@ def evaluate_node(
         if status == "healthy":
             status = "degraded"
         reasons.append(("recent_monitoring_event", "A recent service or source transition was recorded"))
+    if "managed_env_invalid" in recent_codes:
+        if status == "healthy":
+            status = "degraded"
+        reasons.append(
+            ("managed_env_invalid", "A managed tunnel environment source is malformed")
+        )
     if bool(snapshot.get("health_events_truncated")):
         if status == "healthy":
             status = "degraded"

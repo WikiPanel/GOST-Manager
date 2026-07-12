@@ -35,6 +35,7 @@ class QueryLimits:
     max_entities: int = 256
     max_materialized_rows: int = 110_000
     max_health_events: int = 200
+    max_stream_scan_rows: int = 1_000_000
 
 
 def worst_quality(values: Sequence[str]) -> str:
@@ -466,7 +467,7 @@ class QueryEngine:
         now = int(self.clock())
         start, end = window.effective_start, window.effective_end
         raw_cutoff = now - self.retention.raw_seconds
-        watermark = self.database.rollup_watermark(conn)
+        watermark, watermark_status = self.database.rollup_watermark_status(conn, now)
 
         if start >= raw_cutoff:
             full_raw_count = self.database.bounded_point_count(
@@ -487,6 +488,7 @@ class QueryEngine:
                     estimated_rows=full_raw_count,
                     reason="raw_within_budget",
                     rollup_watermark=watermark,
+                    rollup_watermark_status=watermark_status,
                 )
 
         finalized_end = start
@@ -512,6 +514,23 @@ class QueryEngine:
                 metric_names,
             )
             stream_raw = raw_count > self.limits.max_query_rows
+            if stream_raw:
+                stream_count = self.database.bounded_point_count(
+                    conn,
+                    "raw",
+                    raw_start,
+                    raw_end,
+                    self.limits.max_stream_scan_rows,
+                    entity_type,
+                    entity_id,
+                    metric_names,
+                )
+                if stream_count > self.limits.max_stream_scan_rows:
+                    raise QueryLimitError(
+                        "stream_scan_limit: raw query exceeds the maximum scan budget "
+                        f"of {self.limits.max_stream_scan_rows} rows"
+                    )
+                raw_count = stream_count
         if (
             not stream_raw
             and raw_end is not None
@@ -540,9 +559,10 @@ class QueryEngine:
         else:
             source_mode = "raw"
         if watermark is None:
+            prefix = "missing" if watermark_status == "missing" else "invalid"
             reason = (
-                "missing_rollup_watermark_streaming"
-                if stream_raw else "missing_rollup_watermark"
+                f"{prefix}_rollup_watermark_streaming"
+                if stream_raw else f"{prefix}_rollup_watermark"
             )
         elif stream_raw:
             reason = "rollup_watermark_streaming"
@@ -558,6 +578,7 @@ class QueryEngine:
             reason=reason,
             stream_raw=stream_raw,
             rollup_watermark=watermark,
+            rollup_watermark_status=watermark_status,
         )
 
     def query_plan(
@@ -788,6 +809,8 @@ class QueryEngine:
                 "metrics": list(metric_names or ()),
                 "plan_reason": plan.reason,
                 "rollup_watermark": plan.rollup_watermark,
+                "rollup_watermark_status": plan.rollup_watermark_status,
+                "max_stream_scan_rows": self.limits.max_stream_scan_rows,
             },
             materialized_rows=materialized_rows,
             rows_scanned=rows_scanned,
@@ -819,6 +842,7 @@ class QueryEngine:
                 conn,
                 max_rows=self.limits.max_entities,
             )
+            invalid_env_sources = self.database.invalid_managed_env_sources(conn)
             points = self.database.latest_points(
                 conn,
                 self.limits.max_series,
@@ -864,6 +888,7 @@ class QueryEngine:
             "health_events": [event.to_dict() for event in health_events],
             "health_events_truncated": health_events_truncated,
             "current_membership_authoritative": True,
+            "invalid_managed_env_sources": invalid_env_sources,
         }
 
     def entities(self, entity_type: str | None = None) -> list[dict[str, object]]:

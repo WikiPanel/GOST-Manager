@@ -432,6 +432,22 @@ class ProductionProfileQueryTests(unittest.TestCase):
             self.assertLess(elapsed, 12.0)
             self.assertEqual(10, max(statement_counts))
 
+            writer = connect_db(path)
+            writer.execute(
+                "DELETE FROM collector_state WHERE key='minute_rollup_watermark'"
+            )
+            writer.close()
+            missing_watermark = QueryEngine(
+                ReadOnlyDatabase(path), clock=lambda: NOW
+            ).summary(resolve_window(NOW, "2h"))
+            self.assertEqual("raw", missing_watermark.source_mode)
+            self.assertEqual(760_663, missing_watermark.rows_scanned)
+            self.assertLessEqual(
+                missing_watermark.maximum_rows_buffered,
+                missing_watermark.filters["max_stream_scan_rows"],
+            )
+            self.assertTrue(all(item.p95 is None for item in missing_watermark.series))
+
             explain_conn = sqlite3.connect(path)
             plans = []
             for sql in all_selects:

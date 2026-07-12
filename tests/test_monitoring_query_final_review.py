@@ -220,7 +220,7 @@ class WatermarkPlanningTests(unittest.TestCase):
             )
             raw_minute_sql = next(
                 sql for sql in statements
-                if "GROUP BY p.entity_pk,p.metric_name,(p.ts/60)" in sql
+                if "GROUP BY r.entity_pk,r.metric_name,r.minute" in sql
                 and "AVG(CASE" in sql
             )
             reader = connect_db(path)
