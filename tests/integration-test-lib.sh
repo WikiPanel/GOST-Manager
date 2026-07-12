@@ -59,12 +59,12 @@ assert_eq() {
 
 mode_of() {
   local path="$1"
-  stat -f '%Lp' "${path}" 2>/dev/null || stat -c '%a' "${path}"
+  stat -c '%a' "${path}" 2>/dev/null || stat -f '%Lp' "${path}"
 }
 
 owner_of() {
   local path="$1"
-  stat -f '%u:%g' "${path}" 2>/dev/null || stat -c '%u:%g' "${path}"
+  stat -c '%u:%g' "${path}" 2>/dev/null || stat -f '%u:%g' "${path}"
 }
 
 tree_digest() {

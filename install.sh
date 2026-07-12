@@ -382,7 +382,7 @@ record_metadata() {
   for existing in "${METADATA_PATHS[@]+"${METADATA_PATHS[@]}"}"; do
     [[ "${existing}" == "${path}" ]] && return 0
   done
-  metadata="$(stat -f '%Lp %u %g' "${path}" 2>/dev/null || stat -c '%a %u %g' "${path}")"
+  metadata="$(stat -c '%a %u %g' "${path}" 2>/dev/null || stat -f '%Lp %u %g' "${path}")"
   read -r mode uid gid <<< "${metadata}"
   METADATA_PATHS+=("${path}")
   METADATA_MODES+=("${mode}")

@@ -457,7 +457,9 @@ missing_root="${TEST_HOME}/missing"
 mkdir -p "${missing_root}"
 mv "${STUB_BIN}/ss" "${STUB_BIN}/ss.disabled"
 missing_before="$(tree_digest "${missing_root}")"
-if run_installer "${missing_root}" >/dev/null 2>&1; then
+if GOST_MANAGER_TEST_MISSING_COMMANDS=ss \
+  GOST_MANAGER_TEST_DEP_BIN="${STUB_BIN}" \
+  run_installer "${missing_root}" >/dev/null 2>&1; then
   fail "missing dependency without opt-in fails"
 else
   pass "missing dependency without opt-in fails"
@@ -496,6 +498,8 @@ STUB_BIN_PATH="${STUB_BIN}" \
 STUB_TRUE_BIN="${TRUE_BIN}" \
 STUB_REAL_CMP_BIN="${REAL_CMP_BIN}" \
 STUB_REAL_STAT_BIN="${REAL_STAT_BIN}" \
+GOST_MANAGER_TEST_MISSING_COMMANDS=ss \
+GOST_MANAGER_TEST_DEP_BIN="${STUB_BIN}" \
 APT_GET_BIN="${STUB_BIN}/apt-get" \
 run_installer "${dependency_root}" --install-dependencies >/dev/null
 assert_contains "dependency opt-in runs apt update" "apt-get update" "${COMMAND_LOG}"
