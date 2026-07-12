@@ -2,7 +2,7 @@ BASH_SCRIPTS = gost-manager.sh install.sh uninstall.sh \
 	lib/gost-run-iran.sh lib/gost-run-kharej.sh \
 	packaging/gost-monitor packaging/gost-monitor-admin packaging/gost-monitor-collector \
 	tests/run-tests.sh tests/integration-test-lib.sh tests/test-install.sh \
-	tests/test-menu.sh tests/test-uninstall.sh
+	tests/test-menu.sh tests/test-uninstall.sh tests/test-systemd-linux.sh
 
 lint:
 	bash -n $(BASH_SCRIPTS)
@@ -14,6 +14,7 @@ test:
 	bash tests/test-install.sh
 	bash tests/test-menu.sh
 	bash tests/test-uninstall.sh
+	bash tests/test-systemd-linux.sh
 	python3 -m unittest discover -s tests -p 'test_monitoring*.py'
 
 check: lint test

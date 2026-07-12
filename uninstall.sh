@@ -20,10 +20,13 @@ REMOVE_CREDENTIALS=0
 REMOVE_GOST_BINARY=0
 UNIT_CHANGED=0
 FAILED_ACTIONS=0
+CONFIG_CAPTURED=0
+CONFIGURED_DB_PRODUCTION=""
+CONFIGURED_DB_ACTUAL=""
 
 die() {
   printf 'Error: %s\n' "$*" >&2
-  exit 1
+  return 1
 }
 
 info() {
@@ -73,34 +76,42 @@ reject_symlink_path() {
   current="${boundary}"
   relative="${path#"${boundary}"}"
   IFS='/' read -r -a parts <<< "${relative#/}"
-  for part in "${parts[@]}"; do
+  for part in "${parts[@]+"${parts[@]}"}"; do
     [[ -n "${part}" ]] || continue
     current="${current%/}/${part}"
-    [[ ! -L "${current}" ]] || die "managed removal path may not traverse a symlink: ${current}"
+    if [[ -L "${current}" ]]; then
+      die "managed removal path may not traverse a symlink: ${current}"
+      return 1
+    fi
   done
   if [[ -n "${GOST_MANAGER_ROOT}" ]]; then
-    [[ "${path}" == "${GOST_MANAGER_ROOT}"/* ]] || die "managed removal path escaped the testing root: ${path}"
+    if [[ "${path}" != "${GOST_MANAGER_ROOT}"/* ]]; then
+      die "managed removal path escaped the testing root: ${path}"
+      return 1
+    fi
   fi
 }
 
 remove_file() {
   local path="$1"
-  reject_symlink_path "${path}"
+  reject_symlink_path "${path}" || return 1
   [[ ! -e "${path}" ]] || "${RM_BIN}" -f "${path}"
 }
 
 remove_exact_tree() {
   local path="$1"
-  local allowed_state allowed_config allowed_credentials allowed_package
-  allowed_state="$(path_for /var/lib/gost-manager)"
+  local allowed_config allowed_credentials allowed_package
   allowed_config="$(path_for /etc/gost-manager)"
   allowed_credentials="$(path_for /etc/gost)"
   allowed_package="$(path_for /usr/local/lib/gost-manager/monitoring)"
   case "${path}" in
-    "${allowed_state}"|"${allowed_config}"|"${allowed_credentials}"|"${allowed_package}") ;;
-    *) die "refusing unapproved recursive removal path: ${path}" ;;
+    "${allowed_config}"|"${allowed_credentials}"|"${allowed_package}") ;;
+    *)
+      die "refusing unapproved recursive removal path: ${path}"
+      return 1
+      ;;
   esac
-  reject_symlink_path "${path}"
+  reject_symlink_path "${path}" || return 1
   [[ ! -e "${path}" ]] || "${RM_BIN}" -rf -- "${path}"
 }
 
@@ -110,7 +121,7 @@ managed_traffic_units() {
   [[ -d "${directory}" && ! -L "${directory}" ]] || return 0
   shopt -s nullglob
   for file in "${directory}"/gost-iran-*.service "${directory}"/gost-kharej-*.service; do
-    base="$(basename "${file}")"
+    base="${file##*/}"
     if [[ "${base}" =~ ^gost-(iran|kharej)-[1-9][0-9]*\.service$ && -f "${file}" && ! -L "${file}" ]]; then
       printf '%s|%s\n' "${base}" "${file}"
     fi
@@ -122,20 +133,66 @@ traffic_units_exist() {
   [[ -n "$(managed_traffic_units)" ]]
 }
 
-validate_dependencies() {
+surviving_traffic_services() {
+  local record
+  while IFS= read -r record; do
+    [[ -n "${record}" ]] || continue
+    printf '%s\n' "${record%%|*}"
+  done < <(managed_traffic_units)
+}
+
+monitor_service_loaded() {
+  local state
+  if ! state="$("${SYSTEMCTL_BIN}" show "${MONITOR_SERVICE}" --property=LoadState --value 2>/dev/null)"; then
+    return 0
+  fi
+  [[ -n "${state}" && "${state}" != "not-found" ]]
+}
+
+monitor_service_present() {
   local unit_path
   unit_path="$(path_for /etc/systemd/system/${MONITOR_SERVICE})"
-  if [[ "${REMOVE_MONITOR_CODE}" == "1" && "${REMOVE_MONITOR_SERVICE}" != "1" && -e "${unit_path}" ]]; then
-    die "monitoring code cannot be removed while the collector service remains."
+  [[ -e "${unit_path}" ]] && return 0
+  "${SYSTEMCTL_BIN}" is-active --quiet "${MONITOR_SERVICE}" >/dev/null 2>&1 && return 0
+  "${SYSTEMCTL_BIN}" is-enabled --quiet "${MONITOR_SERVICE}" >/dev/null 2>&1 && return 0
+  monitor_service_loaded
+}
+
+capture_monitor_config() {
+  local config_path value
+  config_path="$(path_for /etc/gost-manager/monitoring.env)"
+  [[ -f "${config_path}" && ! -L "${config_path}" ]] || return 1
+  [[ -x "${MONITOR_ADMIN_BIN}" ]] || return 1
+  if ! value="$("${MONITOR_ADMIN_BIN}" config --format value --field database_path --config "${config_path}")"; then
+    return 1
   fi
-  if [[ "${REMOVE_MONITOR_CONFIG}" == "1" && "${REMOVE_MONITOR_SERVICE}" != "1" && -e "${unit_path}" ]]; then
-    die "monitoring config cannot be removed while the collector service remains."
+  [[ "${value}" == /var/lib/gost-manager/* && "${value}" != *".."* ]] || return 1
+  CONFIGURED_DB_PRODUCTION="${value}"
+  CONFIGURED_DB_ACTUAL="$(path_for "${value}")"
+  reject_symlink_path "${CONFIGURED_DB_ACTUAL}" || return 1
+  CONFIG_CAPTURED=1
+}
+
+validate_dependencies() {
+  if [[ "${REMOVE_MONITOR_CODE}" == "1" || "${REMOVE_MONITOR_CONFIG}" == "1" ]]; then
+    if [[ "${REMOVE_MONITOR_SERVICE}" != "1" ]] && monitor_service_present; then
+      die "monitoring code/config cannot be removed while the collector service is active, enabled, or loaded."
+      return 1
+    fi
   fi
-  if [[ "${REMOVE_CREDENTIALS}" == "1" && "${REMOVE_TRAFFIC}" != "1" ]] && traffic_units_exist; then
-    die "credentials cannot be removed while managed traffic services remain."
+  if traffic_units_exist && [[ "${REMOVE_TRAFFIC}" != "1" ]]; then
+    if [[ "${REMOVE_CREDENTIALS}" == "1" ]]; then
+      die "credentials cannot be removed while managed traffic services remain."
+      return 1
+    fi
+    if [[ "${REMOVE_GOST_BINARY}" == "1" ]]; then
+      die "the GOST binary cannot be removed while managed traffic services remain."
+      return 1
+    fi
   fi
-  if [[ "${REMOVE_MONITOR_HISTORY}" == "1" && "${REMOVE_MONITOR_SERVICE}" != "1" && ! -x "${MONITOR_ADMIN_BIN}" ]]; then
-    die "history purge requires the installed monitoring admin while the collector remains."
+  if [[ "${REMOVE_MONITOR_HISTORY}" == "1" && ! -x "${MONITOR_ADMIN_BIN}" ]]; then
+    die "history removal requires the installed monitoring admin to resolve the configured database safely."
+    return 1
   fi
 }
 
@@ -164,7 +221,7 @@ collect_plan() {
   confirm "Stop and remove the monitoring collector service/unit?" && REMOVE_MONITOR_SERVICE=1
   confirm "Remove monitoring launchers and Python code?" && REMOVE_MONITOR_CODE=1
   confirm "Remove monitoring config under /etc/gost-manager?" && REMOVE_MONITOR_CONFIG=1
-  confirm "Delete monitoring history under /var/lib/gost-manager?" && REMOVE_MONITOR_HISTORY=1
+  confirm "Delete monitoring history from the configured database?" && REMOVE_MONITOR_HISTORY=1
   confirm "Stop and remove exact managed traffic tunnel services?" && REMOVE_TRAFFIC=1
   if confirm "Delete /etc/gost env files, credentials, and backups?"; then
     read -r -p "Type DELETE GOST CREDENTIALS to confirm: " phrase
@@ -178,44 +235,107 @@ collect_plan() {
   return 0
 }
 
+preserve_monitoring_dependencies() {
+  REMOVE_MONITOR_CODE=0
+  REMOVE_MONITOR_CONFIG=0
+  REMOVE_MONITOR_HISTORY=0
+  info "Monitoring service removal failed; code, launchers, config, and history were preserved."
+}
+
 remove_monitor_service() {
   local unit_path
   unit_path="$(path_for /etc/systemd/system/${MONITOR_SERVICE})"
+  if ! monitor_service_present; then
+    return 0
+  fi
+  if ! "${SYSTEMCTL_BIN}" disable --now "${MONITOR_SERVICE}"; then
+    preserve_monitoring_dependencies
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  if "${SYSTEMCTL_BIN}" is-active --quiet "${MONITOR_SERVICE}" >/dev/null 2>&1 || \
+     "${SYSTEMCTL_BIN}" is-enabled --quiet "${MONITOR_SERVICE}" >/dev/null 2>&1; then
+    preserve_monitoring_dependencies
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  UNIT_CHANGED=1
   if [[ -e "${unit_path}" ]]; then
-    if ! "${SYSTEMCTL_BIN}" disable --now "${MONITOR_SERVICE}"; then
-      info "Failed to stop/remove monitoring service; dependent monitoring files were preserved."
-      REMOVE_MONITOR_SERVICE=0
-      REMOVE_MONITOR_CODE=0
-      REMOVE_MONITOR_CONFIG=0
+    if ! remove_file "${unit_path}"; then
+      preserve_monitoring_dependencies
       FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
       return 0
     fi
-    remove_file "${unit_path}"
-    UNIT_CHANGED=1
+  fi
+  if [[ "${UNIT_CHANGED}" == "1" ]]; then
+    if ! "${SYSTEMCTL_BIN}" daemon-reload; then
+      preserve_monitoring_dependencies
+      FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+      return 0
+    fi
+    UNIT_CHANGED=0
+  fi
+  if monitor_service_present; then
+    preserve_monitoring_dependencies
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
   fi
 }
 
 remove_monitor_code() {
-  remove_file "$(path_for /usr/local/sbin/gost-monitor)"
-  remove_file "$(path_for /usr/local/sbin/gost-monitor-admin)"
-  remove_file "$(path_for /usr/local/sbin/gost-monitor-collector)"
-  remove_exact_tree "$(path_for /usr/local/lib/gost-manager/monitoring)"
+  if monitor_service_present; then
+    info "Collector still exists; monitoring code and launchers were preserved."
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  remove_file "$(path_for /usr/local/sbin/gost-monitor)" || return 1
+  monitor_service_present && return 1
+  remove_file "$(path_for /usr/local/sbin/gost-monitor-admin)" || return 1
+  monitor_service_present && return 1
+  remove_file "$(path_for /usr/local/sbin/gost-monitor-collector)" || return 1
+  monitor_service_present && return 1
+  remove_exact_tree "$(path_for /usr/local/lib/gost-manager/monitoring)" || return 1
 }
 
 remove_monitor_config() {
   local directory
-  remove_file "$(path_for /etc/gost-manager/monitoring.env)"
+  if monitor_service_present; then
+    info "Collector still exists; monitoring config was preserved."
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  remove_file "$(path_for /etc/gost-manager/monitoring.env)" || return 1
   directory="$(path_for /etc/gost-manager)"
   if [[ -d "${directory}" && ! -L "${directory}" ]]; then
     "${RMDIR_BIN}" "${directory}" >/dev/null 2>&1 || true
   fi
 }
 
+remove_configured_history_files() {
+  local state_root directory candidate
+  if [[ "${CONFIG_CAPTURED}" != "1" ]]; then
+    die "configured monitoring database was not captured; history was preserved."
+    return 1
+  fi
+  for candidate in "${CONFIGURED_DB_ACTUAL}" "${CONFIGURED_DB_ACTUAL}-wal" "${CONFIGURED_DB_ACTUAL}-shm"; do
+    remove_file "${candidate}" || return 1
+  done
+  state_root="$(path_for /var/lib/gost-manager)"
+  directory="${CONFIGURED_DB_ACTUAL%/*}"
+  while [[ "${directory}" == "${state_root}"/* ]]; do
+    "${RMDIR_BIN}" "${directory}" >/dev/null 2>&1 || break
+    directory="${directory%/*}"
+  done
+  "${RMDIR_BIN}" "${state_root}" >/dev/null 2>&1 || true
+}
+
 delete_monitor_history() {
-  local state_dir was_active=0 status=0
-  state_dir="$(path_for /var/lib/gost-manager)"
-  if [[ "${REMOVE_MONITOR_SERVICE}" == "1" ]]; then
-    remove_exact_tree "${state_dir}"
+  local was_active=0 status=0 config_path
+  if [[ "${CONFIG_CAPTURED}" != "1" ]]; then
+    die "configured monitoring database could not be resolved; history was preserved."
+    return 1
+  fi
+  if ! monitor_service_present; then
+    remove_configured_history_files || return 1
     return 0
   fi
   if "${SYSTEMCTL_BIN}" is-active --quiet "${MONITOR_SERVICE}"; then
@@ -226,8 +346,9 @@ delete_monitor_history() {
       return 0
     fi
   fi
-  if ! "${MONITOR_ADMIN_BIN}" purge-history --yes --db "${state_dir}/metrics.sqlite3"; then
-    info "History purge failed; original monitoring database was preserved."
+  config_path="$(path_for /etc/gost-manager/monitoring.env)"
+  if ! "${MONITOR_ADMIN_BIN}" purge-history --yes --db "${CONFIGURED_DB_PRODUCTION}" --config "${config_path}"; then
+    info "History purge failed; original configured monitoring database was preserved."
     status=1
     FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
   fi
@@ -241,45 +362,97 @@ delete_monitor_history() {
 }
 
 remove_traffic_services() {
-  local record service file
+  local record service file survivors
   while IFS= read -r record; do
     [[ -n "${record}" ]] || continue
     service="${record%%|*}"
     file="${record#*|}"
     if "${SYSTEMCTL_BIN}" disable --now "${service}"; then
-      remove_file "${file}"
+      remove_file "${file}" || return 1
       UNIT_CHANGED=1
     else
       info "Failed to remove managed traffic service: ${service}"
       FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
     fi
   done < <(managed_traffic_units)
+  if traffic_units_exist; then
+    survivors="$(surviving_traffic_services)"
+    info "Managed traffic remains; all runners, credentials, and the GOST binary were preserved."
+    info "Surviving managed services: ${survivors//$'\n'/, }"
+    return 0
+  fi
   if ! traffic_units_exist; then
-    remove_file "$(path_for /usr/local/lib/gost-manager/gost-run-iran.sh)"
-    remove_file "$(path_for /usr/local/lib/gost-manager/gost-run-kharej.sh)"
-  else
-    info "Managed traffic remains; runner scripts were preserved."
+    remove_file "$(path_for /usr/local/lib/gost-manager/gost-run-iran.sh)" || return 1
+  fi
+  if ! traffic_units_exist; then
+    remove_file "$(path_for /usr/local/lib/gost-manager/gost-run-kharej.sh)" || return 1
+  fi
+}
+
+remove_selected_traffic_dependencies() {
+  if traffic_units_exist; then
+    [[ "${REMOVE_CREDENTIALS}" != "1" ]] || info "Credentials were selected but preserved because managed traffic remains."
+    [[ "${REMOVE_GOST_BINARY}" != "1" ]] || info "GOST binary was selected but preserved because managed traffic remains."
+    return 0
+  fi
+  if [[ "${REMOVE_CREDENTIALS}" == "1" ]]; then
+    if ! traffic_units_exist; then
+      remove_exact_tree "$(path_for /etc/gost)" || return 1
+    fi
+  fi
+  if [[ "${REMOVE_GOST_BINARY}" == "1" ]]; then
+    if ! traffic_units_exist; then
+      remove_file "$(path_for /usr/local/bin/gost)" || return 1
+    fi
   fi
 }
 
 apply_plan() {
-  validate_dependencies
-  [[ "${REMOVE_MANAGER}" == "1" ]] && remove_file "$(path_for /usr/local/sbin/gost-manager)"
-  [[ "${REMOVE_MONITOR_SERVICE}" == "1" ]] && remove_monitor_service
-  [[ "${REMOVE_MONITOR_CODE}" == "1" ]] && remove_monitor_code
-  [[ "${REMOVE_MONITOR_CONFIG}" == "1" ]] && remove_monitor_config
-  [[ "${REMOVE_MONITOR_HISTORY}" == "1" ]] && delete_monitor_history || true
-  [[ "${REMOVE_TRAFFIC}" == "1" ]] && remove_traffic_services
-  [[ "${REMOVE_CREDENTIALS}" == "1" ]] && remove_exact_tree "$(path_for /etc/gost)"
-  [[ "${REMOVE_GOST_BINARY}" == "1" ]] && remove_file "$(path_for /usr/local/bin/gost)"
+  local failures_before
+  validate_dependencies || return 1
+  if [[ "${REMOVE_MONITOR_SERVICE}" == "1" || "${REMOVE_MONITOR_CODE}" == "1" || "${REMOVE_MONITOR_CONFIG}" == "1" || "${REMOVE_MONITOR_HISTORY}" == "1" ]]; then
+    if ! capture_monitor_config && [[ "${REMOVE_MONITOR_HISTORY}" == "1" ]]; then
+      die "monitoring config is missing or invalid; refusing to guess a database path for history removal."
+      return 1
+    fi
+  fi
+  if [[ "${REMOVE_MANAGER}" == "1" ]]; then
+    remove_file "$(path_for /usr/local/sbin/gost-manager)" || return 1
+  fi
+  if [[ "${REMOVE_MONITOR_SERVICE}" == "1" ]]; then
+    remove_monitor_service || return 1
+  fi
+  if [[ "${REMOVE_MONITOR_HISTORY}" == "1" ]]; then
+    failures_before="${FAILED_ACTIONS}"
+    if ! delete_monitor_history; then
+      [[ "${FAILED_ACTIONS}" -gt "${failures_before}" ]] || FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+      REMOVE_MONITOR_CODE=0
+      REMOVE_MONITOR_CONFIG=0
+      info "History removal failed; monitoring code and config were preserved for recovery."
+    fi
+  fi
+  if [[ "${REMOVE_MONITOR_CODE}" == "1" ]]; then
+    remove_monitor_code || return 1
+  fi
+  if [[ "${REMOVE_MONITOR_CONFIG}" == "1" ]]; then
+    remove_monitor_config || return 1
+  fi
+  if [[ "${REMOVE_TRAFFIC}" == "1" ]]; then
+    remove_traffic_services || return 1
+  fi
+  remove_selected_traffic_dependencies || return 1
   if [[ "${UNIT_CHANGED}" == "1" ]]; then
     "${SYSTEMCTL_BIN}" daemon-reload || {
       info "systemd daemon-reload failed."
       FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
     }
   fi
-  if [[ "${REMOVE_MONITOR_HISTORY}" != "1" && -d "$(path_for /var/lib/gost-manager)" ]]; then
-    info "Monitoring history retained at $(path_for /var/lib/gost-manager)."
+  if [[ "${REMOVE_MONITOR_HISTORY}" != "1" ]]; then
+    if [[ "${CONFIG_CAPTURED}" == "1" ]]; then
+      info "Monitoring history retained at ${CONFIGURED_DB_PRODUCTION}."
+    elif [[ -d "$(path_for /var/lib/gost-manager)" ]]; then
+      info "Monitoring history retained; its path could not be resolved from config."
+    fi
   fi
   if [[ "${REMOVE_MONITOR_CONFIG}" != "1" && -d "$(path_for /etc/gost-manager)" ]]; then
     info "Monitoring config retained at $(path_for /etc/gost-manager)."

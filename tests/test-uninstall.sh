@@ -27,12 +27,16 @@ cat > "${STUB_BIN}/gost-monitor-admin" <<'STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf 'admin %s\n' "$*" >> "${COMMAND_LOG}"
-PYTHONPATH="${REPO_ROOT}" python3 -m monitoring.admin_cli "$@"
+PYTHONPATH="${REPO_ROOT}" python3 -m monitoring.admin_cli \
+  --policy installed --path-root "${GOST_MANAGER_ROOT}" \
+  --lock-path "${GOST_MANAGER_ROOT}/run/gost-manager/collector.lock" "$@"
 STUB
 chmod 755 "${STUB_BIN}/gost-monitor-admin"
 
 create_fixture() {
   local root="$1"
+  rm -f "${STUB_STATE_DIR}/active" "${STUB_STATE_DIR}/enabled"
+  rm -rf "${STUB_STATE_DIR}/wants"
   mkdir -p \
     "${root}/usr/local/sbin" \
     "${root}/usr/local/lib/gost-manager/monitoring" \
@@ -53,12 +57,31 @@ create_fixture() {
   printf '[Unit]\nDescription=managed\n' > "${root}/etc/systemd/system/gost-iran-1.service"
   printf '[Unit]\nDescription=unmanaged\n' > "${root}/etc/systemd/system/custom-gost.service"
   printf 'MAPPINGS=2052:2052\nPASSWORD=uninstall-secret-canary\n' > "${root}/etc/gost/iran-1.env"
-  printf 'config-retained\n' > "${root}/etc/gost-manager/monitoring.env"
-  PYTHONPATH="${ROOT_DIR}" python3 -m monitoring.admin_cli migrate --db "${root}/var/lib/gost-manager/metrics.sqlite3" >/dev/null
+  cp "${ROOT_DIR}/packaging/monitoring.env" "${root}/etc/gost-manager/monitoring.env"
+  PYTHONPATH="${ROOT_DIR}" python3 -m monitoring.admin_cli --policy generic \
+    migrate --db "${root}/var/lib/gost-manager/metrics.sqlite3" >/dev/null
   PYTHONPATH="${ROOT_DIR}" python3 - "${root}/var/lib/gost-manager/metrics.sqlite3" <<'PY'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 conn.execute("INSERT INTO events(ts,severity,code,message,details_json) VALUES(1,'info','keep','keep','{}')")
+conn.commit()
+conn.close()
+PY
+}
+
+configure_custom_history() {
+  local root="$1"
+  local config="${root}/etc/gost-manager/monitoring.env"
+  local custom="${root}/var/lib/gost-manager/archive/custom.sqlite3"
+  sed 's|^GOST_MONITOR_DB=.*|GOST_MONITOR_DB=/var/lib/gost-manager/archive/custom.sqlite3|' \
+    "${config}" > "${config}.new"
+  mv "${config}.new" "${config}"
+  mkdir -p "${custom%/*}"
+  PYTHONPATH="${ROOT_DIR}" python3 -m monitoring.admin_cli --policy generic migrate --db "${custom}" >/dev/null
+  PYTHONPATH="${ROOT_DIR}" python3 - "${custom}" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], isolation_level=None)
+conn.execute("INSERT INTO events(ts,severity,code,message,details_json) VALUES(2,'info','custom','custom','{}')")
 conn.close()
 PY
 }
@@ -70,6 +93,7 @@ run_plan() {
     export GOST_MANAGER_TESTING=1
     export GOST_MANAGER_ROOT="${root}"
     export GOST_MANAGER_SOURCE_ONLY=1
+    export STUB_UNIT_PATH="${root}/etc/systemd/system/gost-monitor-collector.service"
     export MONITOR_ADMIN_BIN="${STUB_BIN}/gost-monitor-admin"
     export SYSTEMCTL_BIN=systemctl
     # shellcheck source=../uninstall.sh
@@ -207,6 +231,122 @@ unset STUB_FAIL_SYSTEMCTL_ACTION
 assert_file "traffic systemctl failure keeps unit" "${failure_root}/etc/systemd/system/gost-iran-1.service"
 assert_file "traffic systemctl failure keeps runner" "${failure_root}/usr/local/lib/gost-manager/gost-run-iran.sh"
 assert_file "traffic systemctl failure keeps unmanaged unit" "${failure_root}/etc/systemd/system/custom-gost.service"
+
+binary_refusal_root="${TEST_HOME}/binary-refusal"
+create_fixture "${binary_refusal_root}"
+if run_plan "${binary_refusal_root}" binary >/dev/null 2>&1; then
+  fail "binary-only removal refuses while traffic remains"
+else
+  pass "binary-only removal refuses while traffic remains"
+fi
+assert_file "binary-only refusal preserves GOST binary" "${binary_refusal_root}/usr/local/bin/gost"
+
+credentials_refusal_root="${TEST_HOME}/credentials-refusal"
+create_fixture "${credentials_refusal_root}"
+if run_plan "${credentials_refusal_root}" credentials >/dev/null 2>&1; then
+  fail "credentials-only removal refuses while traffic remains"
+else
+  pass "credentials-only removal refuses while traffic remains"
+fi
+assert_file "credentials-only refusal preserves env" "${credentials_refusal_root}/etc/gost/iran-1.env"
+
+combined_failure_root="${TEST_HOME}/combined-traffic-failure"
+create_fixture "${combined_failure_root}"
+printf '[Unit]\nDescription=managed second\n' > "${combined_failure_root}/etc/systemd/system/gost-kharej-2.service"
+printf 'MAPPINGS=2053:2053\nPASSWORD=combined-canary\n' > "${combined_failure_root}/etc/gost/kharej-2.env"
+: > "${COMMAND_LOG}"
+if STUB_FAIL_SYSTEMCTL_ACTION=disable STUB_FAIL_SYSTEMCTL_UNIT=gost-kharej-2.service \
+  run_plan "${combined_failure_root}" traffic credentials binary > "${TEST_HOME}/combined-failure.out"; then
+  fail "combined traffic dependency failure returns non-zero"
+else
+  pass "combined traffic dependency failure returns non-zero"
+fi
+assert_absent "combined failure removes successfully disabled unit" "${combined_failure_root}/etc/systemd/system/gost-iran-1.service"
+assert_file "combined failure keeps surviving managed unit" "${combined_failure_root}/etc/systemd/system/gost-kharej-2.service"
+assert_dir "combined failure preserves all credentials" "${combined_failure_root}/etc/gost"
+assert_file "combined failure preserves GOST binary" "${combined_failure_root}/usr/local/bin/gost"
+assert_file "combined failure preserves Iran runner" "${combined_failure_root}/usr/local/lib/gost-manager/gost-run-iran.sh"
+assert_file "combined failure preserves Kharej runner" "${combined_failure_root}/usr/local/lib/gost-manager/gost-run-kharej.sh"
+assert_file "combined failure keeps unrelated unit" "${combined_failure_root}/etc/systemd/system/custom-gost.service"
+assert_contains "combined failure reports exact survivor" "gost-kharej-2.service" "${TEST_HOME}/combined-failure.out"
+
+all_traffic_root="${TEST_HOME}/all-traffic-success"
+create_fixture "${all_traffic_root}"
+printf '[Unit]\nDescription=managed second\n' > "${all_traffic_root}/etc/systemd/system/gost-kharej-2.service"
+run_plan "${all_traffic_root}" traffic credentials binary >/dev/null
+assert_absent "all-traffic success removes credentials" "${all_traffic_root}/etc/gost"
+assert_absent "all-traffic success removes GOST binary" "${all_traffic_root}/usr/local/bin/gost"
+assert_absent "all-traffic success removes Iran runner" "${all_traffic_root}/usr/local/lib/gost-manager/gost-run-iran.sh"
+assert_absent "all-traffic success removes Kharej runner" "${all_traffic_root}/usr/local/lib/gost-manager/gost-run-kharej.sh"
+
+collector_missing_root="${TEST_HOME}/collector-unit-missing"
+create_fixture "${collector_missing_root}"
+rm -f "${collector_missing_root}/etc/systemd/system/gost-monitor-collector.service"
+touch "${STUB_STATE_DIR}/active"
+: > "${COMMAND_LOG}"
+run_plan "${collector_missing_root}" monitor-service monitor-code monitor-config history >/dev/null
+assert_contains "unit-missing active collector still stopped" "systemctl disable --now gost-monitor-collector.service" "${COMMAND_LOG}"
+assert_absent "unit-missing collector permits code removal after stop" "${collector_missing_root}/usr/local/lib/gost-manager/monitoring"
+assert_absent "unit-missing collector permits config removal after stop" "${collector_missing_root}/etc/gost-manager/monitoring.env"
+assert_absent "unit-missing collector permits configured history removal" "${collector_missing_root}/var/lib/gost-manager/metrics.sqlite3"
+
+collector_failure_root="${TEST_HOME}/collector-removal-failure"
+create_fixture "${collector_failure_root}"
+rm -f "${collector_failure_root}/etc/systemd/system/gost-monitor-collector.service"
+touch "${STUB_STATE_DIR}/active"
+if STUB_FAIL_SYSTEMCTL_ACTION=disable STUB_FAIL_SYSTEMCTL_UNIT=gost-monitor-collector.service \
+  run_plan "${collector_failure_root}" monitor-service monitor-code monitor-config history >/dev/null; then
+  fail "collector removal failure returns non-zero"
+else
+  pass "collector removal failure returns non-zero"
+fi
+assert_file "collector failure preserves query launcher" "${collector_failure_root}/usr/local/sbin/gost-monitor"
+assert_file "collector failure preserves admin launcher" "${collector_failure_root}/usr/local/sbin/gost-monitor-admin"
+assert_file "collector failure preserves collector launcher" "${collector_failure_root}/usr/local/sbin/gost-monitor-collector"
+assert_dir "collector failure preserves Python code" "${collector_failure_root}/usr/local/lib/gost-manager/monitoring"
+assert_file "collector failure preserves config" "${collector_failure_root}/etc/gost-manager/monitoring.env"
+assert_file "collector failure preserves history" "${collector_failure_root}/var/lib/gost-manager/metrics.sqlite3"
+assert_file "collector failure leaves traffic untouched" "${collector_failure_root}/etc/systemd/system/gost-iran-1.service"
+
+custom_history_root="${TEST_HOME}/custom-history"
+create_fixture "${custom_history_root}"
+configure_custom_history "${custom_history_root}"
+run_plan "${custom_history_root}" history >/dev/null
+custom_rows="$(PYTHONPATH="${ROOT_DIR}" python3 - "${custom_history_root}/var/lib/gost-manager/archive/custom.sqlite3" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+conn.close()
+PY
+)"
+default_rows="$(PYTHONPATH="${ROOT_DIR}" python3 - "${custom_history_root}/var/lib/gost-manager/metrics.sqlite3" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+conn.close()
+PY
+)"
+assert_eq "history-only purges alternate configured database" "0" "${custom_rows}"
+assert_eq "history-only does not purge wrong default database" "1" "${default_rows}"
+
+captured_history_root="${TEST_HOME}/captured-history"
+create_fixture "${captured_history_root}"
+configure_custom_history "${captured_history_root}"
+run_plan "${captured_history_root}" monitor-service history monitor-config >/dev/null
+assert_absent "config removal plus history uses captured custom path" "${captured_history_root}/var/lib/gost-manager/archive/custom.sqlite3"
+assert_absent "config removal removes config after path capture" "${captured_history_root}/etc/gost-manager/monitoring.env"
+assert_file "captured custom removal leaves wrong default database" "${captured_history_root}/var/lib/gost-manager/metrics.sqlite3"
+
+invalid_history_root="${TEST_HOME}/invalid-history-config"
+create_fixture "${invalid_history_root}"
+printf 'invalid config\n' > "${invalid_history_root}/etc/gost-manager/monitoring.env"
+invalid_history_before="$(tree_digest "${invalid_history_root}/var/lib/gost-manager")"
+if run_plan "${invalid_history_root}" history >/dev/null 2>&1; then
+  fail "invalid config refuses history deletion"
+else
+  pass "invalid config refuses history deletion"
+fi
+assert_eq "invalid config never deletes guessed default history" "${invalid_history_before}" "$(tree_digest "${invalid_history_root}/var/lib/gost-manager")"
 
 symlink_root="${TEST_HOME}/symlink"
 create_fixture "${symlink_root}"

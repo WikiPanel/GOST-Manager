@@ -249,7 +249,13 @@ class CliTests(unittest.TestCase):
 
     def call(self, argv):
         stdout, stderr = io.StringIO(), io.StringIO()
-        code = main(argv, stdout, stderr, clock=lambda: NOW, sleeper=lambda _seconds: None)
+        code = main(
+            ["--policy", "generic", *argv],
+            stdout,
+            stderr,
+            clock=lambda: NOW,
+            sleeper=lambda _seconds: None,
+        )
         return code, stdout.getvalue(), stderr.getvalue()
 
     def test_snapshot_summary_and_export_smoke(self):

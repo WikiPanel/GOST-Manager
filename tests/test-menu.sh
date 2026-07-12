@@ -36,6 +36,11 @@ cat > "${STUB_BIN}/gost-monitor-admin" <<'STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf 'admin %s\n' "$*" >> "${COMMAND_LOG}"
+if [[ "${1:-}" == "config" ]]; then
+  [[ "${STUB_CONFIG_EXIT:-0}" == "0" ]] || exit "${STUB_CONFIG_EXIT}"
+  printf '%s\n' "${STUB_CONFIG_DB}"
+  exit 0
+fi
 exit "${STUB_ADMIN_EXIT:-0}"
 STUB
 chmod 755 "${STUB_BIN}/gost-monitor" "${STUB_BIN}/gost-monitor-collector" "${STUB_BIN}/gost-monitor-admin"
@@ -47,8 +52,8 @@ export GOST_MONITOR_BIN_TEST="${STUB_BIN}/gost-monitor"
 export GOST_MONITOR_COLLECTOR_BIN_TEST="${STUB_BIN}/gost-monitor-collector"
 export GOST_MONITOR_ADMIN_BIN_TEST="${STUB_BIN}/gost-monitor-admin"
 export GOST_MONITOR_CONFIG_TEST="${TEST_HOME}/monitoring.env"
-export GOST_MONITOR_DB_TEST="${TEST_HOME}/metrics.sqlite3"
 export GOST_MONITOR_EXPORT_DIR_TEST="${TEST_HOME}"
+export STUB_CONFIG_DB="/var/lib/gost-manager/custom.sqlite3"
 
 # shellcheck source=../gost-manager.sh
 source "${ROOT_DIR}/gost-manager.sh"
@@ -84,9 +89,12 @@ monitor_query live > "${live_output}"
 assert_contains "Ctrl-C live returns to menu" "Monitoring view closed" "${live_output}"
 unset STUB_MONITOR_EXIT
 
-audit_root="${TEST_HOME}/native-audit"
-mkdir -p "${audit_root}"
+audit_root="${TEST_HOME}/native-complete-root"
+mkdir -p "${audit_root}/etc/gost" "${audit_root}/usr/local/sbin" "${audit_root}/var/lib/gost-manager"
 printf 'unchanged\n' > "${audit_root}/canary"
+printf 'direct\n' > "${audit_root}/etc/gost/iran-1.env"
+chmod 640 "${audit_root}/etc/gost/iran-1.env"
+ln -s "iran-1.env" "${audit_root}/etc/gost/current.env"
 tree_before="$(tree_digest "${audit_root}")"
 log_before="$(cksum "${COMMAND_LOG}")"
 native_output="${TEST_HOME}/native.out"
@@ -95,10 +103,60 @@ assert_eq "Native placeholder filesystem no-op" "${tree_before}" "$(tree_digest 
 assert_eq "Native placeholder command no-op" "${log_before}" "$(cksum "${COMMAND_LOG}")"
 assert_contains "Native placeholder prints Coming soon" "Coming soon" "${native_output}"
 
+: > "${COMMAND_LOG}"
+status_output="${TEST_HOME}/status.out"
+monitoring_service_status > "${status_output}"
+assert_contains "configured database shown in status" "History: ${STUB_CONFIG_DB}" "${status_output}"
+assert_contains "status resolves database through admin config" "admin config --format value --field database_path --config ${MONITOR_CONFIG}" "${COMMAND_LOG}"
+
 require_root() { return 0; }
+touch "${STUB_STATE_DIR}/active"
+: > "${COMMAND_LOG}"
+printf 'y\n' | monitor_one_shot >/dev/null
+assert_contains "one-shot stops only active collector" "systemctl stop gost-monitor-collector.service" "${COMMAND_LOG}"
+assert_contains "one-shot invokes collector once" "collector --once" "${COMMAND_LOG}"
+assert_contains "one-shot restores active collector" "systemctl start gost-monitor-collector.service" "${COMMAND_LOG}"
+assert_not_contains "one-shot never targets traffic" "gost-iran-" "${COMMAND_LOG}"
+rm -f "${STUB_STATE_DIR}/active"
+
+touch "${STUB_STATE_DIR}/active"
+export STUB_COLLECTOR_EXIT=1
+: > "${COMMAND_LOG}"
+printf 'y\n' | monitor_one_shot >/dev/null
+assert_contains "failed one-shot still restores collector" "systemctl start gost-monitor-collector.service" "${COMMAND_LOG}"
+assert_not_contains "failed one-shot still avoids traffic" "gost-kharej-" "${COMMAND_LOG}"
+unset STUB_COLLECTOR_EXIT
+rm -f "${STUB_STATE_DIR}/active"
+
+touch "${STUB_STATE_DIR}/active"
+export STUB_COLLECTOR_EXIT=130
+: > "${COMMAND_LOG}"
+printf 'y\n' | monitor_one_shot >/dev/null
+assert_contains "interrupted one-shot restores collector" "systemctl start gost-monitor-collector.service" "${COMMAND_LOG}"
+assert_not_contains "interrupted one-shot avoids traffic" "gost-iran-" "${COMMAND_LOG}"
+unset STUB_COLLECTOR_EXIT
+rm -f "${STUB_STATE_DIR}/active"
+
+: > "${COMMAND_LOG}"
+purge_output="${TEST_HOME}/configured-purge.out"
+printf 'DELETE MONITORING HISTORY\n' | monitor_purge_history > "${purge_output}"
+assert_contains "purge displays exact configured database" "${STUB_CONFIG_DB}" "${purge_output}"
+assert_contains "purge uses strict config resolution" "admin purge-history --yes --config ${MONITOR_CONFIG}" "${COMMAND_LOG}"
+assert_not_contains "configured purge never targets traffic" "gost-iran-" "${COMMAND_LOG}"
+
+export STUB_CONFIG_EXIT=2
+: > "${COMMAND_LOG}"
+invalid_output="${TEST_HOME}/invalid-config.out"
+printf 'DELETE MONITORING HISTORY\n' | monitor_purge_history > "${invalid_output}" 2>&1
+assert_contains "invalid config refuses purge" "no database action was taken" "${invalid_output}"
+assert_not_contains "invalid config runs no purge" "purge-history" "${COMMAND_LOG}"
+unset STUB_CONFIG_EXIT
+
 : > "${COMMAND_LOG}"
 printf 'CANCEL\n' | monitor_purge_history >/dev/null
-assert_eq "purge cancellation calls no service" "0" "$(wc -l < "${COMMAND_LOG}" | tr -d ' ')"
+assert_eq "purge cancellation resolves config only" "1" "$(wc -l < "${COMMAND_LOG}" | tr -d ' ')"
+assert_not_contains "purge cancellation calls no service" "systemctl" "${COMMAND_LOG}"
+assert_not_contains "purge cancellation runs no purge" "purge-history" "${COMMAND_LOG}"
 
 DISPATCH_LOG="${TEST_HOME}/dispatch.log"
 : > "${DISPATCH_LOG}"

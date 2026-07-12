@@ -206,7 +206,7 @@ class MonitoringTests(unittest.TestCase):
             old = gm.collect_once
             try:
                 gm.collect_once = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))
-                self.assertEqual(gm.main(['--db', str(Path(td)/'m.sqlite3'), '--env-dir', td, '--once']), 1)
+                self.assertEqual(gm.main(['--policy', 'generic', '--db', str(Path(td)/'m.sqlite3'), '--env-dir', td, '--once']), 1)
             finally:
                 gm.collect_once = old
 

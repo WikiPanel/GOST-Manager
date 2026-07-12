@@ -10,7 +10,6 @@ SYSTEMD_DIR="/etc/systemd/system"
 GITHUB_RELEASES_API="https://api.github.com/repos/go-gost/gost/releases?per_page=100"
 MONITOR_SERVICE="gost-monitor-collector.service"
 MONITOR_CONFIG="/etc/gost-manager/monitoring.env"
-MONITOR_DB="/var/lib/gost-manager/metrics.sqlite3"
 MONITOR_EXPORT_DIR="/root"
 MONITOR_BIN="/usr/local/sbin/gost-monitor"
 MONITOR_COLLECTOR_BIN="/usr/local/sbin/gost-monitor-collector"
@@ -18,7 +17,6 @@ MONITOR_ADMIN_BIN="/usr/local/sbin/gost-monitor-admin"
 
 if [[ "${GOST_MANAGER_TESTING:-0}" == "1" ]]; then
   MONITOR_CONFIG="${GOST_MONITOR_CONFIG_TEST:-${MONITOR_CONFIG}}"
-  MONITOR_DB="${GOST_MONITOR_DB_TEST:-${MONITOR_DB}}"
   MONITOR_EXPORT_DIR="${GOST_MONITOR_EXPORT_DIR_TEST:-${MONITOR_EXPORT_DIR}}"
   MONITOR_BIN="${GOST_MONITOR_BIN_TEST:-${MONITOR_BIN}}"
   MONITOR_COLLECTOR_BIN="${GOST_MONITOR_COLLECTOR_BIN_TEST:-${MONITOR_COLLECTOR_BIN}}"
@@ -1170,6 +1168,20 @@ monitor_admin() {
   run_monitor_command "${command[@]}"
 }
 
+monitor_config_value() {
+  local field="$1"
+  local value
+  if ! value="$("${MONITOR_ADMIN_BIN}" config --format value --field "${field}" --config "${MONITOR_CONFIG}")"; then
+    info "Monitoring config could not be resolved safely; no database action was taken." >&2
+    return 1
+  fi
+  if [[ "${field}" == "database_path" && "${value}" != /* ]]; then
+    info "Monitoring config returned an unsafe database path; no database action was taken." >&2
+    return 1
+  fi
+  printf '%s\n' "${value}"
+}
+
 monitor_custom_summary() {
   local duration
   read -r -p "Custom duration (for example 90s, 15m, 2h, 2d): " duration
@@ -1230,9 +1242,11 @@ monitor_export() {
 }
 
 monitoring_service_status() {
+  local database_path
+  database_path="$(monitor_config_value database_path)" || return 0
   info "Collector service: ${MONITOR_SERVICE}"
   info "Config: ${MONITOR_CONFIG}"
-  info "History: ${MONITOR_DB}"
+  info "History: ${database_path}"
   systemctl --no-pager status "${MONITOR_SERVICE}" || true
   if systemctl is-enabled --quiet "${MONITOR_SERVICE}"; then
     info "Enabled: yes"
@@ -1266,19 +1280,44 @@ monitoring_service_action() {
 
 monitor_one_shot() {
   require_root
+  local database_path was_active=0 status=0
+  database_path="$(monitor_config_value database_path)" || return 0
+  info "One-shot database: ${database_path}"
+  if systemctl is-active --quiet "${MONITOR_SERVICE}"; then
+    confirm "Temporarily stop the monitoring collector for one-shot diagnostics?" || {
+      info "One-shot diagnostic cancelled."
+      return 0
+    }
+    if ! systemctl stop "${MONITOR_SERVICE}"; then
+      info "Could not stop monitoring collector; one-shot diagnostic was not run."
+      return 0
+    fi
+    was_active=1
+  fi
   local -a command=("${MONITOR_COLLECTOR_BIN}" --once)
-  run_monitor_command "${command[@]}"
+  if execute_monitor_command "${command[@]}"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "${was_active}" -eq 1 ]]; then
+    systemctl start "${MONITOR_SERVICE}" || info "One-shot finished, but collector restart failed."
+  fi
+  [[ "${status}" -eq 0 ]] || info "One-shot diagnostic did not complete successfully."
+  return 0
 }
 
 monitor_maintenance() {
   require_root
+  monitor_config_value database_path >/dev/null || return 0
   monitor_admin maintenance
 }
 
 monitor_purge_history() {
-  local phrase was_active=0 status
+  local phrase was_active=0 status database_path
   require_root
-  info "This deletes only monitoring history: ${MONITOR_DB}"
+  database_path="$(monitor_config_value database_path)" || return 0
+  info "This deletes only monitoring history: ${database_path}"
   info "Traffic services and ${GOST_ETC_DIR} are not affected."
   read -r -p "Type DELETE MONITORING HISTORY to continue: " phrase
   if [[ "${phrase}" != "DELETE MONITORING HISTORY" ]]; then

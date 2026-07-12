@@ -23,6 +23,8 @@ from monitoring.collector import (
 )
 from monitoring.config import (
     ALLOWED_KEYS,
+    CONFIG_POLICIES,
+    INSTALLED_POLICY,
     ConfigError,
     KEY_DB,
     KEY_ENV_DIR,
@@ -30,9 +32,11 @@ from monitoring.config import (
     KEY_SAMPLE,
     KEY_SLOW,
     KEY_TCP,
+    apply_config_policy,
     config_from_environment,
     config_from_mapping,
     load_config,
+    rooted_path,
 )
 from monitoring.entities import (
     DEFAULT_ENV_DIR,
@@ -94,6 +98,7 @@ from monitoring.scheduler import (
     run_daemon as run_daemon_with_sources,
     scheduler_ticks,
 )
+from monitoring.runtime_lock import DEFAULT_LOCK_PATH, RuntimeLock, RuntimeLockError
 from monitoring.socket_readers import (
     parse_listener_address,
     parse_ss_listeners,
@@ -337,6 +342,9 @@ def run_daemon(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--policy", choices=CONFIG_POLICIES, default=INSTALLED_POLICY)
+    parser.add_argument("--path-root", help=argparse.SUPPRESS)
+    parser.add_argument("--lock-path", help=argparse.SUPPRESS)
     parser.add_argument("--config")
     parser.add_argument("--db")
     parser.add_argument("--env-dir")
@@ -351,7 +359,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         environment_config = (
-            load_config(args.config) if args.config else config_from_environment()
+            load_config(args.config, policy=args.policy, root=args.path_root)
+            if args.config
+            else config_from_environment()
         )
         overrides: dict[str, object] = environment_config.as_mapping()
         if args.db is not None:
@@ -366,34 +376,57 @@ def main(argv: Sequence[str] | None = None) -> int:
             overrides[KEY_SLOW] = args.slow_interval
         if args.maintenance_interval is not None:
             overrides[KEY_MAINTENANCE] = args.maintenance_interval
-        active = config_from_mapping(
-            {key: overrides[key] for key in ALLOWED_KEYS}, require_all=True
+        active = apply_config_policy(
+            config_from_mapping(
+                {key: overrides[key] for key in ALLOWED_KEYS}, require_all=True
+            ),
+            policy=args.policy,
+            root=args.path_root,
         )
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
     collector_config = active.collector_config()
-    if args.once:
-        try:
-            migrate_database(active.db_path)
+    db_path = active.db_path
+    env_dir = active.env_dir
+    if args.policy == INSTALLED_POLICY:
+        db_path = str(rooted_path(active.db_path, args.path_root))
+        env_dir = str(rooted_path(active.env_dir, args.path_root))
+    lock_path = args.lock_path
+    if lock_path is None and args.policy == INSTALLED_POLICY:
+        lock_path = str(rooted_path(DEFAULT_LOCK_PATH, args.path_root))
+
+    def execute() -> int:
+        apply_config_policy(active, policy=args.policy, root=args.path_root)
+        if args.once:
+            migrate_database(db_path)
             collect_once(
-                active.db_path,
-                active.env_dir,
+                db_path,
+                env_dir,
                 args.now,
                 maintenance=True,
                 config=collector_config,
             )
             return 0
-        except Exception as exc:
-            print(f"collection failed: {exc}", file=sys.stderr)
-            return 1
-    return run_daemon(
-        active.db_path,
-        active.env_dir,
-        interval=collector_config.sample_interval,
-        maintenance_interval=collector_config.maintenance_interval,
-        config=collector_config,
-    )
+        return run_daemon(
+            db_path,
+            env_dir,
+            interval=collector_config.sample_interval,
+            maintenance_interval=collector_config.maintenance_interval,
+            config=collector_config,
+        )
+
+    try:
+        if lock_path is None:
+            return execute()
+        with RuntimeLock(lock_path):
+            return execute()
+    except RuntimeLockError as exc:
+        print(f"collection refused: {exc}", file=sys.stderr)
+        return 4
+    except Exception as exc:
+        print(f"collection failed: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

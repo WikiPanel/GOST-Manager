@@ -13,7 +13,17 @@ from collections.abc import Callable, Sequence
 from typing import TextIO
 
 from monitoring.exporters import export_data
-from monitoring.config import ConfigError, config_from_environment, load_config
+from monitoring.config import (
+    CONFIG_POLICIES,
+    INSTALLED_POLICY,
+    ConfigError,
+    DEFAULT_CONFIG,
+    MonitoringConfig,
+    apply_config_policy,
+    config_from_environment,
+    load_config,
+    rooted_path,
+)
 from monitoring.query_db import ReadOnlyDatabase
 from monitoring.query_engine import QueryEngine
 from monitoring.query_models import QueryError, QueryInputError
@@ -59,6 +69,8 @@ def _add_metrics(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = QueryArgumentParser(prog="python3 -m monitoring.query_cli")
     parser.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--policy", choices=CONFIG_POLICIES, default=INSTALLED_POLICY)
+    parser.add_argument("--path-root", help=argparse.SUPPRESS)
     parser.add_argument("--config", help="strict monitoring config file")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -241,10 +253,35 @@ def main(
         args = parser.parse_args(argv)
         if args.db is None:
             try:
-                config = load_config(args.config) if args.config else config_from_environment()
+                config = (
+                    load_config(args.config, policy=args.policy, root=args.path_root)
+                    if args.config
+                    else config_from_environment()
+                )
+                config = apply_config_policy(
+                    config, policy=args.policy, root=args.path_root
+                )
             except ConfigError as exc:
                 raise QueryInputError(str(exc)) from exc
             args.db = config.db_path
+        elif args.policy == INSTALLED_POLICY:
+            try:
+                apply_config_policy(
+                    MonitoringConfig(
+                        db_path=args.db,
+                        env_dir=DEFAULT_CONFIG.env_dir,
+                        sample_interval=DEFAULT_CONFIG.sample_interval,
+                        tcp_interval=DEFAULT_CONFIG.tcp_interval,
+                        slow_interval=DEFAULT_CONFIG.slow_interval,
+                        maintenance_interval=DEFAULT_CONFIG.maintenance_interval,
+                    ),
+                    policy=args.policy,
+                    root=args.path_root,
+                )
+            except ConfigError as exc:
+                raise QueryInputError(str(exc)) from exc
+        if args.policy == INSTALLED_POLICY:
+            args.db = str(rooted_path(args.db, args.path_root))
         return run_command(args, stdout, clock, sleeper)
     except QueryError as exc:
         stderr.write(f"error: {exc}\n")

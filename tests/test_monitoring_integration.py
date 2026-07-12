@@ -10,6 +10,7 @@ import os
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,7 @@ from monitoring.config import (
     ALLOWED_KEYS,
     ConfigError,
     DEFAULT_CONFIG,
+    INSTALLED_POLICY,
     INTERVAL_BOUNDS,
     KEY_DB,
     KEY_ENV_DIR,
@@ -32,6 +34,7 @@ from monitoring.config import (
     load_config,
     parse_config_text,
 )
+from monitoring.runtime_lock import RuntimeLock, RuntimeLockError
 from monitoring.schema import EVENT_RETENTION_SECONDS, SCHEMA_VERSION, init_db
 
 
@@ -128,6 +131,83 @@ class ConfigParserTests(unittest.TestCase):
             parse_config_text(raw)
         self.assertNotIn(canary, str(caught.exception))
 
+    def test_installed_policy_accepts_only_managed_database_and_env_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            (root / "var/lib/gost-manager/archive").mkdir(parents=True)
+            (root / "etc/gost/nested").mkdir(parents=True)
+            config = root / "monitoring.env"
+            for db_path, env_path in (
+                ("/var/lib/gost-manager/metrics.sqlite3", "/etc/gost"),
+                ("/var/lib/gost-manager/custom.sqlite3", "/etc/gost"),
+                ("/var/lib/gost-manager/archive/current.sqlite3", "/etc/gost/nested"),
+            ):
+                with self.subTest(db_path=db_path, env_path=env_path):
+                    config.write_text(
+                        config_text(**{KEY_DB: db_path, KEY_ENV_DIR: env_path}),
+                        encoding="utf-8",
+                    )
+                    parsed = load_config(
+                        config, policy=INSTALLED_POLICY, root=root
+                    )
+                    self.assertEqual(db_path, parsed.db_path)
+                    self.assertEqual(env_path, parsed.env_dir)
+
+    def test_installed_policy_rejects_paths_outside_managed_roots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            config = root / "monitoring.env"
+            for db_path in (
+                "/srv/gost/metrics.sqlite3",
+                "/root/metrics.sqlite3",
+                "/tmp/metrics.sqlite3",
+                "/var/lib/gost-manager-link/metrics.sqlite3",
+            ):
+                with self.subTest(db_path=db_path):
+                    config.write_text(config_text(**{KEY_DB: db_path}), encoding="utf-8")
+                    with self.assertRaises(ConfigError):
+                        load_config(config, policy=INSTALLED_POLICY, root=root)
+            config.write_text(
+                config_text(**{KEY_ENV_DIR: "/srv/gost/env"}), encoding="utf-8"
+            )
+            with self.assertRaises(ConfigError):
+                load_config(config, policy=INSTALLED_POLICY, root=root)
+
+    def test_installed_policy_rejects_parent_final_and_env_symlinks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            state = root / "var/lib/gost-manager"
+            state.mkdir(parents=True)
+            env = root / "etc/gost"
+            env.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            config = root / "monitoring.env"
+
+            (state / "archive").symlink_to(outside, target_is_directory=True)
+            config.write_text(
+                config_text(**{KEY_DB: "/var/lib/gost-manager/archive/current.sqlite3"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "symlink"):
+                load_config(config, policy=INSTALLED_POLICY, root=root)
+            (state / "archive").unlink()
+
+            target = outside / "target.sqlite3"
+            target.write_bytes(b"outside")
+            (state / "metrics.sqlite3").symlink_to(target)
+            config.write_text(default_config_text(), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "symlink"):
+                load_config(config, policy=INSTALLED_POLICY, root=root)
+            (state / "metrics.sqlite3").unlink()
+
+            (env / "nested").symlink_to(outside, target_is_directory=True)
+            config.write_text(
+                config_text(**{KEY_ENV_DIR: "/etc/gost/nested"}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ConfigError, "symlink"):
+                load_config(config, policy=INSTALLED_POLICY, root=root)
+
 
 class CollectorConfigurationTests(unittest.TestCase):
     def test_invalid_cadence_returns_two_without_creating_database(self):
@@ -136,7 +216,7 @@ class CollectorConfigurationTests(unittest.TestCase):
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 result = gost_monitoring.main(
-                    ["--once", "--db", str(db), "--interval", "4"]
+                    ["--policy", "generic", "--once", "--db", str(db), "--interval", "4"]
                 )
             self.assertEqual(2, result)
             self.assertFalse(db.exists())
@@ -154,6 +234,7 @@ class CollectorConfigurationTests(unittest.TestCase):
         ):
             result = gost_monitoring.main(
                 [
+                    "--policy", "generic",
                     "--once",
                     "--db", "/tmp/gost-monitor-test.sqlite3",
                     "--env-dir", "/tmp/gost-env",
@@ -181,7 +262,9 @@ class CollectorConfigurationTests(unittest.TestCase):
             config.write_text(config_text(**{KEY_DB: str(db)}), encoding="utf-8")
             stdout, stderr = io.StringIO(), io.StringIO()
             result = query_cli.main(
-                ["--config", str(config), "snapshot"], stdout=stdout, stderr=stderr
+                ["--policy", "generic", "--config", str(config), "snapshot"],
+                stdout=stdout,
+                stderr=stderr,
             )
             self.assertEqual(0, result)
             self.assertIn("OVERALL", stdout.getvalue())
@@ -196,9 +279,9 @@ class AdminCliTests(unittest.TestCase):
             db = root / "metrics.sqlite3"
             config.write_text(config_text(**{KEY_DB: str(db)}), encoding="utf-8")
             before = config.read_bytes()
-            self.assertEqual(0, admin_cli.main(["validate-config", "--config", str(config)]))
+            self.assertEqual(0, admin_cli.main(["--policy", "generic", "validate-config", "--config", str(config)]))
             self.assertEqual(before, config.read_bytes())
-            self.assertEqual(0, admin_cli.main(["migrate", "--db", str(db)]))
+            self.assertEqual(0, admin_cli.main(["--policy", "generic", "migrate", "--db", str(db)]))
             self.assertEqual(0o600, stat.S_IMODE(db.stat().st_mode))
             status = admin_cli.database_status(str(db))
             self.assertEqual(SCHEMA_VERSION, status["schema_version"])
@@ -252,7 +335,7 @@ class AdminCliTests(unittest.TestCase):
             original_mode = stat.S_IMODE(db.stat().st_mode)
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
-                self.assertEqual(4, admin_cli.main(["purge-history", "--db", str(db)]))
+                self.assertEqual(4, admin_cli.main(["--policy", "generic", "purge-history", "--db", str(db)]))
             self.assertEqual(1, sqlite3.connect(db).execute("SELECT COUNT(*) FROM events").fetchone()[0])
             admin_cli.purge_history(str(db))
             self.assertFalse(Path(str(db) + "-wal").exists())
@@ -295,9 +378,220 @@ class AdminCliTests(unittest.TestCase):
             db.write_bytes(b"not sqlite")
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
-                result = admin_cli.main(["status", "--db", str(db)])
+                result = admin_cli.main(["--policy", "generic", "status", "--db", str(db)])
             self.assertEqual(3, result)
             self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_safe_machine_readable_installed_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            (root / "var/lib/gost-manager").mkdir(parents=True)
+            (root / "etc/gost").mkdir(parents=True)
+            config = root / "monitoring.env"
+            config.write_text(
+                config_text(**{KEY_DB: "/var/lib/gost-manager/custom.sqlite3"}),
+                encoding="utf-8",
+            )
+            args = admin_cli.build_parser().parse_args(
+                [
+                    "--path-root", str(root),
+                    "config", "--config", str(config), "--format", "json",
+                ]
+            )
+            output = io.StringIO()
+            self.assertEqual(0, admin_cli.run_command(args, stdout=output))
+            payload = json.loads(output.getvalue())
+            self.assertEqual(
+                "/var/lib/gost-manager/custom.sqlite3", payload["database_path"]
+            )
+            self.assertEqual(set(admin_cli.CONFIG_FIELDS), set(payload))
+
+    def test_purge_fault_boundaries_restore_wal_database_and_release_lock(self):
+        for phase in admin_cli.PURGE_FAILURE_PHASES:
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                db = root / "metrics.sqlite3"
+                lock = root / "run/collector.lock"
+                conn = init_db(str(db))
+                conn.execute(
+                    "INSERT INTO events(ts,severity,code,message,details_json) "
+                    "VALUES(1,'info','canary','canary','{}')"
+                )
+                conn.close()
+                with self.assertRaises(OSError):
+                    admin_cli.purge_history(
+                        str(db), fail_phase=phase, lock_path=lock
+                    )
+                self.assertTrue(db.is_file())
+                reader = sqlite3.connect(db)
+                self.assertEqual(
+                    [("canary",)], reader.execute("SELECT code FROM events").fetchall()
+                )
+                self.assertEqual(
+                    SCHEMA_VERSION,
+                    reader.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0],
+                )
+                reader.close()
+                with RuntimeLock(lock):
+                    pass
+                self.assertEqual([], list(root.glob(f".{db.name}.*")))
+
+    def test_purge_refuses_busy_real_wal_with_concurrent_reader(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            db = root / "metrics.sqlite3"
+            writer = init_db(str(db))
+            writer.execute(
+                "INSERT INTO events(ts,severity,code,message,details_json) "
+                "VALUES(1,'info','base','base','{}')"
+            )
+            reader = sqlite3.connect(f"file:{db}?mode=ro", uri=True, isolation_level=None)
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM events").fetchone()
+            writer.execute(
+                "INSERT INTO events(ts,severity,code,message,details_json) "
+                "VALUES(2,'info','wal','wal','{}')"
+            )
+            self.assertGreater(Path(str(db) + "-wal").stat().st_size, 0)
+            with self.assertRaises(admin_cli.AdminUnsafeError):
+                admin_cli.purge_history(str(db), lock_path=root / "collector.lock")
+            reader.close()
+            writer.close()
+            check = sqlite3.connect(db)
+            self.assertEqual(
+                [("base",), ("wal",)],
+                check.execute("SELECT code FROM events ORDER BY event_id").fetchall(),
+            )
+            check.close()
+
+
+class RuntimeLockTests(unittest.TestCase):
+    def test_lock_rejects_symlink_file_and_parent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            target = root / "target.lock"
+            target.write_text("unchanged\n", encoding="ascii")
+            lock_path = root / "collector.lock"
+            lock_path.symlink_to(target)
+            with self.assertRaises(RuntimeLockError):
+                RuntimeLock(lock_path).acquire()
+            self.assertEqual("unchanged\n", target.read_text(encoding="ascii"))
+
+            target_dir = root / "real-run"
+            target_dir.mkdir()
+            linked_dir = root / "linked-run"
+            linked_dir.symlink_to(target_dir, target_is_directory=True)
+            with self.assertRaises(RuntimeLockError):
+                RuntimeLock(linked_dir / "collector.lock").acquire()
+            self.assertFalse((target_dir / "collector.lock").exists())
+
+    def test_stale_lock_file_is_private_and_reusable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lock_path = Path(temp).resolve() / "run/collector.lock"
+            lock_path.parent.mkdir()
+            lock_path.write_text("stale\n", encoding="ascii")
+            with RuntimeLock(lock_path):
+                self.assertEqual(0o600, stat.S_IMODE(lock_path.stat().st_mode))
+                with self.assertRaises(RuntimeLockError):
+                    RuntimeLock(lock_path).acquire()
+            with RuntimeLock(lock_path):
+                pass
+
+    def test_daemon_and_one_shot_share_the_same_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            lock_path = root / "collector.lock"
+            db = root / "metrics.sqlite3"
+
+            def daemon(*_args, **_kwargs):
+                with self.assertRaises(RuntimeLockError):
+                    RuntimeLock(lock_path).acquire()
+                return 0
+
+            with mock.patch.object(gost_monitoring, "run_daemon", side_effect=daemon):
+                self.assertEqual(
+                    0,
+                    gost_monitoring.main(
+                        [
+                            "--policy", "generic", "--lock-path", str(lock_path),
+                            "--daemon", "--db", str(db), "--env-dir", str(root),
+                        ]
+                    ),
+                )
+            with RuntimeLock(lock_path):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = gost_monitoring.main(
+                        [
+                            "--policy", "generic", "--lock-path", str(lock_path),
+                            "--once", "--db", str(db), "--env-dir", str(root),
+                        ]
+                    )
+                self.assertEqual(4, result)
+                self.assertIn("busy", stderr.getvalue())
+
+    def test_lock_released_after_collector_exception(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            lock_path = root / "collector.lock"
+            args = [
+                "--policy", "generic", "--lock-path", str(lock_path),
+                "--once", "--db", str(root / "metrics.sqlite3"),
+                "--env-dir", str(root),
+            ]
+            with mock.patch.object(gost_monitoring, "migrate_database"), mock.patch.object(
+                gost_monitoring, "collect_once", side_effect=RuntimeError("boom")
+            ):
+                self.assertEqual(1, gost_monitoring.main(args))
+            with RuntimeLock(lock_path):
+                pass
+
+    def test_process_sigterm_releases_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lock_path = Path(temp).resolve() / "collector.lock"
+            script = (
+                "import time\n"
+                "from monitoring.runtime_lock import RuntimeLock\n"
+                f"with RuntimeLock({str(lock_path)!r}):\n"
+                " print('ready', flush=True)\n"
+                " time.sleep(60)\n"
+            )
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(ROOT)
+            process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual("ready", process.stdout.readline().strip())
+            process.terminate()
+            process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+            with RuntimeLock(lock_path):
+                pass
+
+    def test_purge_cli_refuses_active_collector_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            db = root / "metrics.sqlite3"
+            lock_path = root / "collector.lock"
+            init_db(str(db)).close()
+            with RuntimeLock(lock_path):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = admin_cli.main(
+                        [
+                            "--policy", "generic", "--lock-path", str(lock_path),
+                            "purge-history", "--yes", "--db", str(db),
+                        ]
+                    )
+                self.assertEqual(4, result)
+                self.assertIn("busy", stderr.getvalue())
 
 
 class PackagingContractTests(unittest.TestCase):
@@ -313,6 +607,7 @@ class PackagingContractTests(unittest.TestCase):
             "After=local-fs.target", "Restart=on-failure", "StartLimitBurst=5",
             "Nice=10", "IOSchedulingClass=idle", "OOMScoreAdjust=500",
             "UMask=0077", "LimitNOFILE=65536", "StateDirectoryMode=0700",
+            "RuntimeDirectory=gost-manager", "RuntimeDirectoryMode=0700",
             "ProtectSystem=strict", "ReadWritePaths=/var/lib/gost-manager",
         ):
             self.assertIn(required, unit)
@@ -349,9 +644,58 @@ class PackagingContractTests(unittest.TestCase):
                     lines = log.read_text(encoding="utf-8").splitlines()
                     self.assertEqual("PYTHONPATH=/usr/local/lib/gost-manager", lines[0])
                     self.assertEqual(["-m", module], lines[1:3])
+                    self.assertEqual(["--policy", "installed"], lines[3:5])
                     self.assertEqual(["argument with spaces", "--flag"], lines[-2:])
                     if launcher != "gost-monitor-admin":
                         self.assertIn("--config", lines)
+
+    def test_installed_launchers_reject_policy_and_lock_overrides(self):
+        cases = {
+            "gost-monitor": (
+                ["--policy", "generic"],
+                ["--path-root=/tmp"],
+            ),
+            "gost-monitor-collector": (
+                ["--policy=generic"],
+                ["--path-root", "/tmp"],
+                ["--lock-path=/tmp/collector.lock"],
+            ),
+            "gost-monitor-admin": (
+                ["--policy", "generic"],
+                ["--path-root=/tmp"],
+                ["--lock-path", "/tmp/collector.lock"],
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            called = root / "python-called"
+            python = bin_dir / "python3"
+            python.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"${PYTHON_CALLED}\"\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            environment["PYTHON_CALLED"] = str(called)
+
+            for launcher, argument_sets in cases.items():
+                for arguments in argument_sets:
+                    with self.subTest(launcher=launcher, arguments=arguments):
+                        called.unlink(missing_ok=True)
+                        result = subprocess.run(
+                            [str(PACKAGING / launcher), *arguments],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            env=environment,
+                        )
+                        self.assertEqual(2, result.returncode)
+                        self.assertIn("cannot be overridden", result.stderr)
+                        self.assertFalse(called.exists())
 
 
 if __name__ == "__main__":

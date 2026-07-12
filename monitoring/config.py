@@ -14,6 +14,11 @@ from monitoring.schema import DEFAULT_DB_PATH, DEFAULT_SAMPLE_INTERVAL_SECONDS
 
 
 DEFAULT_CONFIG_PATH = "/etc/gost-manager/monitoring.env"
+GENERIC_POLICY = "generic"
+INSTALLED_POLICY = "installed"
+CONFIG_POLICIES = (GENERIC_POLICY, INSTALLED_POLICY)
+INSTALLED_STATE_DIR = "/var/lib/gost-manager"
+INSTALLED_ENV_DIR = "/etc/gost"
 KEY_DB = "GOST_MONITOR_DB"
 KEY_ENV_DIR = "GOST_ENV_DIR"
 KEY_SAMPLE = "GOST_MONITOR_SAMPLE_INTERVAL"
@@ -85,6 +90,85 @@ def _validate_path(value: str, label: str) -> str:
     if not os.path.isabs(value) or normalized != value:
         raise ConfigError(f"{label} must be normalized and absolute")
     return value
+
+
+def _path_under(path: str, parent: str, *, allow_parent: bool) -> bool:
+    candidate = Path(path)
+    base = Path(parent)
+    if candidate == base:
+        return allow_parent
+    return base in candidate.parents
+
+
+def rooted_path(path: str, root: str | Path | None = None) -> Path:
+    """Map a validated production path below a temporary installation root."""
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise ConfigError("installed path must be absolute")
+    if root is None or str(root) == "":
+        return candidate
+    boundary = Path(root)
+    if not boundary.is_absolute() or boundary.is_symlink():
+        raise ConfigError("installed path root must be a real absolute directory")
+    return boundary.joinpath(*candidate.parts[1:])
+
+
+def _reject_symlink_components(path: Path, *, boundary: Path | None = None) -> None:
+    if boundary is None:
+        current = Path(path.anchor)
+        parts = path.parts[1:]
+    else:
+        current = boundary
+        try:
+            parts = path.relative_to(boundary).parts
+        except ValueError as exc:
+            raise ConfigError("installed path escaped its validation root") from exc
+    if current.is_symlink():
+        raise ConfigError(f"installed path traverses a symlink: {current}")
+    for part in parts:
+        current /= part
+        if current.is_symlink():
+            raise ConfigError(f"installed path traverses a symlink: {current}")
+
+
+def validate_installed_config(
+    config: MonitoringConfig,
+    *,
+    root: str | Path | None = None,
+) -> MonitoringConfig:
+    """Apply the narrower path policy used by the installed v0.2 service."""
+    if not _path_under(config.db_path, INSTALLED_STATE_DIR, allow_parent=False):
+        raise ConfigError(
+            f"{KEY_DB} must be a file below {INSTALLED_STATE_DIR}; "
+            "move the database into the managed state directory"
+        )
+    if not _path_under(config.env_dir, INSTALLED_ENV_DIR, allow_parent=True):
+        raise ConfigError(
+            f"{KEY_ENV_DIR} must be {INSTALLED_ENV_DIR} or a directory below it"
+        )
+    boundary = Path(root) if root is not None and str(root) else None
+    db_path = rooted_path(config.db_path, root)
+    env_path = rooted_path(config.env_dir, root)
+    _reject_symlink_components(db_path, boundary=boundary)
+    _reject_symlink_components(env_path, boundary=boundary)
+    if db_path.exists() and not db_path.is_file():
+        raise ConfigError(f"{KEY_DB} must identify a regular database file")
+    if env_path.exists() and not env_path.is_dir():
+        raise ConfigError(f"{KEY_ENV_DIR} must identify a directory")
+    return config
+
+
+def apply_config_policy(
+    config: MonitoringConfig,
+    *,
+    policy: str = GENERIC_POLICY,
+    root: str | Path | None = None,
+) -> MonitoringConfig:
+    if policy == GENERIC_POLICY:
+        return config
+    if policy == INSTALLED_POLICY:
+        return validate_installed_config(config, root=root)
+    raise ConfigError(f"unknown monitoring config policy: {policy}")
 
 
 def _validate_interval(key: str, value: str) -> int:
@@ -160,7 +244,12 @@ def parse_config_text(text: str) -> MonitoringConfig:
     return config_from_mapping(values, require_all=True)
 
 
-def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> MonitoringConfig:
+def load_config(
+    path: str | Path = DEFAULT_CONFIG_PATH,
+    *,
+    policy: str = GENERIC_POLICY,
+    root: str | Path | None = None,
+) -> MonitoringConfig:
     config_path = Path(path)
     if config_path.is_symlink():
         raise ConfigError("monitoring config path may not be a symlink")
@@ -168,7 +257,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> MonitoringConfig:
         raw = config_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ConfigError(f"cannot read monitoring config: {exc.__class__.__name__}") from exc
-    return parse_config_text(raw)
+    return apply_config_policy(parse_config_text(raw), policy=policy, root=root)
 
 
 def config_from_environment(environment: Mapping[str, str] | None = None) -> MonitoringConfig:

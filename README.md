@@ -36,6 +36,8 @@ The installer copies:
 
 The monitoring collector is enabled and started on a fresh install. Upgrades preserve a valid operator-modified monitoring config, monitoring history, and the collector's enabled/active state. Existing `/etc/gost/iran-*.env`, `/etc/gost/kharej-*.env`, tunnel units, and traffic service state are not changed.
 
+The installer copies only modules listed in `packaging/monitoring-runtime-manifest.txt`. Existing shared `/usr/local/sbin` and `/etc/systemd/system` metadata is preserved, as is existing `/etc/gost` ownership, mode, content, and file metadata. Private manager directories are enforced and their prior metadata is restored if a later installation phase fails.
+
 Direct run also works:
 
 ```bash
@@ -195,7 +197,16 @@ GOST_MONITOR_MAINTENANCE_INTERVAL=900
 
 Bounds are sample 5..60 seconds; TCP 10..300 and not below sample; slow 30..900 and not below sample; maintenance 300..86400 and not below slow. The file is parsed as strict `KEY=VALUE` data and is never sourced or executed. Unknown/duplicate keys, relative paths, shell substitutions, unsafe quoting, and invalid cadence combinations are rejected before collection starts.
 
-Default retention is 48 hours of raw points, 30 days of minute rollups, and 30 days of structured events. Reserve at least 12 GiB for the representative one-NGINX-plus-six-GOST profile. `gost-monitor-admin maintenance` runs rollup/retention in one transaction and checkpoints after commit. Monitoring menu history deletion requires the exact phrase `DELETE MONITORING HISTORY`, stops only the collector when needed, atomically replaces the database, and restores the collector only when it was previously active. It does not touch traffic or `/etc/gost`.
+The generic parser used by library tests accepts safe absolute paths. The installed service has a narrower policy: `GOST_MONITOR_DB` must name a file below `/var/lib/gost-manager` and `GOST_ENV_DIR` must be `/etc/gost` or a descendant. Alternate names such as `/var/lib/gost-manager/custom.sqlite3` and nested paths such as `/var/lib/gost-manager/archive/current.sqlite3` are supported; `/srv`, `/root`, `/tmp`, prefix lookalikes, and symlink traversal are rejected. Inspect only the validated non-secret fields with:
+
+```bash
+gost-monitor-admin config --format json
+gost-monitor-admin config --format value --field database_path
+```
+
+Default retention is 48 hours of raw points, 30 days of minute rollups, and 30 days of structured events. Reserve at least 12 GiB for the representative one-NGINX-plus-six-GOST profile. `gost-monitor-admin maintenance` runs rollup/retention in one transaction and checkpoints after commit.
+
+The daemon, one-shot collector, and destructive history purge share the private advisory lock `/run/gost-manager/collector.lock`. A second collector or a direct purge while collection is active returns exit code `4`. The manager asks before temporarily stopping an active collector for one-shot diagnostics and restores it after success, failure, or interrupt. History deletion requires the exact phrase `DELETE MONITORING HISTORY`, resolves and displays the configured database, checkpoints WAL, refuses a busy checkpoint, creates same-directory hard-link recovery anchors, performs one atomic canonical replacement, fsyncs durability boundaries, and restores the original DB and sidecars after an injected failure. It does not touch traffic or `/etc/gost`.
 
 The collector service has bounded restart behavior, low CPU/I/O priority, private state permissions, and no `Requires=`, `PartOf=`, `BindsTo=`, stop, restart, or reload relationship with NGINX or GOST tunnel services. Collector failure, corrupt history, maintenance failure, or monitoring removal cannot stop Direct Mode traffic.
 
@@ -206,6 +217,14 @@ Option `11`, `Native GOST Gateway (Coming soon)`, only prints a message and retu
 Run `sudo bash uninstall.sh`. Every component defaults to No and is confirmed independently: manager CLI, monitoring service, monitoring code, monitoring config, monitoring history, managed traffic services, `/etc/gost` credentials/backups, and the GOST binary. A final plan is shown before changes.
 
 Removing monitoring only leaves tunnel units, active traffic, runners, `/etc/gost`, the GOST binary, firewall state, and NGINX unchanged. History and config are separate choices. Monitoring code cannot be removed while its service remains; runners are retained while managed traffic units remain. If history/config are retained, a later `sudo bash install.sh` restores the monitoring code and validates/migrates the retained database.
+
+Removal decisions are rechecked against actual post-action state. If any exact managed traffic unit survives, both runners, `/etc/gost`, and `/usr/local/bin/gost` are preserved even when deletion was selected. If the collector is active, enabled, or loaded despite a missing unit file, removal still attempts to stop/disable it; a failure preserves monitoring code, launchers, config, and history. History removal uses the configured DB captured before optional config deletion and never guesses the default path.
+
+## Linux systemd verification
+
+`tests/test-systemd-linux.sh` uses the host's real `systemd-analyze verify` environment and temporary executable/config paths; it does not use an incomplete synthetic `--root`. It skips only off Linux or when the real binary is unavailable. `.github/workflows/monitoring-integration.yml` runs `make check`, the temporary-root installer, and real systemd verification on Ubuntu 22.04 and 24.04.
+
+If installer service-state rollback cannot be verified, it retains collision-resistant backup directories and prints exact `rm`, `cp -a`, `systemctl daemon-reload`, enable/disable, start/stop, and status commands for restoring the recorded collector state. Do not delete those backups until the printed status check succeeds.
 
 ## Firewall Notes
 

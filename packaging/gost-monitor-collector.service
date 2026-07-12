@@ -32,6 +32,8 @@ RestrictSUIDSGID=true
 LockPersonality=true
 StateDirectory=gost-manager
 StateDirectoryMode=0700
+RuntimeDirectory=gost-manager
+RuntimeDirectoryMode=0700
 ReadWritePaths=/var/lib/gost-manager
 
 [Install]

@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Corrected final monitoring integration blockers with host-based Linux systemd verification, installed-path policy and configured DB resolution, collector/admin locking, crash-safe WAL-aware purge, exact runtime manifest and package mapping, metadata-safe installation rollback, and post-failure dependency rechecks in uninstall.
 - Integrated the local monitoring package with strict configuration, hardened isolated systemd service, atomic install/upgrade rollback, operator menu workflows, admin maintenance/history purge, and dependency-aware safe uninstall while preserving Direct Mode traffic.
 - Enforced metric semantics in minute/auto exports, made health incidents recovery-aware and current-membership scoped, surfaced malformed managed env sources safely, bounded compact interface membership, and added strict watermark validation plus a one-million-row streaming scan ceiling.
 - Made monitoring queries rollup-watermark aware, preserved lagging raw tails with bounded streaming, limited current health to active collector membership, made health events direction/overflow aware, corrected unavailable rollup weighting, and centralized metric statistics semantics.

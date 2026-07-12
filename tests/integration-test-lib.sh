@@ -62,9 +62,38 @@ mode_of() {
   stat -f '%Lp' "${path}" 2>/dev/null || stat -c '%a' "${path}"
 }
 
+owner_of() {
+  local path="$1"
+  stat -f '%u:%g' "${path}" 2>/dev/null || stat -c '%u:%g' "${path}"
+}
+
 tree_digest() {
   local root="$1"
-  find "${root}" -type f -print -exec cksum {} \; | LC_ALL=C sort | cksum | awk '{print $1":"$2}'
+  filesystem_manifest "${root}" | cksum | awk '{print $1":"$2}'
+}
+
+filesystem_manifest() {
+  local root="$1"
+  local path relative mode owner kind detail
+  while IFS= read -r -d '' path; do
+    relative="${path#"${root}"}"
+    [[ -n "${relative}" ]] || relative="/"
+    mode="$(mode_of "${path}")"
+    owner="$(owner_of "${path}")"
+    detail=""
+    if [[ -L "${path}" ]]; then
+      kind="symlink"
+      detail="$(readlink "${path}")"
+    elif [[ -d "${path}" ]]; then
+      kind="directory"
+    elif [[ -f "${path}" ]]; then
+      kind="file"
+      detail="$(cksum "${path}" | awk '{print $1":"$2}')"
+    else
+      kind="other"
+    fi
+    printf '%s|%s|%s|%s|%s\n' "${kind}" "${mode}" "${owner}" "${relative}" "${detail}"
+  done < <(find "${root}" -print0) | LC_ALL=C sort
 }
 
 make_command_stubs() {
@@ -76,27 +105,80 @@ set -Eeuo pipefail
 printf 'systemctl' >> "${COMMAND_LOG}"
 printf ' %q' "$@" >> "${COMMAND_LOG}"
 printf '\n' >> "${COMMAND_LOG}"
-action="${1:-}"
-if [[ "${STUB_FAIL_SYSTEMCTL_ACTION:-}" == "${action}" ]]; then
+action=""
+unit=""
+result=0
+for argument in "$@"; do
+  if [[ -z "${action}" ]]; then
+    [[ "${argument}" == -* ]] && continue
+    action="${argument}"
+    continue
+  fi
+  [[ "${argument}" == -* ]] && continue
+  unit="${argument}"
+  break
+done
+if [[ "${STUB_REMOVE_UNIT_BEFORE_DISABLE:-0}" == "1" && "${action}" == "disable" && -n "${STUB_UNIT_PATH:-}" ]]; then
+  rm -f "${STUB_UNIT_PATH}"
+fi
+if [[ "${STUB_FAIL_SYSTEMCTL_ACTION:-}" == "${action}" && ( -z "${STUB_FAIL_SYSTEMCTL_UNIT:-}" || "${STUB_FAIL_SYSTEMCTL_UNIT}" == "${unit}" ) ]]; then
   exit 1
 fi
 case "${action}" in
-  is-enabled) [[ -f "${STUB_STATE_DIR}/enabled" ]] ;;
-  is-active) [[ -f "${STUB_STATE_DIR}/active" ]] ;;
+  is-enabled)
+    if [[ "${unit}" != "gost-monitor-collector.service" || ! -f "${STUB_STATE_DIR}/enabled" ]]; then
+      result=1
+    fi
+    ;;
+  is-active)
+    if [[ "${unit}" != "gost-monitor-collector.service" || ! -f "${STUB_STATE_DIR}/active" ]]; then
+      result=1
+    fi
+    ;;
   enable)
-    touch "${STUB_STATE_DIR}/enabled"
-    [[ " ${*} " == *" --now "* ]] && touch "${STUB_STATE_DIR}/active"
+    if [[ "${unit}" == "gost-monitor-collector.service" ]]; then
+      touch "${STUB_STATE_DIR}/enabled"
+      mkdir -p "${STUB_STATE_DIR}/wants"
+      ln -sfn "${STUB_UNIT_PATH:-${unit}}" "${STUB_STATE_DIR}/wants/${unit}"
+      if [[ " ${*} " == *" --now "* ]]; then
+        touch "${STUB_STATE_DIR}/active"
+      fi
+    fi
     ;;
   disable)
-    rm -f "${STUB_STATE_DIR}/enabled"
-    [[ " ${*} " == *" --now "* ]] && rm -f "${STUB_STATE_DIR}/active"
+    if [[ "${unit}" == "gost-monitor-collector.service" ]]; then
+      rm -f "${STUB_STATE_DIR}/enabled"
+      rm -f "${STUB_STATE_DIR}/wants/${unit}"
+      if [[ " ${*} " == *" --now "* ]]; then
+        rm -f "${STUB_STATE_DIR}/active"
+      fi
+    fi
     ;;
-  start|restart) touch "${STUB_STATE_DIR}/active" ;;
-  stop) rm -f "${STUB_STATE_DIR}/active" ;;
-  status) [[ -f "${STUB_STATE_DIR}/active" ]] ;;
+  start|restart)
+    [[ "${unit}" != "gost-monitor-collector.service" ]] || touch "${STUB_STATE_DIR}/active"
+    ;;
+  stop)
+    [[ "${unit}" != "gost-monitor-collector.service" ]] || rm -f "${STUB_STATE_DIR}/active"
+    ;;
+  status)
+    if [[ "${unit}" != "gost-monitor-collector.service" || ! -f "${STUB_STATE_DIR}/active" ]]; then
+      result=1
+    fi
+    ;;
   daemon-reload) ;;
+  show)
+    if [[ "${unit}" == "gost-monitor-collector.service" && ( "${STUB_FORCE_MONITOR_LOADED:-0}" == "1" || -e "${STUB_UNIT_PATH:-/nonexistent}" || -f "${STUB_STATE_DIR}/active" || -f "${STUB_STATE_DIR}/enabled" ) ]]; then
+      printf 'loaded\n'
+    else
+      printf 'not-found\n'
+    fi
+    ;;
   *) ;;
 esac
+if [[ "${STUB_FAIL_SYSTEMCTL_AFTER_ACTION:-}" == "${action}" && ( -z "${STUB_FAIL_SYSTEMCTL_AFTER_UNIT:-}" || "${STUB_FAIL_SYSTEMCTL_AFTER_UNIT}" == "${unit}" ) ]]; then
+  exit 1
+fi
+exit "${result}"
 STUB
   cat > "${bin_dir}/ss" <<'STUB'
 #!/usr/bin/env bash
