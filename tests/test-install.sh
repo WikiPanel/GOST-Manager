@@ -38,8 +38,10 @@ create_source_fixture() {
   local destination="$1"
   mkdir -p "${destination}/lib" "${destination}/packaging"
   cp "${ROOT_DIR}/gost-manager.sh" "${destination}/gost-manager.sh"
-  cp "${ROOT_DIR}/lib/gost-run-iran.sh" "${ROOT_DIR}/lib/gost-run-kharej.sh" "${destination}/lib/"
+  cp "${ROOT_DIR}/lib/gost-run-iran.sh" "${ROOT_DIR}/lib/gost-run-kharej.sh" \
+    "${ROOT_DIR}/lib/gost-run-gateway-exit.sh" "${destination}/lib/"
   cp -R "${ROOT_DIR}/monitoring" "${destination}/monitoring"
+  cp -R "${ROOT_DIR}/gateway" "${destination}/gateway"
   cp "${ROOT_DIR}"/packaging/* "${destination}/packaging/"
 }
 
@@ -59,6 +61,18 @@ assert_file "fresh query launcher installed" "${fresh_root}/usr/local/sbin/gost-
 assert_file "fresh collector launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor-collector"
 assert_file "fresh admin launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor-admin"
 assert_file "complete package includes init" "${fresh_root}/usr/local/lib/gost-manager/monitoring/__init__.py"
+assert_file "fresh gateway launcher installed" "${fresh_root}/usr/local/sbin/gost-gateway"
+assert_file "fresh gateway runtime launcher installed" "${fresh_root}/usr/local/sbin/gost-gateway-runtime"
+assert_file "fresh gateway package installed" "${fresh_root}/usr/local/lib/gost-manager/gateway/runtime_cli.py"
+assert_file "fresh gateway runner installed" "${fresh_root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh"
+assert_dir "fresh gateway secret directory created" "${fresh_root}/etc/gost-manager/secrets"
+assert_dir "fresh gateway generated directory created" "${fresh_root}/etc/gost-manager/generated/gateway/exits"
+assert_dir "fresh gateway runtime backup directory created" "${fresh_root}/etc/gost-manager/backups/gateway-runtime"
+assert_absent "installer does not initialize gateway state" "${fresh_root}/etc/gost-manager/state.json"
+assert_absent "installer does not initialize node state" "${fresh_root}/etc/gost-manager/node.json"
+assert_absent "installer does not create runtime manifest" "${fresh_root}/etc/gost-manager/generated/gateway/runtime.json"
+assert_eq "gateway secret directory mode" "700" "$(mode_of "${fresh_root}/etc/gost-manager/secrets")"
+assert_eq "gateway runner mode" "755" "$(mode_of "${fresh_root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh")"
 assert_file "fresh default config installed" "${fresh_root}/etc/gost-manager/monitoring.env"
 assert_file "fresh systemd unit installed" "${fresh_root}/etc/systemd/system/gost-monitor-collector.service"
 assert_file "fresh schema migrated" "${fresh_root}/var/lib/gost-manager/metrics.sqlite3"
@@ -73,6 +87,7 @@ assert_contains "fresh collector started" "systemctl start gost-monitor-collecto
 assert_not_contains "fresh install never targets Iran traffic" "gost-iran-" "${COMMAND_LOG}"
 assert_not_contains "fresh install never targets Kharej traffic" "gost-kharej-" "${COMMAND_LOG}"
 assert_not_contains "fresh install never targets NGINX" "nginx" "${COMMAND_LOG}"
+assert_not_contains "fresh install starts no gateway Exit" "gost-gateway-exit-" "${COMMAND_LOG}"
 
 launcher_bin="${TEST_HOME}/launcher-bin"
 launcher_log="${TEST_HOME}/launcher.log"
@@ -196,7 +211,9 @@ assert_not_contains "inactive collector is not started" "systemctl start gost-mo
 touch "${STUB_STATE_DIR}/active"
 
 printf 'previous-manager-content\n' > "${fresh_root}/usr/local/sbin/gost-manager"
+printf 'previous-gateway-package\n' > "${fresh_root}/usr/local/lib/gost-manager/gateway/runtime_cli.py"
 rollback_before="$(cksum "${fresh_root}/usr/local/sbin/gost-manager")"
+gateway_rollback_before="$(cksum "${fresh_root}/usr/local/lib/gost-manager/gateway/runtime_cli.py")"
 : > "${COMMAND_LOG}"
 if GOST_MANAGER_FAIL_PHASE=daemon_reload run_installer "${fresh_root}" >/dev/null 2>&1; then
   fail "injected failed upgrade returns failure"
@@ -204,6 +221,7 @@ else
   pass "injected failed upgrade returns failure"
 fi
 assert_eq "rollback restores previous manager" "${rollback_before}" "$(cksum "${fresh_root}/usr/local/sbin/gost-manager")"
+assert_eq "rollback restores previous gateway package" "${gateway_rollback_before}" "$(cksum "${fresh_root}/usr/local/lib/gost-manager/gateway/runtime_cli.py")"
 assert_eq "rollback preserves custom config" "${custom_before}" "$(cksum "${custom_config}")"
 assert_not_contains "rollback never targets traffic" "gost-iran-" "${COMMAND_LOG}"
 
@@ -464,6 +482,44 @@ mkdir -p "${manifest_extra_root}"
 rm -f "${STUB_STATE_DIR}/enabled" "${STUB_STATE_DIR}/active"
 GOST_MANAGER_SOURCE_ROOT_TEST="${manifest_extra_source}" run_installer "${manifest_extra_root}" >/dev/null
 assert_absent "unlisted extra Python module is not installed" "${manifest_extra_root}/usr/local/lib/gost-manager/monitoring/unlisted_extra.py"
+
+gateway_manifest_missing_source="${TEST_HOME}/gateway-source-missing"
+create_source_fixture "${gateway_manifest_missing_source}"
+rm -f "${gateway_manifest_missing_source}/gateway/runtime_apply.py"
+gateway_manifest_missing_root="${TEST_HOME}/gateway-manifest-missing-root"
+mkdir -p "${gateway_manifest_missing_root}"
+gateway_manifest_missing_before="$(tree_digest "${gateway_manifest_missing_root}")"
+if GOST_MANAGER_SOURCE_ROOT_TEST="${gateway_manifest_missing_source}" run_installer "${gateway_manifest_missing_root}" >/dev/null 2>&1; then
+  fail "missing gateway manifest module fails before mutation"
+else
+  pass "missing gateway manifest module fails before mutation"
+fi
+assert_eq "missing gateway module leaves root unchanged" "${gateway_manifest_missing_before}" "$(tree_digest "${gateway_manifest_missing_root}")"
+
+gateway_manifest_duplicate_source="${TEST_HOME}/gateway-source-duplicate"
+create_source_fixture "${gateway_manifest_duplicate_source}"
+printf 'gateway/runtime_apply.py\n' >> "${gateway_manifest_duplicate_source}/packaging/gateway-runtime-manifest.txt"
+gateway_manifest_duplicate_root="${TEST_HOME}/gateway-manifest-duplicate-root"
+mkdir -p "${gateway_manifest_duplicate_root}"
+if GOST_MANAGER_SOURCE_ROOT_TEST="${gateway_manifest_duplicate_source}" run_installer "${gateway_manifest_duplicate_root}" >/dev/null 2>&1; then
+  fail "duplicate gateway manifest entry rejected"
+else
+  pass "duplicate gateway manifest entry rejected"
+fi
+
+gateway_manifest_symlink_source="${TEST_HOME}/gateway-source-symlink"
+create_source_fixture "${gateway_manifest_symlink_source}"
+printf 'external-gateway-canary\n' > "${TEST_HOME}/external-gateway.py"
+rm -f "${gateway_manifest_symlink_source}/gateway/runtime_cli.py"
+ln -s "${TEST_HOME}/external-gateway.py" "${gateway_manifest_symlink_source}/gateway/runtime_cli.py"
+gateway_manifest_symlink_root="${TEST_HOME}/gateway-manifest-symlink-root"
+mkdir -p "${gateway_manifest_symlink_root}"
+if GOST_MANAGER_SOURCE_ROOT_TEST="${gateway_manifest_symlink_source}" run_installer "${gateway_manifest_symlink_root}" >/dev/null 2>&1; then
+  fail "symlinked gateway runtime module rejected"
+else
+  pass "symlinked gateway runtime module rejected"
+fi
+assert_absent "external gateway symlink content never installed" "${gateway_manifest_symlink_root}/usr/local/lib/gost-manager/gateway/runtime_cli.py"
 
 missing_root="${TEST_HOME}/missing"
 mkdir -p "${missing_root}"

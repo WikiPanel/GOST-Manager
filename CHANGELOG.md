@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Added independent loopback-only GOST Gateway Exit services, strict private secret storage, non-secret runtime rendering, ownership-aware plan/apply, atomic service-state rollback, exact service control, and dependency-safe install/uninstall integration without enabling NGINX or firewall runtime.
 - Added strict versioned Gateway shared/node desired state, safe state-only CRUD, revision control, atomic writes, bounded backups, runtime-readiness validation, and Direct Mode isolation tests without changing traffic runtime.
 - Reset the operator experience to Monitoring Lite with 10/30/60/900-second cadences, 6-hour raw and 24-hour rollup/event retention, a compact seven-item menu, retained Advanced tools, a sub-1-GiB capacity model, and a deterministic 1,000-user performance fixture.
 - Corrected final monitoring integration blockers with host-based Linux systemd verification, installed-path policy and configured DB resolution, collector/admin locking, crash-safe WAL-aware purge, exact runtime manifest and package mapping, metadata-safe installation rollback, and post-failure dependency rechecks in uninstall.

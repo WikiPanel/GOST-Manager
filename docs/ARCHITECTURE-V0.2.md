@@ -216,6 +216,20 @@ route-estonia
 
 NGINX may perform passive failover for new handshakes when a local backend connection or handshake fails. An established TCP/WebSocket connection cannot migrate; clients must reconnect.
 
+## Local Exit runtime boundary
+
+Before NGINX route rendering, each enabled Exit Binding is activated as one
+independent `gost-gateway-exit-<exit-id>.service`. Its listener and target are
+both loopback-only. Credentials are private runtime inputs referenced by stable
+slug, while generated env, unit, and runtime manifest files remain non-secret
+and non-authoritative. State/runtime operations acquire the state lock before
+the runtime lock. Planning uses authoritative systemd `MainPID` ownership and a
+bounded listener snapshot; apply restarts only Exits whose effective runtime
+inputs changed and rolls back exact files plus enabled/active service states.
+
+The full contract is in `docs/GATEWAY-RUNTIME-V0.2.md`. This layer has no NGINX,
+firewall, route-rendering, failover-controller, or monitoring lifecycle hook.
+
 The manager must distinguish:
 
 - `active-active`: more than one normal upstream member;
@@ -249,8 +263,9 @@ Detailed metric definitions are in `docs/MONITORING-V0.2.md`.
 1. Foundation and repository guidance.
 2. Monitoring collector, database, live view, and historical summaries.
 3. Gateway state and route/tunnel CRUD.
-4. Atomic NGINX renderer, validation, reload, and rollback.
-5. Multiple Iran allowlist and firewall migration.
-6. Route-aware monitoring, import/export, synchronization helpers, HA hardening, and release documentation.
+4. Independent loopback GOST Exit runtime and private secrets.
+5. Atomic NGINX renderer, validation, reload, and rollback.
+6. Multiple Iran allowlist and firewall migration.
+7. Route-aware monitoring, import/export, synchronization helpers, HA hardening, and release documentation.
 
 Each milestone is delivered in a focused pull request with tests and a rollback plan.

@@ -20,6 +20,8 @@ class GatewayStateLock:
         timeout: float = 5.0,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        label: str = "gateway state",
+        marker: bytes = b"gateway-state\n",
     ) -> None:
         if timeout < 0 or timeout > 60:
             raise ValidationError("lock timeout must be from 0 through 60 seconds")
@@ -27,6 +29,8 @@ class GatewayStateLock:
         self.timeout = timeout
         self.monotonic = monotonic
         self.sleep = sleep
+        self.label = label
+        self.marker = marker
         self._descriptor: int | None = None
 
     def acquire(self) -> "GatewayStateLock":
@@ -39,11 +43,11 @@ class GatewayStateLock:
         try:
             descriptor = os.open(self.path, flags, 0o600)
         except OSError as exc:
-            raise OperationalError("gateway state lock file is unavailable") from exc
+            raise OperationalError(f"{self.label} lock file is unavailable") from exc
         try:
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode):
-                raise ValidationError("gateway state lock must be a regular file")
+                raise ValidationError(f"{self.label} lock must be a regular file")
             os.fchmod(descriptor, 0o600)
             deadline = self.monotonic() + self.timeout
             while True:
@@ -52,10 +56,10 @@ class GatewayStateLock:
                     break
                 except BlockingIOError:
                     if self.monotonic() >= deadline:
-                        raise ConflictError("gateway state lock is busy")
+                        raise ConflictError(f"{self.label} lock is busy")
                     self.sleep(min(0.05, max(0.0, deadline - self.monotonic())))
             os.ftruncate(descriptor, 0)
-            os.write(descriptor, b"gateway-state\n")
+            os.write(descriptor, self.marker)
             os.fsync(descriptor)
         except Exception:
             os.close(descriptor)
@@ -77,3 +81,16 @@ class GatewayStateLock:
 
     def __exit__(self, *_args: object) -> None:
         self.release()
+
+
+class GatewayRuntimeLock(GatewayStateLock):
+    """Separate lock for generated runtime and private-secret mutations."""
+
+    def __init__(self, path: str | Path, timeout: float = 5.0, **kwargs: object) -> None:
+        super().__init__(
+            path,
+            timeout=timeout,
+            label="gateway runtime",
+            marker=b"gateway-runtime\n",
+            **kwargs,
+        )
