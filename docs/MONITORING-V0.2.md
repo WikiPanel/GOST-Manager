@@ -28,7 +28,19 @@ python3 -m monitoring.query_cli
       └── bounded JSON/CSV export
 ```
 
-The collector and independent query CLI use Python 3 standard library only. Installer, systemd, and Bash-menu integration are intentionally deferred to issue #6.
+The collector, query CLI, strict config parser, and admin CLI use Python 3 standard library only. Issue #6 installs them as an independent local subsystem; monitoring is never a traffic runtime dependency.
+
+### Production integration
+
+The complete package is installed under `/usr/local/lib/gost-manager/monitoring`. Fixed launchers `/usr/local/sbin/gost-monitor`, `/usr/local/sbin/gost-monitor-collector`, and `/usr/local/sbin/gost-monitor-admin` set `PYTHONPATH=/usr/local/lib/gost-manager` and preserve arguments without `eval`. No module is copied to system site-packages and pip is not used.
+
+`/etc/gost-manager/monitoring.env` is root-owned mode `0600` and is parsed only as strict `KEY=VALUE` data. The allow-list is `GOST_MONITOR_DB`, `GOST_ENV_DIR`, `GOST_MONITOR_SAMPLE_INTERVAL` (5..60), `GOST_MONITOR_TCP_INTERVAL` (10..300 and at least sample), `GOST_MONITOR_SLOW_INTERVAL` (30..900 and at least sample), and `GOST_MONITOR_MAINTENANCE_INTERVAL` (300..86400 and at least slow). Unknown/duplicate/empty keys, relative or non-normalized paths, shell substitutions, unsafe quoting/whitespace, NULs, and invalid integers/cross-field cadence combinations are rejected before database mutation. A valid existing config is preserved on upgrade; an invalid existing config aborts activation without replacement.
+
+`gost-monitor-admin` provides `validate-config`, `migrate`, `status`, `maintenance`, and explicitly confirmed `purge-history`. Status is read-only. Maintenance commits rollup and all three retention policies before a separate WAL checkpoint. Purge creates and validates a private same-directory schema-v4 database, fsyncs and atomically replaces the old database, removes stale WAL/SHM, and restores the original on injected replacement failure.
+
+`gost-monitor-collector.service` uses `After=local-fs.target`, bounded `Restart=on-failure`, low CPU/I/O priority, `UMask=0077`, `StateDirectoryMode=0700`, `ProtectSystem=strict`, and a single write path `/var/lib/gost-manager`. It deliberately does not use traffic `Requires=`, `PartOf=`, `BindsTo=`, `PrivateNetwork`, hidden `/proc`, netlink-blocking address-family restrictions, or NGINX/GOST lifecycle hooks. Fresh install enables/starts it; upgrade preserves the prior collector enabled/active state. Rollback restores only manager/monitoring files and the prior collector state.
+
+Main-menu options 1 through 9 retain their labels and dispatch. Option 10 opens all monitoring query/export/admin workflows; errors and live exit 130 return to the menu. Option 11 is a filesystem/command-audited `Native GOST Gateway (Coming soon)` print-only no-op. Uninstall confirmations separate monitoring service, code, config, and history from traffic units, credentials, runners, and the GOST binary.
 
 ## Sampling and retention
 

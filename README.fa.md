@@ -21,6 +21,10 @@
 sudo gost-manager
 ```
 
+نصب‌کننده علاوه بر manager و runnerهای قبلی، کل پکیج مانیتورینگ را در `/usr/local/lib/gost-manager/monitoring`، سه launcher را در `/usr/local/sbin`، تنظیمات را در `/etc/gost-manager/monitoring.env`، unit را در `/etc/systemd/system/gost-monitor-collector.service` و تاریخچه را در `/var/lib/gost-manager/metrics.sqlite3` نصب می‌کند.
+
+در نصب تازه collector فعال و اجرا می‌شود. در ارتقا، config معتبر سفارشی، تاریخچه، و وضعیت enabled/active قبلی collector حفظ می‌شود. فایل‌های `/etc/gost/iran-*.env` و `/etc/gost/kharej-*.env`، unitهای تونل و وضعیت ترافیک بدون تغییر باقی می‌مانند.
+
 اجرای مستقیم هم ممکن است:
 
 ```bash
@@ -135,6 +139,57 @@ Available GOST tunnels:
 
 Select tunnel number:
 ```
+
+## مانیتورینگ محلی
+
+گزینه‌های جدید منوی اصلی بدون تغییر شماره‌های ۱ تا ۹ اضافه شده‌اند:
+
+```text
+10) Monitoring
+11) Native GOST Gateway (Coming soon)
+```
+
+زیرمنوی Monitoring شامل snapshot، داشبورد live، خلاصه‌های ۱۰ دقیقه، ۳۰ دقیقه، ۱ ساعت و بازه سفارشی، جزئیات host/network/service/tunnel/collector، eventها، خروجی JSON/CSV، کنترل collector، اجرای one-shot، maintenance و حذف صریح تاریخچه است. خطای مانیتورینگ از منو خارج نمی‌شود و هیچ سرویس ترافیکی را تغییر نمی‌دهد.
+
+دستورات مستقیم:
+
+```bash
+systemctl status gost-monitor-collector.service
+systemctl start gost-monitor-collector.service
+systemctl stop gost-monitor-collector.service
+systemctl restart gost-monitor-collector.service
+
+gost-monitor snapshot
+gost-monitor live
+gost-monitor summary --window 10m
+gost-monitor-admin status
+gost-monitor-admin maintenance
+```
+
+فایل تنظیمات با مالک `root:root` و mode برابر `0600` فقط کلیدهای زیر را می‌پذیرد:
+
+```text
+GOST_MONITOR_DB=/var/lib/gost-manager/metrics.sqlite3
+GOST_ENV_DIR=/etc/gost
+GOST_MONITOR_SAMPLE_INTERVAL=5
+GOST_MONITOR_TCP_INTERVAL=30
+GOST_MONITOR_SLOW_INTERVAL=60
+GOST_MONITOR_MAINTENANCE_INTERVAL=900
+```
+
+محدوده sample برابر ۵ تا ۶۰ ثانیه است؛ TCP برابر ۱۰ تا ۳۰۰ و حداقل sample؛ slow برابر ۳۰ تا ۹۰۰ و حداقل sample؛ maintenance برابر ۳۰۰ تا ۸۶۴۰۰ و حداقل slow. این فایل هرگز در Bash source یا اجرا نمی‌شود. کلید ناشناخته/تکراری، مسیر نسبی، substitution شل، quoting ناامن و cadence نامعتبر رد می‌شود.
+
+نگه‌داری پیش‌فرض شامل ۴۸ ساعت raw metric، سی روز minute rollup و سی روز event ساختاریافته است. برای پروفایل نمونه حداقل ۱۲ GiB فضا در نظر بگیرید. Maintenance در یک transaction انجام می‌شود و checkpoint بعد از commit است. حذف تاریخچه در منو نیازمند عبارت دقیق `DELETE MONITORING HISTORY` است، فقط collector را در صورت نیاز متوقف می‌کند، DB را اتمیک جایگزین می‌کند و فقط اگر collector قبلاً active بوده آن را دوباره اجرا می‌کند. ترافیک و `/etc/gost` دست‌نخورده می‌مانند.
+
+سرویس collector restart محدود، اولویت CPU/I/O پایین، UMask خصوصی و state mode برابر 0700 دارد و هیچ وابستگی یا hook توقف/restart/reload برای NGINX یا سرویس‌های GOST ندارد. خرابی collector، DB، maintenance یا حذف مانیتورینگ باعث توقف Direct Mode نمی‌شود.
+
+گزینه Native GOST Gateway فقط پیام `Coming soon` چاپ می‌کند و هیچ package، فایل، directory، service، database، firewall، NGINX یا GOST را تغییر نمی‌دهد.
+
+## حذف امن
+
+`sudo bash uninstall.sh` را اجرا کنید. حذف manager، سرویس مانیتورینگ، کد مانیتورینگ، config، history، سرویس‌های ترافیکی، credentialهای `/etc/gost` و باینری GOST هرکدام تأیید مستقل دارند و پیش‌فرض همه No است. قبل از اجرا plan نهایی نمایش داده می‌شود.
+
+حذف فقط مانیتورینگ، unitها و وضعیت فعال تونل‌ها، runnerها، `/etc/gost`، باینری GOST، firewall و NGINX را تغییر نمی‌دهد. config و history انتخاب‌های جدا هستند. تا وقتی collector service باقی است کد/config لازم حذف نمی‌شود و تا وقتی سرویس ترافیکی باقی است runnerها حفظ می‌شوند. اگر config/history را نگه دارید، اجرای دوباره `sudo bash install.sh` مانیتورینگ را بازیابی و DB را validate/migrate می‌کند.
 
 ## مشاهده لاگ
 

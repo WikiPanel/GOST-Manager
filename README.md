@@ -28,6 +28,13 @@ The installer copies:
 - `gost-manager.sh` to `/usr/local/sbin/gost-manager`
 - `lib/gost-run-iran.sh` to `/usr/local/lib/gost-manager/gost-run-iran.sh`
 - `lib/gost-run-kharej.sh` to `/usr/local/lib/gost-manager/gost-run-kharej.sh`
+- the complete monitoring package to `/usr/local/lib/gost-manager/monitoring`
+- `gost-monitor`, `gost-monitor-collector`, and `gost-monitor-admin` to `/usr/local/sbin`
+- `/etc/gost-manager/monitoring.env`
+- `/etc/systemd/system/gost-monitor-collector.service`
+- monitoring history to `/var/lib/gost-manager/metrics.sqlite3`
+
+The monitoring collector is enabled and started on a fresh install. Upgrades preserve a valid operator-modified monitoring config, monitoring history, and the collector's enabled/active state. Existing `/etc/gost/iran-*.env`, `/etc/gost/kharej-*.env`, tunnel units, and traffic service state are not changed.
 
 Direct run also works:
 
@@ -139,6 +146,8 @@ Use the menu:
 7) Restart tunnel
 8) List active GOST services
 9) Clean old/broken GOST configs
+10) Monitoring
+11) Native GOST Gateway (Coming soon)
 ```
 
 For delete, status, logs, and restart, the manager now shows a numbered tunnel selector. You no longer need to type `iran` or `kharej` manually.
@@ -153,6 +162,50 @@ Select tunnel number:
 ```
 
 Each numbered tunnel is independent. Deleting `iran-2` does not affect `iran-1`; deleting `kharej-2` does not affect `kharej-1`.
+
+## Local Monitoring
+
+Option `10` opens snapshot/live views, 10-minute/30-minute/1-hour/custom summaries, host/network/service/tunnel/collector details, events, JSON/CSV export, collector controls, one-shot diagnostics, maintenance, and explicit history deletion. Monitoring command failures return to the manager menu and never trigger traffic service actions.
+
+Direct commands are also available:
+
+```bash
+systemctl status gost-monitor-collector.service
+systemctl start gost-monitor-collector.service
+systemctl stop gost-monitor-collector.service
+systemctl restart gost-monitor-collector.service
+
+gost-monitor snapshot
+gost-monitor live
+gost-monitor summary --window 10m
+gost-monitor-admin status
+gost-monitor-admin maintenance
+```
+
+The strict root-owned mode-`0600` config contains only:
+
+```text
+GOST_MONITOR_DB=/var/lib/gost-manager/metrics.sqlite3
+GOST_ENV_DIR=/etc/gost
+GOST_MONITOR_SAMPLE_INTERVAL=5
+GOST_MONITOR_TCP_INTERVAL=30
+GOST_MONITOR_SLOW_INTERVAL=60
+GOST_MONITOR_MAINTENANCE_INTERVAL=900
+```
+
+Bounds are sample 5..60 seconds; TCP 10..300 and not below sample; slow 30..900 and not below sample; maintenance 300..86400 and not below slow. The file is parsed as strict `KEY=VALUE` data and is never sourced or executed. Unknown/duplicate keys, relative paths, shell substitutions, unsafe quoting, and invalid cadence combinations are rejected before collection starts.
+
+Default retention is 48 hours of raw points, 30 days of minute rollups, and 30 days of structured events. Reserve at least 12 GiB for the representative one-NGINX-plus-six-GOST profile. `gost-monitor-admin maintenance` runs rollup/retention in one transaction and checkpoints after commit. Monitoring menu history deletion requires the exact phrase `DELETE MONITORING HISTORY`, stops only the collector when needed, atomically replaces the database, and restores the collector only when it was previously active. It does not touch traffic or `/etc/gost`.
+
+The collector service has bounded restart behavior, low CPU/I/O priority, private state permissions, and no `Requires=`, `PartOf=`, `BindsTo=`, stop, restart, or reload relationship with NGINX or GOST tunnel services. Collector failure, corrupt history, maintenance failure, or monitoring removal cannot stop Direct Mode traffic.
+
+Option `11`, `Native GOST Gateway (Coming soon)`, only prints a message and returns. It performs no dependency, package, filesystem, service, database, firewall, NGINX, or GOST action.
+
+## Safe Uninstall
+
+Run `sudo bash uninstall.sh`. Every component defaults to No and is confirmed independently: manager CLI, monitoring service, monitoring code, monitoring config, monitoring history, managed traffic services, `/etc/gost` credentials/backups, and the GOST binary. A final plan is shown before changes.
+
+Removing monitoring only leaves tunnel units, active traffic, runners, `/etc/gost`, the GOST binary, firewall state, and NGINX unchanged. History and config are separate choices. Monitoring code cannot be removed while its service remains; runners are retained while managed traffic units remain. If history/config are retained, a later `sudo bash install.sh` restores the monitoring code and validates/migrates the retained database.
 
 ## Firewall Notes
 

@@ -35,8 +35,22 @@ iptables
 ## Run Shellcheck
 
 ```bash
-shellcheck -x -P SCRIPTDIR gost-manager.sh install.sh uninstall.sh lib/gost-run-iran.sh lib/gost-run-kharej.sh tests/run-tests.sh
+shellcheck -x -P SCRIPTDIR gost-manager.sh install.sh uninstall.sh \
+  lib/gost-run-iran.sh lib/gost-run-kharej.sh \
+  packaging/gost-monitor packaging/gost-monitor-admin packaging/gost-monitor-collector \
+  tests/run-tests.sh tests/integration-test-lib.sh tests/test-install.sh \
+  tests/test-menu.sh tests/test-uninstall.sh
 ```
+
+The temporary-root Issue #6 suites are:
+
+```bash
+bash tests/test-install.sh
+bash tests/test-menu.sh
+bash tests/test-uninstall.sh
+```
+
+They use command stubs and never write to the host's real `/etc`, `/usr/local`, `/var/lib`, systemd, packages, NGINX, firewall, or GOST services.
 
 Or:
 

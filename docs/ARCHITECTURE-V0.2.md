@@ -75,13 +75,14 @@ To avoid surprising existing users, the current menu numbers remain unchanged. N
 7) Restart tunnel
 8) List active GOST services
 9) Clean old/broken GOST configs
-10) NGINX Gateway Mode
+10) Monitoring
 11) Native GOST Gateway (Coming soon)
-12) Monitoring
 0) Exit
 ```
 
 Selecting Native GOST Gateway prints a clear `Coming soon` message and returns to the menu. It must not install packages or write files.
+
+NGINX Gateway runtime and route CRUD are not part of the monitoring integration milestone and remain deferred.
 
 ## State layout
 
