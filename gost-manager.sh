@@ -8,6 +8,22 @@ RUNNER_KHAREJ="${LIB_DIR}/gost-run-kharej.sh"
 GOST_ETC_DIR="/etc/gost"
 SYSTEMD_DIR="/etc/systemd/system"
 GITHUB_RELEASES_API="https://api.github.com/repos/go-gost/gost/releases?per_page=100"
+MONITOR_SERVICE="gost-monitor-collector.service"
+MONITOR_CONFIG="/etc/gost-manager/monitoring.env"
+MONITOR_DB="/var/lib/gost-manager/metrics.sqlite3"
+MONITOR_EXPORT_DIR="/root"
+MONITOR_BIN="/usr/local/sbin/gost-monitor"
+MONITOR_COLLECTOR_BIN="/usr/local/sbin/gost-monitor-collector"
+MONITOR_ADMIN_BIN="/usr/local/sbin/gost-monitor-admin"
+
+if [[ "${GOST_MANAGER_TESTING:-0}" == "1" ]]; then
+  MONITOR_CONFIG="${GOST_MONITOR_CONFIG_TEST:-${MONITOR_CONFIG}}"
+  MONITOR_DB="${GOST_MONITOR_DB_TEST:-${MONITOR_DB}}"
+  MONITOR_EXPORT_DIR="${GOST_MONITOR_EXPORT_DIR_TEST:-${MONITOR_EXPORT_DIR}}"
+  MONITOR_BIN="${GOST_MONITOR_BIN_TEST:-${MONITOR_BIN}}"
+  MONITOR_COLLECTOR_BIN="${GOST_MONITOR_COLLECTOR_BIN_TEST:-${MONITOR_COLLECTOR_BIN}}"
+  MONITOR_ADMIN_BIN="${GOST_MONITOR_ADMIN_BIN_TEST:-${MONITOR_ADMIN_BIN}}"
+fi
 
 die() {
   printf 'Error: %s\n' "$*" >&2
@@ -1125,6 +1141,238 @@ clean_old_broken_configs() {
   info "Cleanup complete."
 }
 
+execute_monitor_command() {
+  local status
+  if "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "${status}" -eq 130 ]]; then
+    info "Monitoring view closed."
+  else
+    info "Monitoring command failed with exit code ${status}."
+  fi
+  return "${status}"
+}
+
+run_monitor_command() {
+  execute_monitor_command "$@" || true
+}
+
+monitor_query() {
+  local -a command=("${MONITOR_BIN}" --config "${MONITOR_CONFIG}" "$@")
+  run_monitor_command "${command[@]}"
+}
+
+monitor_admin() {
+  local -a command=("${MONITOR_ADMIN_BIN}" "$@" --config "${MONITOR_CONFIG}")
+  run_monitor_command "${command[@]}"
+}
+
+monitor_custom_summary() {
+  local duration
+  read -r -p "Custom duration (for example 90s, 15m, 2h, 2d): " duration
+  if [[ ! "${duration}" =~ ^[1-9][0-9]*(s|m|h|d)$ ]]; then
+    info "Invalid duration."
+    return 0
+  fi
+  monitor_query summary --window "${duration}"
+}
+
+monitor_service_detail() {
+  local service
+  monitor_query services --window 10m
+  read -r -p "Exact service name (empty to return): " service
+  [[ -n "${service}" ]] || return 0
+  if [[ ! "${service}" =~ ^(nginx|gost-(iran|kharej)-[1-9][0-9]*)\.service$ ]]; then
+    info "Invalid managed service name."
+    return 0
+  fi
+  monitor_query service "${service}" --window 30m
+}
+
+monitor_tunnel_detail() {
+  local tunnel
+  monitor_query tunnels --window 10m
+  read -r -p "Exact tunnel ID (empty to return): " tunnel
+  [[ -n "${tunnel}" ]] || return 0
+  if [[ ! "${tunnel}" =~ ^(iran|kharej)-[1-9][0-9]*$ ]]; then
+    info "Invalid managed tunnel ID."
+    return 0
+  fi
+  monitor_query tunnel "${tunnel}" --window 1h
+}
+
+monitor_recent_events() {
+  local window severity
+  window="$(prompt_default "Event window" "1h")"
+  read -r -p "Severity filter (comma-separated, empty for all): " severity
+  if [[ -n "${severity}" ]]; then
+    monitor_query events --window "${window}" --severity "${severity}"
+  else
+    monitor_query events --window "${window}"
+  fi
+}
+
+monitor_export() {
+  local format="$1"
+  local window output extension timestamp
+  window="$(prompt_default "Export window" "1h")"
+  extension="${format}"
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  output="$(prompt_default "Output path" "${MONITOR_EXPORT_DIR}/gost-monitor-export-${timestamp}.${extension}")"
+  if [[ -e "${output}" ]] && ! confirm "Replace existing export ${output}?"; then
+    info "Export cancelled."
+    return 0
+  fi
+  monitor_query export --window "${window}" --format "${format}" --granularity auto --output "${output}"
+}
+
+monitoring_service_status() {
+  info "Collector service: ${MONITOR_SERVICE}"
+  info "Config: ${MONITOR_CONFIG}"
+  info "History: ${MONITOR_DB}"
+  systemctl --no-pager status "${MONITOR_SERVICE}" || true
+  if systemctl is-enabled --quiet "${MONITOR_SERVICE}"; then
+    info "Enabled: yes"
+  else
+    info "Enabled: no"
+  fi
+  if systemctl is-active --quiet "${MONITOR_SERVICE}"; then
+    info "Active: yes"
+  else
+    info "Active: no"
+  fi
+  monitor_admin status
+}
+
+monitoring_service_action() {
+  local action="$1"
+  require_root
+  case "${action}" in
+    start) ;;
+    stop|restart)
+      confirm "${action^} monitoring collector only?" || { info "Action cancelled."; return 0; }
+      ;;
+    *) info "Unsupported collector action."; return 0 ;;
+  esac
+  if systemctl "${action}" "${MONITOR_SERVICE}"; then
+    info "Monitoring collector ${action} completed."
+  else
+    info "Monitoring collector ${action} failed."
+  fi
+}
+
+monitor_one_shot() {
+  require_root
+  local -a command=("${MONITOR_COLLECTOR_BIN}" --once)
+  run_monitor_command "${command[@]}"
+}
+
+monitor_maintenance() {
+  require_root
+  monitor_admin maintenance
+}
+
+monitor_purge_history() {
+  local phrase was_active=0 status
+  require_root
+  info "This deletes only monitoring history: ${MONITOR_DB}"
+  info "Traffic services and ${GOST_ETC_DIR} are not affected."
+  read -r -p "Type DELETE MONITORING HISTORY to continue: " phrase
+  if [[ "${phrase}" != "DELETE MONITORING HISTORY" ]]; then
+    info "History deletion cancelled."
+    return 0
+  fi
+  if systemctl is-active --quiet "${MONITOR_SERVICE}"; then
+    was_active=1
+    if ! systemctl stop "${MONITOR_SERVICE}"; then
+      info "Could not stop monitoring collector; history was not changed."
+      return 0
+    fi
+  fi
+  local -a command=("${MONITOR_ADMIN_BIN}" purge-history --yes --config "${MONITOR_CONFIG}")
+  if execute_monitor_command "${command[@]}"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "${was_active}" -eq 1 ]]; then
+    systemctl start "${MONITOR_SERVICE}" || info "Monitoring history changed, but collector restart failed."
+  fi
+  [[ "${status}" -eq 0 ]] && info "Monitoring history deleted safely."
+  return 0
+}
+
+show_monitoring_menu() {
+  cat <<'MENU'
+Monitoring
+==========
+
+1) Current snapshot
+2) Live dashboard
+3) 10-minute summary
+4) 30-minute summary
+5) 1-hour summary
+6) Custom time-window summary
+7) Host detail
+8) Network detail
+9) Service list/detail
+10) Tunnel list/detail
+11) Collector/database detail
+12) Recent events
+13) Export JSON
+14) Export CSV
+15) Collector service status
+16) Start collector
+17) Stop collector
+18) Restart collector
+19) Run one-shot collector diagnostic
+20) Run retention maintenance now
+21) Delete monitoring history
+0) Back
+MENU
+}
+
+monitoring_menu() {
+  local choice
+  while true; do
+    show_monitoring_menu
+    read -r -p "Choose a monitoring option: " choice
+    case "${choice}" in
+      1) monitor_query snapshot ;;
+      2) monitor_query live ;;
+      3) monitor_query summary --window 10m ;;
+      4) monitor_query summary --window 30m ;;
+      5) monitor_query summary --window 1h ;;
+      6) monitor_custom_summary ;;
+      7) monitor_query host --window 30m ;;
+      8) monitor_query network --window 30m ;;
+      9) monitor_service_detail ;;
+      10) monitor_tunnel_detail ;;
+      11) monitor_query collector --window 1h ;;
+      12) monitor_recent_events ;;
+      13) monitor_export json ;;
+      14) monitor_export csv ;;
+      15) monitoring_service_status ;;
+      16) monitoring_service_action start ;;
+      17) monitoring_service_action stop ;;
+      18) monitoring_service_action restart ;;
+      19) monitor_one_shot ;;
+      20) monitor_maintenance ;;
+      21) monitor_purge_history ;;
+      0) return 0 ;;
+      *) info "Invalid monitoring option." ;;
+    esac
+    printf '\n'
+  done
+}
+
+native_gost_gateway_coming_soon() {
+  info "Native GOST Gateway: Coming soon."
+}
+
 show_menu() {
   cat <<'MENU'
 GOST Manager
@@ -1139,6 +1387,8 @@ GOST Manager
 7) Restart tunnel
 8) List active GOST services
 9) Clean old/broken GOST configs
+10) Monitoring
+11) Native GOST Gateway (Coming soon)
 0) Exit
 MENU
 }
@@ -1158,6 +1408,8 @@ main_menu() {
       7) restart_tunnel ;;
       8) list_active_gost_services ;;
       9) clean_old_broken_configs ;;
+      10) monitoring_menu ;;
+      11) native_gost_gateway_coming_soon ;;
       0) exit 0 ;;
       *) info "Invalid option." ;;
     esac

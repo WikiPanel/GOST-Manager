@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=integration-test-lib.sh
+source "${ROOT_DIR}/tests/integration-test-lib.sh"
+
+TEST_HOME="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/gost-uninstall-tests.XXXXXX")" && pwd -P)"
+cleanup_test_home() {
+  local status=$?
+  rm -rf "${TEST_HOME}"
+  exit "${status}"
+}
+trap cleanup_test_home EXIT
+
+COMMAND_LOG="${TEST_HOME}/commands.log"
+STUB_STATE_DIR="${TEST_HOME}/state"
+STUB_BIN="${TEST_HOME}/bin"
+mkdir -p "${STUB_STATE_DIR}"
+: > "${COMMAND_LOG}"
+make_command_stubs "${STUB_BIN}"
+export COMMAND_LOG STUB_STATE_DIR
+export PATH="${STUB_BIN}:${PATH}"
+export REPO_ROOT="${ROOT_DIR}"
+
+cat > "${STUB_BIN}/gost-monitor-admin" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'admin %s\n' "$*" >> "${COMMAND_LOG}"
+PYTHONPATH="${REPO_ROOT}" python3 -m monitoring.admin_cli "$@"
+STUB
+chmod 755 "${STUB_BIN}/gost-monitor-admin"
+
+create_fixture() {
+  local root="$1"
+  mkdir -p \
+    "${root}/usr/local/sbin" \
+    "${root}/usr/local/lib/gost-manager/monitoring" \
+    "${root}/usr/local/bin" \
+    "${root}/etc/systemd/system" \
+    "${root}/etc/gost-manager" \
+    "${root}/etc/gost" \
+    "${root}/var/lib/gost-manager"
+  printf 'manager\n' > "${root}/usr/local/sbin/gost-manager"
+  printf 'monitor\n' > "${root}/usr/local/sbin/gost-monitor"
+  printf 'admin\n' > "${root}/usr/local/sbin/gost-monitor-admin"
+  printf 'collector\n' > "${root}/usr/local/sbin/gost-monitor-collector"
+  printf 'python\n' > "${root}/usr/local/lib/gost-manager/monitoring/__init__.py"
+  printf 'iran-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-iran.sh"
+  printf 'kharej-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-kharej.sh"
+  printf 'gost\n' > "${root}/usr/local/bin/gost"
+  printf '[Unit]\nDescription=monitor\n' > "${root}/etc/systemd/system/gost-monitor-collector.service"
+  printf '[Unit]\nDescription=managed\n' > "${root}/etc/systemd/system/gost-iran-1.service"
+  printf '[Unit]\nDescription=unmanaged\n' > "${root}/etc/systemd/system/custom-gost.service"
+  printf 'MAPPINGS=2052:2052\nPASSWORD=uninstall-secret-canary\n' > "${root}/etc/gost/iran-1.env"
+  printf 'config-retained\n' > "${root}/etc/gost-manager/monitoring.env"
+  PYTHONPATH="${ROOT_DIR}" python3 -m monitoring.admin_cli migrate --db "${root}/var/lib/gost-manager/metrics.sqlite3" >/dev/null
+  PYTHONPATH="${ROOT_DIR}" python3 - "${root}/var/lib/gost-manager/metrics.sqlite3" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("INSERT INTO events(ts,severity,code,message,details_json) VALUES(1,'info','keep','keep','{}')")
+conn.close()
+PY
+}
+
+run_plan() {
+  local root="$1"
+  shift
+  (
+    export GOST_MANAGER_TESTING=1
+    export GOST_MANAGER_ROOT="${root}"
+    export GOST_MANAGER_SOURCE_ONLY=1
+    export MONITOR_ADMIN_BIN="${STUB_BIN}/gost-monitor-admin"
+    export SYSTEMCTL_BIN=systemctl
+    # shellcheck source=../uninstall.sh
+    source "${ROOT_DIR}/uninstall.sh"
+    require_safe_root
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        manager) REMOVE_MANAGER=1 ;;
+        monitor-service) REMOVE_MONITOR_SERVICE=1 ;;
+        monitor-code) REMOVE_MONITOR_CODE=1 ;;
+        monitor-config) REMOVE_MONITOR_CONFIG=1 ;;
+        history) REMOVE_MONITOR_HISTORY=1 ;;
+        traffic) REMOVE_TRAFFIC=1 ;;
+        credentials) REMOVE_CREDENTIALS=1 ;;
+        binary) REMOVE_GOST_BINARY=1 ;;
+        *) return 2 ;;
+      esac
+      shift
+    done
+    apply_plan
+  )
+}
+
+cancel_root="${TEST_HOME}/cancel"
+create_fixture "${cancel_root}"
+cancel_before="$(tree_digest "${cancel_root}")"
+: > "${COMMAND_LOG}"
+printf 'n\nn\nn\nn\nn\nn\nn\nn\n' | \
+  GOST_MANAGER_TESTING=1 GOST_MANAGER_ROOT="${cancel_root}" \
+  SYSTEMCTL_BIN=systemctl MONITOR_ADMIN_BIN="${STUB_BIN}/gost-monitor-admin" \
+  bash "${ROOT_DIR}/uninstall.sh" >/dev/null
+assert_eq "cancel everything changes nothing" "${cancel_before}" "$(tree_digest "${cancel_root}")"
+assert_eq "cancel everything calls no commands" "0" "$(wc -l < "${COMMAND_LOG}" | tr -d ' ')"
+
+manager_root="${TEST_HOME}/manager"
+create_fixture "${manager_root}"
+run_plan "${manager_root}" manager >/dev/null
+assert_absent "manager-only removes CLI" "${manager_root}/usr/local/sbin/gost-manager"
+assert_file "manager-only keeps traffic unit" "${manager_root}/etc/systemd/system/gost-iran-1.service"
+assert_file "manager-only keeps monitoring" "${manager_root}/usr/local/sbin/gost-monitor"
+
+monitor_root="${TEST_HOME}/monitor-only"
+create_fixture "${monitor_root}"
+: > "${COMMAND_LOG}"
+run_plan "${monitor_root}" monitor-service monitor-code >/dev/null
+assert_absent "monitor-only removes unit" "${monitor_root}/etc/systemd/system/gost-monitor-collector.service"
+assert_absent "monitor-only removes Python code" "${monitor_root}/usr/local/lib/gost-manager/monitoring"
+assert_file "monitor-only retains history" "${monitor_root}/var/lib/gost-manager/metrics.sqlite3"
+assert_file "monitor-only retains config" "${monitor_root}/etc/gost-manager/monitoring.env"
+assert_file "monitor-only retains traffic unit" "${monitor_root}/etc/systemd/system/gost-iran-1.service"
+assert_file "monitor-only retains credentials" "${monitor_root}/etc/gost/iran-1.env"
+assert_not_contains "monitor-only never stops traffic" "gost-iran-1.service" "${COMMAND_LOG}"
+
+history_root="${TEST_HOME}/history"
+create_fixture "${history_root}"
+touch "${STUB_STATE_DIR}/active"
+: > "${COMMAND_LOG}"
+run_plan "${history_root}" history >/dev/null
+assert_file "history-only keeps valid database" "${history_root}/var/lib/gost-manager/metrics.sqlite3"
+history_rows="$(PYTHONPATH="${ROOT_DIR}" python3 - "${history_root}/var/lib/gost-manager/metrics.sqlite3" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+print(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+conn.close()
+PY
+)"
+assert_eq "history-only purges rows" "0" "${history_rows}"
+assert_file "history-only keeps config" "${history_root}/etc/gost-manager/monitoring.env"
+assert_file "history-only keeps traffic" "${history_root}/etc/systemd/system/gost-iran-1.service"
+assert_contains "history-only stops collector" "systemctl stop gost-monitor-collector.service" "${COMMAND_LOG}"
+assert_contains "history-only restores active collector" "systemctl start gost-monitor-collector.service" "${COMMAND_LOG}"
+rm -f "${STUB_STATE_DIR}/active"
+
+config_root="${TEST_HOME}/config"
+create_fixture "${config_root}"
+rm -f "${config_root}/etc/systemd/system/gost-monitor-collector.service"
+run_plan "${config_root}" monitor-config >/dev/null
+assert_absent "config-only removes monitoring config" "${config_root}/etc/gost-manager/monitoring.env"
+assert_file "config-only keeps history" "${config_root}/var/lib/gost-manager/metrics.sqlite3"
+assert_file "config-only keeps traffic" "${config_root}/etc/systemd/system/gost-iran-1.service"
+
+complete_monitor_root="${TEST_HOME}/complete-monitor"
+create_fixture "${complete_monitor_root}"
+run_plan "${complete_monitor_root}" monitor-service monitor-code monitor-config history >/dev/null
+assert_absent "complete monitoring removal removes code" "${complete_monitor_root}/usr/local/lib/gost-manager/monitoring"
+assert_absent "complete monitoring removal removes config" "${complete_monitor_root}/etc/gost-manager/monitoring.env"
+assert_absent "complete monitoring removal removes history" "${complete_monitor_root}/var/lib/gost-manager"
+assert_file "complete monitoring removal keeps traffic" "${complete_monitor_root}/etc/systemd/system/gost-iran-1.service"
+assert_file "complete monitoring removal keeps runners" "${complete_monitor_root}/usr/local/lib/gost-manager/gost-run-iran.sh"
+
+traffic_root="${TEST_HOME}/traffic"
+create_fixture "${traffic_root}"
+run_plan "${traffic_root}" traffic >/dev/null
+assert_absent "traffic removal removes exact managed unit" "${traffic_root}/etc/systemd/system/gost-iran-1.service"
+assert_file "traffic removal keeps credentials" "${traffic_root}/etc/gost/iran-1.env"
+assert_file "traffic removal keeps unmanaged unit" "${traffic_root}/etc/systemd/system/custom-gost.service"
+assert_absent "traffic removal removes now-unused runner" "${traffic_root}/usr/local/lib/gost-manager/gost-run-iran.sh"
+
+credentials_root="${TEST_HOME}/credentials"
+create_fixture "${credentials_root}"
+run_plan "${credentials_root}" traffic credentials >/dev/null
+assert_absent "traffic+credentials removes env tree" "${credentials_root}/etc/gost"
+assert_file "traffic+credentials keeps monitoring" "${credentials_root}/usr/local/sbin/gost-monitor"
+assert_file "traffic+credentials keeps unmanaged unit" "${credentials_root}/etc/systemd/system/custom-gost.service"
+
+full_root="${TEST_HOME}/full"
+create_fixture "${full_root}"
+run_plan "${full_root}" manager monitor-service monitor-code monitor-config history traffic credentials binary >/dev/null
+assert_absent "full selection removes manager" "${full_root}/usr/local/sbin/gost-manager"
+assert_absent "full selection removes monitoring" "${full_root}/usr/local/sbin/gost-monitor"
+assert_absent "full selection removes history" "${full_root}/var/lib/gost-manager"
+assert_absent "full selection removes credentials" "${full_root}/etc/gost"
+assert_absent "full selection removes GOST binary" "${full_root}/usr/local/bin/gost"
+assert_file "full selection keeps unmanaged unit" "${full_root}/etc/systemd/system/custom-gost.service"
+
+dependency_root="${TEST_HOME}/dependency"
+create_fixture "${dependency_root}"
+if run_plan "${dependency_root}" monitor-code >/dev/null 2>&1; then
+  fail "monitoring code removal refuses while service remains"
+else
+  pass "monitoring code removal refuses while service remains"
+fi
+assert_file "dependency refusal keeps monitoring code" "${dependency_root}/usr/local/lib/gost-manager/monitoring/__init__.py"
+
+failure_root="${TEST_HOME}/failure"
+create_fixture "${failure_root}"
+: > "${COMMAND_LOG}"
+export STUB_FAIL_SYSTEMCTL_ACTION=disable
+if run_plan "${failure_root}" traffic >/dev/null; then
+  fail "traffic systemctl failure reports partial failure"
+else
+  pass "traffic systemctl failure reports partial failure"
+fi
+unset STUB_FAIL_SYSTEMCTL_ACTION
+assert_file "traffic systemctl failure keeps unit" "${failure_root}/etc/systemd/system/gost-iran-1.service"
+assert_file "traffic systemctl failure keeps runner" "${failure_root}/usr/local/lib/gost-manager/gost-run-iran.sh"
+assert_file "traffic systemctl failure keeps unmanaged unit" "${failure_root}/etc/systemd/system/custom-gost.service"
+
+symlink_root="${TEST_HOME}/symlink"
+create_fixture "${symlink_root}"
+outside="${TEST_HOME}/outside-monitoring"
+printf 'outside-safe\n' > "${outside}"
+rm -rf "${symlink_root}/usr/local/lib/gost-manager/monitoring"
+ln -s "${outside}" "${symlink_root}/usr/local/lib/gost-manager/monitoring"
+rm -f "${symlink_root}/etc/systemd/system/gost-monitor-collector.service"
+if run_plan "${symlink_root}" monitor-code >/dev/null 2>&1; then
+  fail "uninstall rejects symlinked monitoring code"
+else
+  pass "uninstall rejects symlinked monitoring code"
+fi
+assert_eq "uninstall symlink target unchanged" "outside-safe" "$(tr -d '\n' < "${outside}")"
+
+finish_suite
