@@ -102,6 +102,12 @@ The current `/etc/gost` env files remain supported. New v0.2 state uses a separa
 
 JSON is used because Python 3 can validate it with the standard library. Generated files are never read back as authoritative desired state.
 
+Gateway milestone 1/6 implements only the versioned `state.json` and
+`node.json` desired-state layer. Its CLI performs locked, revision-aware,
+atomic CRUD and validation without rendering or activating runtime
+configuration. The exact implemented schema and commands are documented in
+`docs/GATEWAY-STATE-V0.2.md`.
+
 ## State model
 
 The initial schema contains these concepts:
@@ -112,7 +118,6 @@ The initial schema contains these concepts:
 - public listen port;
 - one or more accepted server names;
 - local status endpoint settings;
-- NGINX worker/file-descriptor tuning policy;
 - enabled/disabled state.
 
 ### Route
@@ -124,21 +129,20 @@ The initial schema contains these concepts:
 - enabled/disabled state;
 - upstream strategy;
 - ordered tunnel membership;
-- optional public health policy.
 
 The pair `Host + Path` must be globally unique among enabled routes on one public listener.
 
-### Tunnel
+### Exit and local binding
 
-- stable tunnel ID;
-- Iran loopback listen address and port;
-- Kharej address and SOCKS port;
-- target port on Kharej;
-- secret reference;
-- primary/backup role or active weight;
+- stable Exit ID;
+- Kharej address, SOCKS port, and target port in shared state;
+- Iran loopback binding fixed to `127.0.0.1` in node-local state;
+- secret reference only, never a secret value;
 - enabled/disabled state.
 
-Internal listen ports must be unique and must not conflict with unmanaged listeners.
+The current state-only validator keeps internal ports unique and separate from
+the declared public and status ports. Live unmanaged-listener checks belong to
+the runtime rendering milestone.
 
 ### Kharej allowlist
 
