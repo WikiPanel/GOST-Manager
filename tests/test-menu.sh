@@ -191,17 +191,52 @@ assert_eq "legacy dispatch order unchanged" $'install\nkharej\niran\ndelete\nsta
 assert_contains "main option 10 dispatches Monitoring" '10) monitoring_menu ;;' "${ROOT_DIR}/gost-manager.sh"
 assert_contains "main option 11 dispatches Native placeholder" '11) native_gost_gateway_coming_soon ;;' "${ROOT_DIR}/gost-manager.sh"
 
+lite_menu_file="${TEST_HOME}/monitoring-lite-menu.txt"
+show_monitoring_menu > "${lite_menu_file}"
+for label in \
+  "1) Live resources" \
+  "2) Last 10 minutes" \
+  "3) Last 30 minutes" \
+  "4) Last 1 hour" \
+  "5) Services and tunnels" \
+  "6) Collector status" \
+  "7) Advanced tools" \
+  "0) Back"; do
+  assert_contains "Monitoring Lite menu ${label}" "${label}" "${lite_menu_file}"
+done
+assert_not_contains "Monitoring Lite menu hides exports" "Export JSON" "${lite_menu_file}"
+assert_not_contains "Monitoring Lite menu hides maintenance" "maintenance" "${lite_menu_file}"
+
 : > "${DISPATCH_LOG}"
-monitoring_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n0' >/dev/null
-assert_eq "Monitoring submenu dispatch count" "21" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
+normal_menu_output="${TEST_HOME}/normal-monitoring-menu.out"
+monitoring_menu <<< $'1\n2\n3\n4\n5\n0\n6\n7\n0\n0' > "${normal_menu_output}"
+assert_eq "Monitoring Lite command dispatch count" "5" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
 for marker in \
-  "query snapshot" "query live" "query summary --window 10m" \
-  "query summary --window 30m" "query summary --window 1h" "custom" \
-  "query host --window 30m" "query network --window 30m" "service-detail" \
-  "tunnel-detail" "query collector --window 1h" "events" "export-json" \
-  "export-csv" "service-status" "service-start" "service-stop" \
-  "service-restart" "diagnostic" "maintenance" "purge"; do
-  assert_contains "Monitoring dispatch ${marker}" "${marker}" "${DISPATCH_LOG}"
+  "query live" "query summary --window 10m" \
+  "query summary --window 30m" "query summary --window 1h" \
+  "service-status"; do
+  assert_contains "Monitoring Lite dispatch ${marker}" "${marker}" "${DISPATCH_LOG}"
+done
+assert_contains "Monitoring Lite opens services submenu" "Services and tunnels" "${normal_menu_output}"
+assert_contains "Monitoring Lite opens advanced submenu" "Advanced tools" "${normal_menu_output}"
+
+: > "${DISPATCH_LOG}"
+services_and_tunnels_menu <<< $'1\n2\n3\n4\n0' >/dev/null
+assert_eq "Services and tunnels dispatch count" "4" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
+for marker in "query services --window 10m" "service-detail" \
+  "query tunnels --window 10m" "tunnel-detail"; do
+  assert_contains "Services and tunnels dispatch ${marker}" "${marker}" "${DISPATCH_LOG}"
+done
+
+: > "${DISPATCH_LOG}"
+monitoring_advanced_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n0' >/dev/null
+assert_eq "Advanced tools dispatch count" "14" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
+for marker in \
+  "query snapshot" "query host --window 30m" "query network --window 30m" \
+  "query collector --window 1h" "events" "custom" "export-json" \
+  "export-csv" "diagnostic" "maintenance" "purge" "service-start" \
+  "service-stop" "service-restart"; do
+  assert_contains "Advanced tools dispatch ${marker}" "${marker}" "${DISPATCH_LOG}"
 done
 
 finish_suite

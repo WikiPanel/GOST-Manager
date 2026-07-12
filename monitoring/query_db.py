@@ -33,7 +33,8 @@ REQUIRED_TABLES = {
 
 SNAPSHOT_METRICS_BY_ENTITY = {
     "host": (
-        "cpu_utilization_percent", "memory_used_percent", "load1", "load5", "load15",
+        "cpu_utilization_percent", "memory_used_percent", "memory_used_bytes",
+        "memory_available_bytes", "swap_used_bytes", "load1", "load5", "load15",
         "conntrack_utilization_percent", "file_handles_utilization_percent",
         "tcp_state_estab", "tcp_state_syn_sent", "tcp_state_syn_recv",
         "tcp_state_close_wait", "tcp_state_time_wait",

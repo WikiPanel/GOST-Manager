@@ -165,7 +165,7 @@ fi
 assert_absent "DB symlink rejection creates no default database" "${db_symlink_root}/var/lib/gost-manager/metrics.sqlite3"
 
 custom_config="${fresh_root}/etc/gost-manager/monitoring.env"
-sed 's/GOST_MONITOR_SAMPLE_INTERVAL=5/GOST_MONITOR_SAMPLE_INTERVAL=10/' "${custom_config}" > "${custom_config}.new"
+sed 's/GOST_MONITOR_SAMPLE_INTERVAL=10/GOST_MONITOR_SAMPLE_INTERVAL=20/' "${custom_config}" > "${custom_config}.new"
 mv "${custom_config}.new" "${custom_config}"
 chmod 600 "${custom_config}"
 custom_before="$(cksum "${custom_config}")"

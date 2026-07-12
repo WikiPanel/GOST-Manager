@@ -51,7 +51,11 @@ def _add_database(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_window(parser: argparse.ArgumentParser, default: str = "10m") -> None:
-    parser.add_argument("--window", default=None, help=f"duration such as {default}, 90s, 2h, or 2d")
+    parser.add_argument(
+        "--window",
+        default=None,
+        help=f"duration such as {default}, 90s, 2h, or 24h",
+    )
     parser.add_argument("--start", help="timezone-aware ISO-8601 start")
     parser.add_argument("--end", help="timezone-aware ISO-8601 end")
     parser.set_defaults(default_window=default)

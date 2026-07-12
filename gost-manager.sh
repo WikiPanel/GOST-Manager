@@ -1184,7 +1184,7 @@ monitor_config_value() {
 
 monitor_custom_summary() {
   local duration
-  read -r -p "Custom duration (for example 90s, 15m, 2h, 2d): " duration
+  read -r -p "Custom duration (for example 90s, 15m, 2h, 24h): " duration
   if [[ ! "${duration}" =~ ^[1-9][0-9]*(s|m|h|d)$ ]]; then
     info "Invalid duration."
     return 0
@@ -1349,29 +1349,95 @@ show_monitoring_menu() {
 Monitoring
 ==========
 
-1) Current snapshot
-2) Live dashboard
-3) 10-minute summary
-4) 30-minute summary
-5) 1-hour summary
-6) Custom time-window summary
-7) Host detail
-8) Network detail
-9) Service list/detail
-10) Tunnel list/detail
-11) Collector/database detail
-12) Recent events
-13) Export JSON
-14) Export CSV
-15) Collector service status
-16) Start collector
-17) Stop collector
-18) Restart collector
-19) Run one-shot collector diagnostic
-20) Run retention maintenance now
-21) Delete monitoring history
+1) Live resources
+2) Last 10 minutes
+3) Last 30 minutes
+4) Last 1 hour
+5) Services and tunnels
+6) Collector status
+7) Advanced tools
 0) Back
 MENU
+}
+
+show_services_and_tunnels_menu() {
+  cat <<'MENU'
+Services and tunnels
+====================
+
+1) Service list
+2) Service detail
+3) Tunnel list
+4) Tunnel detail
+0) Back
+MENU
+}
+
+services_and_tunnels_menu() {
+  local choice
+  while true; do
+    show_services_and_tunnels_menu
+    read -r -p "Choose a service or tunnel option: " choice
+    case "${choice}" in
+      1) monitor_query services --window 10m ;;
+      2) monitor_service_detail ;;
+      3) monitor_query tunnels --window 10m ;;
+      4) monitor_tunnel_detail ;;
+      0) return 0 ;;
+      *) info "Invalid service or tunnel option." ;;
+    esac
+    printf '\n'
+  done
+}
+
+show_monitoring_advanced_menu() {
+  cat <<'MENU'
+Advanced tools
+==============
+
+1) Plain current snapshot
+2) Host detail
+3) Network detail
+4) Collector/database detail
+5) Recent events
+6) Custom time-window summary
+7) Export JSON
+8) Export CSV
+9) Run one-shot collector diagnostic
+10) Run maintenance now
+11) Delete monitoring history
+12) Start collector
+13) Stop collector
+14) Restart collector
+0) Back
+MENU
+}
+
+monitoring_advanced_menu() {
+  local choice
+  while true; do
+    show_monitoring_advanced_menu
+    read -r -p "Choose an advanced monitoring option: " choice
+    case "${choice}" in
+      1) monitor_query snapshot ;;
+      2) monitor_query host --window 30m ;;
+      3) monitor_query network --window 30m ;;
+      4) monitor_query collector --window 1h ;;
+      5) monitor_recent_events ;;
+      6) monitor_custom_summary ;;
+      7) monitor_export json ;;
+      8) monitor_export csv ;;
+      9) monitor_one_shot ;;
+      10) monitor_maintenance ;;
+      11) monitor_purge_history ;;
+      12) monitoring_service_action start ;;
+      13) monitoring_service_action stop ;;
+      14) monitoring_service_action restart ;;
+      0) return 0 ;;
+      *) info "Invalid advanced monitoring option." ;;
+    esac
+    printf '\n'
+  done
 }
 
 monitoring_menu() {
@@ -1380,27 +1446,13 @@ monitoring_menu() {
     show_monitoring_menu
     read -r -p "Choose a monitoring option: " choice
     case "${choice}" in
-      1) monitor_query snapshot ;;
-      2) monitor_query live ;;
-      3) monitor_query summary --window 10m ;;
-      4) monitor_query summary --window 30m ;;
-      5) monitor_query summary --window 1h ;;
-      6) monitor_custom_summary ;;
-      7) monitor_query host --window 30m ;;
-      8) monitor_query network --window 30m ;;
-      9) monitor_service_detail ;;
-      10) monitor_tunnel_detail ;;
-      11) monitor_query collector --window 1h ;;
-      12) monitor_recent_events ;;
-      13) monitor_export json ;;
-      14) monitor_export csv ;;
-      15) monitoring_service_status ;;
-      16) monitoring_service_action start ;;
-      17) monitoring_service_action stop ;;
-      18) monitoring_service_action restart ;;
-      19) monitor_one_shot ;;
-      20) monitor_maintenance ;;
-      21) monitor_purge_history ;;
+      1) monitor_query live ;;
+      2) monitor_query summary --window 10m ;;
+      3) monitor_query summary --window 30m ;;
+      4) monitor_query summary --window 1h ;;
+      5) services_and_tunnels_menu ;;
+      6) monitoring_service_status ;;
+      7) monitoring_advanced_menu ;;
       0) return 0 ;;
       *) info "Invalid monitoring option." ;;
     esac

@@ -5,7 +5,11 @@ from __future__ import annotations
 import dataclasses
 import math
 
-from monitoring.schema import EVENT_RETENTION_SECONDS
+from monitoring.schema import (
+    EVENT_RETENTION_SECONDS,
+    RAW_RETENTION_SECONDS,
+    ROLLUP_RETENTION_SECONDS,
+)
 
 SECONDS_PER_DAY = 24 * 60 * 60
 MINUTES_PER_DAY = 24 * 60
@@ -16,6 +20,11 @@ REPRESENTATIVE_FULL_SOCKET_EXTRA_POINTS = 9
 REPRESENTATIVE_SLOW_EXTRA_POINTS = 52
 REPRESENTATIVE_ROLLUP_SERIES_PER_MINUTE = 583
 REPRESENTATIVE_SAMPLES_PER_CYCLE = 7
+REPRESENTATIVE_SAMPLE_INTERVAL_SECONDS = 10.0
+REPRESENTATIVE_FULL_SOCKET_INTERVAL_SECONDS = 30.0
+REPRESENTATIVE_SLOW_INTERVAL_SECONDS = 60.0
+REPRESENTATIVE_RAW_RETENTION_HOURS = RAW_RETENTION_SECONDS // 3600
+REPRESENTATIVE_ROLLUP_RETENTION_DAYS = ROLLUP_RETENTION_SECONDS // SECONDS_PER_DAY
 REPRESENTATIVE_EVENT_RETENTION_DAYS = EVENT_RETENTION_SECONDS // SECONDS_PER_DAY
 
 ESTIMATED_RAW_TABLE_BYTES_PER_POINT = 128
@@ -28,7 +37,7 @@ REPRESENTATIVE_EVENTS_PER_DAY = 5_000
 REPRESENTATIVE_ENTITY_CAPACITY = 2_048
 SQLITE_INDEX_AND_FREE_PAGE_RATIO = 0.50
 WAL_AND_OPERATIONAL_HEADROOM_RATIO = 0.20
-RESERVATION_INCREMENT_BYTES = 2 * GIB
+RESERVATION_INCREMENT_BYTES = GIB
 
 
 @dataclasses.dataclass(frozen=True)
@@ -36,6 +45,9 @@ class StorageBudget:
     raw_retention_hours: int
     rollup_retention_days: int
     event_retention_days: int
+    fast_metric_points_per_day: int
+    full_socket_metric_points_per_day: int
+    slow_metric_points_per_day: int
     metric_points_per_day: int
     raw_metric_points: int
     minute_rollup_rows: int
@@ -78,11 +90,11 @@ def estimate_storage_budget(
     slow_extra_points: int = REPRESENTATIVE_SLOW_EXTRA_POINTS,
     rollup_series_per_minute: int = REPRESENTATIVE_ROLLUP_SERIES_PER_MINUTE,
     samples_per_cycle: int = REPRESENTATIVE_SAMPLES_PER_CYCLE,
-    sample_interval: float = 5.0,
-    full_socket_interval: float = 30.0,
-    slow_interval: float = 60.0,
-    raw_retention_hours: int = 48,
-    rollup_retention_days: int = 30,
+    sample_interval: float = REPRESENTATIVE_SAMPLE_INTERVAL_SECONDS,
+    full_socket_interval: float = REPRESENTATIVE_FULL_SOCKET_INTERVAL_SECONDS,
+    slow_interval: float = REPRESENTATIVE_SLOW_INTERVAL_SECONDS,
+    raw_retention_hours: int = REPRESENTATIVE_RAW_RETENTION_HOURS,
+    rollup_retention_days: int = REPRESENTATIVE_ROLLUP_RETENTION_DAYS,
     event_retention_days: int = REPRESENTATIVE_EVENT_RETENTION_DAYS,
     events_per_day: int = REPRESENTATIVE_EVENTS_PER_DAY,
     entity_capacity: int = REPRESENTATIVE_ENTITY_CAPACITY,
@@ -94,10 +106,13 @@ def estimate_storage_budget(
     fast_cycles = math.ceil(SECONDS_PER_DAY / sample_interval)
     full_cycles = math.ceil(SECONDS_PER_DAY / full_socket_interval)
     slow_cycles = math.ceil(SECONDS_PER_DAY / slow_interval)
+    fast_points_per_day = fast_cycles * fast_points_per_cycle
+    full_socket_points_per_day = full_cycles * full_socket_extra_points
+    slow_points_per_day = slow_cycles * slow_extra_points
     points_per_day = (
-        fast_cycles * fast_points_per_cycle
-        + full_cycles * full_socket_extra_points
-        + slow_cycles * slow_extra_points
+        fast_points_per_day
+        + full_socket_points_per_day
+        + slow_points_per_day
     )
     raw_points = math.ceil(points_per_day * raw_retention_hours / 24)
     rollup_rows = rollup_series_per_minute * MINUTES_PER_DAY * rollup_retention_days
@@ -133,6 +148,9 @@ def estimate_storage_budget(
         raw_retention_hours=raw_retention_hours,
         rollup_retention_days=rollup_retention_days,
         event_retention_days=event_retention_days,
+        fast_metric_points_per_day=fast_points_per_day,
+        full_socket_metric_points_per_day=full_socket_points_per_day,
+        slow_metric_points_per_day=slow_points_per_day,
         metric_points_per_day=points_per_day,
         raw_metric_points=raw_points,
         minute_rollup_rows=rollup_rows,

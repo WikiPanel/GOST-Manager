@@ -167,7 +167,20 @@ Each numbered tunnel is independent. Deleting `iran-2` does not affect `iran-1`;
 
 ## Local Monitoring
 
-Option `10` opens snapshot/live views, 10-minute/30-minute/1-hour/custom summaries, host/network/service/tunnel/collector details, events, JSON/CSV export, collector controls, one-shot diagnostics, maintenance, and explicit history deletion. Monitoring command failures return to the manager menu and never trigger traffic service actions.
+Option `10` opens the compact Monitoring Lite workflow:
+
+```text
+1) Live resources
+2) Last 10 minutes
+3) Last 30 minutes
+4) Last 1 hour
+5) Services and tunnels
+6) Collector status
+7) Advanced tools
+0) Back
+```
+
+The normal live view focuses on host, network, TCP connections, managed services, tunnels, and collector health. Existing snapshot/detail/event/export/maintenance/service-control commands remain available under `Advanced tools`. Monitoring command failures return to the manager menu and never trigger traffic service actions.
 
 Direct commands are also available:
 
@@ -189,7 +202,7 @@ The strict root-owned mode-`0600` config contains only:
 ```text
 GOST_MONITOR_DB=/var/lib/gost-manager/metrics.sqlite3
 GOST_ENV_DIR=/etc/gost
-GOST_MONITOR_SAMPLE_INTERVAL=5
+GOST_MONITOR_SAMPLE_INTERVAL=10
 GOST_MONITOR_TCP_INTERVAL=30
 GOST_MONITOR_SLOW_INTERVAL=60
 GOST_MONITOR_MAINTENANCE_INTERVAL=900
@@ -204,7 +217,9 @@ gost-monitor-admin config --format json
 gost-monitor-admin config --format value --field database_path
 ```
 
-Default retention is 48 hours of raw points, 30 days of minute rollups, and 30 days of structured events. Reserve at least 12 GiB for the representative one-NGINX-plus-six-GOST profile. `gost-monitor-admin maintenance` runs rollup/retention in one transaction and checkpoints after commit.
+SQLite remains the dependency-free, restart-safe local history store. Monitoring Lite retains 6 hours of raw points, 24 hours of minute rollups, and 24 hours of structured events. The conservative estimate for one NGINX service plus six GOST services is about 0.484 GiB, including indexes, reusable pages, WAL, and operational headroom; reserve 1 GiB. `gost-monitor-admin maintenance` runs rollup/retention in one transaction and checkpoints after commit.
+
+The deterministic 1,000-user fixture validates monitoring parsing, attribution, storage, and scheduling overhead; it is not a network-capacity claim. Production throughput still depends on CPU, kernel, NIC, encryption, GOST, NGINX, RTT, CDN, and the server provider.
 
 The daemon, one-shot collector, and destructive history purge share the private advisory lock `/run/gost-manager/collector.lock`. A second collector or a direct purge while collection is active returns exit code `4`. The manager asks before temporarily stopping an active collector for one-shot diagnostics and restores it after success, failure, or interrupt. History deletion requires the exact phrase `DELETE MONITORING HISTORY`, resolves and displays the configured database, checkpoints WAL, refuses a busy checkpoint, creates same-directory hard-link recovery anchors, performs one atomic canonical replacement, fsyncs durability boundaries, and restores the original DB and sidecars after an injected failure. It does not touch traffic or `/etc/gost`.
 

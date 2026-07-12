@@ -151,7 +151,20 @@ Select tunnel number:
 11) Native GOST Gateway (Coming soon)
 ```
 
-زیرمنوی Monitoring شامل snapshot، داشبورد live، خلاصه‌های ۱۰ دقیقه، ۳۰ دقیقه، ۱ ساعت و بازه سفارشی، جزئیات host/network/service/tunnel/collector، eventها، خروجی JSON/CSV، کنترل collector، اجرای one-shot، maintenance و حذف صریح تاریخچه است. خطای مانیتورینگ از منو خارج نمی‌شود و هیچ سرویس ترافیکی را تغییر نمی‌دهد.
+زیرمنوی عادی Monitoring Lite ساده و متمرکز است:
+
+```text
+1) Live resources
+2) Last 10 minutes
+3) Last 30 minutes
+4) Last 1 hour
+5) Services and tunnels
+6) Collector status
+7) Advanced tools
+0) Back
+```
+
+نمای live فقط host، network، اتصال‌های TCP، سرویس‌ها، tunnelها و سلامت collector را در اولویت قرار می‌دهد. قابلیت‌های موجود snapshot/detail/event/export/maintenance و کنترل collector در `Advanced tools` حفظ شده‌اند. خطای مانیتورینگ از منو خارج نمی‌شود و هیچ سرویس ترافیکی را تغییر نمی‌دهد.
 
 دستورات مستقیم:
 
@@ -173,7 +186,7 @@ gost-monitor-admin maintenance
 ```text
 GOST_MONITOR_DB=/var/lib/gost-manager/metrics.sqlite3
 GOST_ENV_DIR=/etc/gost
-GOST_MONITOR_SAMPLE_INTERVAL=5
+GOST_MONITOR_SAMPLE_INTERVAL=10
 GOST_MONITOR_TCP_INTERVAL=30
 GOST_MONITOR_SLOW_INTERVAL=60
 GOST_MONITOR_MAINTENANCE_INTERVAL=900
@@ -188,7 +201,9 @@ gost-monitor-admin config --format json
 gost-monitor-admin config --format value --field database_path
 ```
 
-نگه‌داری پیش‌فرض شامل ۴۸ ساعت raw metric، سی روز minute rollup و سی روز event ساختاریافته است. برای پروفایل نمونه حداقل ۱۲ GiB فضا در نظر بگیرید. Maintenance در یک transaction انجام می‌شود و checkpoint بعد از commit است.
+SQLite همچنان history محلی بدون dependency خارجی و مقاوم در برابر restart را نگه می‌دارد. Monitoring Lite به‌صورت پیش‌فرض ۶ ساعت raw metric، ۲۴ ساعت minute rollup و ۲۴ ساعت event ساختاریافته را حفظ می‌کند. برآورد محافظه‌کارانه برای یک NGINX و شش سرویس GOST، با احتساب index، صفحه‌های آزاد، WAL و headroom عملیاتی، حدود ۰٫۴۸۴ GiB است؛ ۱ GiB فضا رزرو کنید. Maintenance در یک transaction انجام می‌شود و checkpoint بعد از commit است.
+
+fixture قطعی ۱٬۰۰۰ کاربر فقط سربار parsing، attribution، storage و scheduling مانیتورینگ را می‌سنجد و اثبات ظرفیت شبکه نیست. توان واقعی به CPU، kernel، NIC، encryption، GOST، NGINX، RTT، CDN و ارائه‌دهنده سرور وابسته است.
 
 daemon، اجرای one-shot و حذف مخرب history از lock خصوصی `/run/gost-manager/collector.lock` استفاده می‌کنند. collector دوم یا purge مستقیم هنگام collection با exit code برابر `4` رد می‌شود. manager پیش از one-shot، برای توقف موقت collector فعال تأیید می‌گیرد و پس از موفقیت، خطا یا interrupt آن را بازمی‌گرداند. حذف history مسیر DB پیکربندی‌شده را نشان می‌دهد، WAL را checkpoint می‌کند، در حالت busy رد می‌شود، recovery hard-link هم‌دایرکتوری می‌سازد، فقط یک replace اتمیک انجام می‌دهد و در failure، DB و sidecarهای قبلی را بازمی‌گرداند. ترافیک و `/etc/gost` دست‌نخورده می‌مانند.
 

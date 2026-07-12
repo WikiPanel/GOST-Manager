@@ -133,10 +133,13 @@ class QueryDatabaseFixture:
 
 class WindowTests(unittest.TestCase):
     def test_duration_parser_accepts_explicit_units(self):
-        self.assertEqual([90, 900, 7200, 172800], [parse_duration(v) for v in ("90s", "15m", "2h", "2d")])
+        self.assertEqual(
+            [90, 900, 7200, 86400],
+            [parse_duration(v) for v in ("90s", "15m", "2h", "24h")],
+        )
 
     def test_duration_parser_rejects_ambiguous_zero_and_oversized(self):
-        for value in ("10", "0s", "-1h", "1.5h", "31d", "999999999s"):
+        for value in ("10", "0s", "-1h", "1.5h", "25h", "2d", "999999999s"):
             with self.subTest(value=value), self.assertRaises(QueryInputError):
                 parse_duration(value)
 
@@ -242,7 +245,7 @@ class QueryEngineTests(unittest.TestCase):
         self.assertIsNone(item.p95)
 
     def test_rollup_p95_unavailable_and_counts_preserved(self):
-        minute = ((NOW - 3 * 24 * 3600) // 60) * 60
+        minute = ((NOW - 12 * 3600) // 60) * 60
         self.fixture.rollup(minute, "cpu_utilization_percent", 30, samples=10, expected=12, unavailable=2, reset=1, gap=1)
         window = resolve_window(
             NOW,
@@ -255,7 +258,7 @@ class QueryEngineTests(unittest.TestCase):
         self.assertEqual((10, 12, 2, 1, 1), (item.sample_count, item.expected_sample_count, item.unavailable_count, item.reset_count, item.gap_count))
 
     def test_partial_rollup_minutes_are_not_fabricated(self):
-        minute = ((NOW - 3 * 24 * 3600) // 60) * 60
+        minute = ((NOW - 12 * 3600) // 60) * 60
         self.fixture.rollup(minute, "cpu_utilization_percent", 30)
         self.fixture.rollup(minute + 60, "cpu_utilization_percent", 90)
         window = resolve_window(
@@ -270,7 +273,7 @@ class QueryEngineTests(unittest.TestCase):
         self.assertAlmostEqual(2 / 3, item.coverage)
 
     def test_rollup_categorical_is_unavailable_not_fabricated(self):
-        minute = ((NOW - 3 * 24 * 3600) // 60) * 60
+        minute = ((NOW - 12 * 3600) // 60) * 60
         self.fixture.rollup(minute, "service_active_state", None, unit="state", kind="service", entity_id="nginx.service")
         window = resolve_window(NOW, start=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(minute)), end=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(minute + 60)))
         item = self.fixture.engine().summary(window).series[0]
@@ -279,7 +282,7 @@ class QueryEngineTests(unittest.TestCase):
         self.assertIsNone(item.latest)
 
     def test_rollup_reports_current_categorical_family_as_historically_unavailable(self):
-        minute = ((NOW - 3 * 24 * 3600) // 60) * 60
+        minute = ((NOW - 12 * 3600) // 60) * 60
         self.fixture.rollup(minute, "cpu_utilization_percent", 30)
         self.fixture.point(NOW - 5, "service_active_state", "active", "state", kind="service", entity_id="nginx.service")
         window = resolve_window(NOW, start=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(minute)), end=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(minute + 60)))

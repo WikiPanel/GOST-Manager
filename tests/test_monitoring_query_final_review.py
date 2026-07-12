@@ -52,6 +52,13 @@ except ModuleNotFoundError:
 NOW = 2_000_000_040  # exact minute boundary
 
 
+def set_fast_cadence(conn, seconds: int = 5) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO collector_state(key,value) VALUES(?,?)",
+        ("metric_cadence_seconds", json.dumps({"host:cpu_*": seconds})),
+    )
+
+
 def point(
     conn,
     ts: int,
@@ -119,6 +126,7 @@ class WatermarkPlanningTests(unittest.TestCase):
         path = str(Path(temp.name) / "metrics.sqlite3")
         conn = init_db(path)
         entity_pk = ensure_entity(conn, "host", "local", "local", {}, NOW)
+        set_fast_cadence(conn)
         start = NOW - 30 * 60
         for ts in range(start, NOW, 5):
             value = float((ts - start) // 60 + 1)
@@ -398,6 +406,7 @@ class RollupWeightingTests(unittest.TestCase):
             path = str(Path(temp) / "metrics.sqlite3")
             conn = init_db(path)
             entity = ensure_entity(conn, "host", "local", "local", {}, NOW)
+            set_fast_cadence(conn)
             start = NOW - 3 * 24 * 3600
             start = (start // 60) * 60
             rows = (
@@ -438,6 +447,7 @@ class RollupWeightingTests(unittest.TestCase):
             path = str(Path(temp) / "metrics.sqlite3")
             conn = init_db(path)
             entity = ensure_entity(conn, "host", "local", "local", {}, NOW)
+            set_fast_cadence(conn)
             start = NOW - 180
             rollup(conn, entity, "cpu_utilization_percent", start, 10, 12, 12, 6, "derived")
             for ts in range(start + 60, start + 120, 5):

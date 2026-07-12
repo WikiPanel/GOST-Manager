@@ -51,6 +51,15 @@ def config_text(**overrides: object) -> str:
 class ConfigParserTests(unittest.TestCase):
     def test_defaults_and_custom_values(self):
         self.assertEqual(DEFAULT_CONFIG, parse_config_text(default_config_text()))
+        self.assertEqual(
+            (10, 30, 60, 900),
+            (
+                DEFAULT_CONFIG.sample_interval,
+                DEFAULT_CONFIG.tcp_interval,
+                DEFAULT_CONFIG.slow_interval,
+                DEFAULT_CONFIG.maintenance_interval,
+            ),
+        )
         parsed = parse_config_text(
             config_text(
                 **{
@@ -83,8 +92,12 @@ class ConfigParserTests(unittest.TestCase):
             default_config_text().replace(DEFAULT_CONFIG.db_path, "/tmp/`id`"),
             default_config_text().replace(DEFAULT_CONFIG.db_path, "/tmp/a b"),
             default_config_text().replace(DEFAULT_CONFIG.db_path, "/tmp/a\x00b"),
-            default_config_text().replace(f"{KEY_SAMPLE}=5", f"{KEY_SAMPLE}=-5"),
-            default_config_text().replace(f"{KEY_SAMPLE}=5", f"{KEY_SAMPLE}=five"),
+            default_config_text().replace(
+                f"{KEY_SAMPLE}={DEFAULT_CONFIG.sample_interval}", f"{KEY_SAMPLE}=-5"
+            ),
+            default_config_text().replace(
+                f"{KEY_SAMPLE}={DEFAULT_CONFIG.sample_interval}", f"{KEY_SAMPLE}=five"
+            ),
         )
         for value in invalid:
             with self.subTest(value=value[-40:]), self.assertRaises(ConfigError):
