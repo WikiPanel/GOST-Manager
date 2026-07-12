@@ -9,6 +9,7 @@ import stat
 import tempfile
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -171,11 +172,18 @@ class GatewayStateStore:
         return pair
 
     def load_pair(self, runtime_ready: bool = False) -> StatePair:
+        with self.locked_pair(runtime_ready=runtime_ready) as pair:
+            return pair
+
+    @contextmanager
+    def locked_pair(self, runtime_ready: bool = False):
+        """Yield one coherent pair while retaining the public state lock."""
+
         with self._lock():
             self._fail("after_lock_acquisition")
             pair = self._load_pair_unlocked(runtime_ready=runtime_ready)
             self._fail("after_current_state_read")
-            return pair
+            yield pair
 
     def initialize(
         self,
