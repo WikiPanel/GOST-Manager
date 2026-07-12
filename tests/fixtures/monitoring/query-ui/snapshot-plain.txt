@@ -1,0 +1,59 @@
+OVERALL
+status: healthy
+reasons: observations_current
+last successful sample: 2033-05-18T03:33:18Z
+sample age: 2s
+history coverage: not applicable (latest-per-series snapshot)
+
+HOST
+CPU: 20 [derived; at=2033-05-18T03:33:18Z age=2s]
+RAM: 50 [derived; at=2033-05-18T03:33:18Z age=2s]
+load 1: 0.20 [exact; at=2033-05-18T03:33:18Z age=2s]
+load 5: 0.30 [exact; at=2033-05-18T03:33:18Z age=2s]
+load 15: 0.40 [exact; at=2033-05-18T03:33:18Z age=2s]
+conntrack: 10 [derived; at=2033-05-18T03:33:18Z age=2s]
+file handles: 5 [derived; at=2033-05-18T03:33:18Z age=2s]
+root filesystem: 45 [at=2033-05-18T03:33:18Z age=2s]
+monitoring filesystem: 35 [at=2033-05-18T03:33:18Z age=2s]
+
+NETWORK
+external RX: 1000 [at=2033-05-18T03:33:18Z age=2s]
+external TX: 500 [at=2033-05-18T03:33:18Z age=2s]
+external RX packets: unavailable [age=unavailable]
+external TX packets: unavailable [age=unavailable]
+external RX errors: unavailable [age=unavailable]
+external TX errors: unavailable [age=unavailable]
+external RX drops: unavailable [age=unavailable]
+external TX drops: unavailable [age=unavailable]
+loopback RX: unavailable [age=unavailable]
+loopback TX: unavailable [age=unavailable]
+
+TCP
+established: 4 [at=2033-05-18T03:33:18Z age=2s]
+SYN-SENT: unavailable [age=unavailable]
+SYN-RECV: unavailable [age=unavailable]
+CLOSE-WAIT: unavailable [age=unavailable]
+TIME-WAIT: unavailable [age=unavailable]
+retransmit rate: unavailable [age=unavailable]
+listen drops: unavailable [age=unavailable]
+listen overflows: unavailable [age=unavailable]
+
+NGINX / SERVICES
+nginx.service: healthy required=false state=active cpu=2 rss=4096 processes=3 fds=20 listeners=2
+  sockets=4 restarts=0 quality=exact age=2s observed=2033-05-18T03:33:18Z
+
+TUNNELS
+iran-1: healthy service=gost-iran-1.service listeners=1/1 ownership=1 remote=example.invalid:443
+  remote_sockets=1 cpu=1 rss=2048 fds=8 quality=exact age=2s observed=2033-05-18T03:33:18Z
+
+COLLECTOR / DATABASE
+cycle: 1 [at=2033-05-18T03:33:18Z age=2s]
+duration: 0.15 [at=2033-05-18T03:33:18Z age=2s]
+missed deadlines: 0 [at=2033-05-18T03:33:18Z age=2s]
+source errors: 0 [at=2033-05-18T03:33:18Z age=2s]
+database size: 123456 [at=2033-05-18T03:33:18Z age=2s]
+WAL size: 0 [at=2033-05-18T03:33:18Z age=2s]
+checkpoint: 1 [at=2033-05-18T03:33:18Z age=2s]
+
+RECENT EVENTS
+2033-05-18T03:33:10Z info metric_source_available entity=proc_stat: Metric source recovered

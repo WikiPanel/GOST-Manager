@@ -20,17 +20,15 @@ local kernel/systemd/NGINX/GOST observations
       ↓
 /var/lib/gost-manager/metrics.sqlite3
       ↓
-gost-manager Monitoring menu
-      ├── Live dashboard
-      ├── 10-minute summary
-      ├── 30-minute summary
-      ├── 1-hour summary
-      ├── Custom window
-      ├── Detailed service/route view
-      └── JSON/CSV export
+python3 -m monitoring.query_cli
+      ├── plain snapshot / ANSI live dashboard
+      ├── cadence-aware historical summaries
+      ├── host/network/service/tunnel/collector details
+      ├── structured event timeline
+      └── bounded JSON/CSV export
 ```
 
-The collector and query CLI use Python 3 standard library only. Bash remains the menu and orchestration layer.
+The collector and independent query CLI use Python 3 standard library only. Installer, systemd, and Bash-menu integration are intentionally deferred to issue #6.
 
 ## Sampling and retention
 
@@ -274,6 +272,14 @@ A route failover counter is incremented only when the manager/health subsystem c
 
 Initial v0.2 health is observational. It does not rewrite NGINX membership automatically.
 
+The query health policy marks observations stale after 20 seconds. CPU at 80%, memory at 85%, and filesystem, conntrack, or system file handles at 85% produce `degraded` reasons. Filesystem, conntrack, and file handles at 95% produce `critical` only from exact or derived observations. An estimated value can degrade health but cannot independently make it critical. Missing required CPU data, unavailable listener ownership, or unavailable process snapshots produce `unknown`; an exact inactive service or exact missing tunnel listener can produce `down`. Each result includes stable reason codes, readable reasons, evaluation time, observation age, semantic quality, and affected entity. Health evaluation never starts, stops, or restarts a service and never changes NGINX, GOST, firewall, routes, or env files.
+
+In Direct Mode, services referenced by active tunnel entity metadata are required. Current membership comes from the latest successful collector cycle: a tunnel is current only when that cycle contains an exact `env_source_valid=1` point, while a service is current when it was discovered and observed in that cycle. A later failed collector cycle does not replace the last successful membership. Removing an env file retires the tunnel and its no-longer-discovered GOST service from current snapshot and health after the next successful cycle, but their retained raw history remains queryable by exact tunnel/service detail commands. Per-tunnel metric failures do not retire a tunnel whose env discovery marker succeeded. Historical entity rows are excluded before applying the 256-current-entity bound.
+
+Current health evaluates the newest transition for each stable service, tunnel, source, or collector incident key. A failure followed by its recovery remains visible in the historical event timeline but is no longer an active health incident; failure, recovery, then failure leaves exactly one active incident. Listener events affect current health only while their tunnel is in current membership, and events older than a recreated tunnel entity do not carry into the new lifecycle. A malformed managed env source records only its safe path identity, exposes `managed_env_invalid`, and remains degraded until `env_parse_recovered`; intentional file removal is retirement, not malformed configuration. The compact snapshot requests only `interface:external-total` and `interface:lo`, so retired transient interfaces cannot exhaust its entity bound, while exact historical interface queries remain available inside retention.
+
+`nginx.service` remains visible but optional until trusted local gateway metadata explicitly sets `gateway_required=true`; absent or inactive optional NGINX does not change overall node health. An exact active required service with zero owned listeners is `down` with reason `required_listener_missing`. Unavailable or stale ownership is `unknown`, never a false `down`. Health-relevant events use a separate time-indexed, 200-row bounded query, so a source/restart/listener/checkpoint failure cannot be hidden by the 50-row display timeline. `service_state_changed` affects health only for a warning/error transition whose `current` state is `inactive` or `failed`; an informational transition to `active` is recovery and does not degrade health. `pid_replaced` remains an explicit restart signal. If more than 200 relevant rows exist, snapshot remains available, returns the newest bounded set, and reports `health_event_overflow` conservatively. Optional-service and optional-source events do not otherwise degrade overall health.
+
 ## Live dashboard
 
 The live view refreshes in place and includes a compact summary:
@@ -307,6 +313,52 @@ Views include:
 - per-route summary;
 - event timeline for restarts, health transitions, config changes, and sampling gaps.
 
+### Query CLI
+
+Every command accepts `--db`; the default is `/var/lib/gost-manager/metrics.sqlite3`.
+
+```bash
+python3 -m monitoring.query_cli snapshot
+python3 -m monitoring.query_cli live --refresh 2
+python3 -m monitoring.query_cli summary --window 10m
+python3 -m monitoring.query_cli summary --start 2026-07-11T10:00:00Z --end 2026-07-11T11:00:00Z
+python3 -m monitoring.query_cli host --window 30m
+python3 -m monitoring.query_cli network --window 30m
+python3 -m monitoring.query_cli services --window 30m
+python3 -m monitoring.query_cli service nginx.service --window 30m
+python3 -m monitoring.query_cli tunnels --window 1h
+python3 -m monitoring.query_cli tunnel iran-1 --window 1h
+python3 -m monitoring.query_cli collector --window 1h
+python3 -m monitoring.query_cli events --window 1h --severity warning,error
+python3 -m monitoring.query_cli export --window 1h --format json --granularity auto --output -
+```
+
+Durations must be an integer followed by `s`, `m`, `h`, or `d`, such as `90s`, `15m`, `2h`, or `2d`. Zero, negative, ambiguous, overflowing, future-only, and greater-than-30-day windows are rejected. Absolute `--start` and `--end` must be supplied together and must include `Z` or an explicit UTC offset. Results retain both the requested and effective window and mark retention truncation.
+
+The shared planner reads `collector_state.minute_rollup_watermark` before choosing a source. Only minute starts strictly before that watermark are finalized rollups. A valid watermark is a non-negative integer aligned to a 60-second boundary and no later than the current completed-minute boundary. Future, misaligned, negative, nonnumeric, or clock-rollback-invalid values are not clamped or trusted; they use the same safe bounded raw fallback as a missing watermark. Complete wall-clock minutes after a valid watermark remain raw, because ordinary 15-minute maintenance means rollups normally lag by as much as about 15 minutes and may lag longer after failure or backlog. Safe recent windows remain raw; larger windows combine finalized rollups with every available raw point after the watermark and report `hybrid`. A stale but valid watermark is allowed, and never turns an available raw tail into artificial missing coverage.
+
+Preflight uses bounded indexed `LIMIT budget+1` queries instead of an unbounded `COUNT(*)`. A raw result within 100,000 rows is materialized and supports weighted p95. Larger raw regions are processed in entity/metric/time order by a constant-memory per-series accumulator; no SQLite temporary table or write is used. A separate configurable `max_stream_scan_rows` ceiling defaults to 1,000,000 raw rows and applies to streamed summaries plus grouped raw-minute `minute`/`auto` exports. Work above that ceiling raises `QueryLimitError`/exit code 4 before an export destination is created. Streamed raw summaries report `raw` or `hybrid` honestly, track rows scanned and peak rows buffered, and leave p95 unavailable. Auto/minute export uses persisted rollups before the watermark and a read-only grouped raw-minute stream after it. The summary materialization cap is 110,000 rows, series 5,000, current entities 256, health events 200, and exports 100,000 rows.
+
+At the accepted 583-series production cardinality with a realistic 15-minute maintenance lag, 10 minutes remains `raw`; 30 minutes, 1 hour, and 2 hours are `hybrid`. Tests cover 0, 1, 5, 14, and 20-minute lag, missing/stalled watermark, and a physically missing finalized rollup row. Valid-watermark plans scan at most 158,313 rows and materialize/buffer at most 105,843 rows with ten SELECT statements per summary. The accepted missing-watermark two-hour fallback scans 760,663 raw rows without materializing the full result; an oversized raw window is rejected at the separate 1,000,000-row scan ceiling.
+
+At the raw-retention boundary, complete rollup minutes end before the cutoff and raw begins exactly at the cutoff. A partial unrepresentable boundary remains missing coverage, including when the requested end occurs before the next minute boundary. No full rollup minute outside the requested interval is used and retained raw-tail points are never discarded. Expected samples use `collector_state.metric_cadence_seconds`, including 5-second fast, 30-second full-socket, and 60-second slow families; unknown families use the collector's 5-second default.
+
+Raw numeric averages are piecewise-constant and weighted by observed duration. SQL returns at most the last valid pre-window seed per series within 2.5 cadence intervals, and no value is carried across a larger gap. Raw p95 uses deterministic weighted nearest rank: values are ordered, elapsed weights are accumulated, and the first value reaching 95% of covered time is selected.
+
+Minute rollups expose two distinct concepts. Observation coverage is `samples / expected_samples` and includes unavailable observations because they arrived. Numeric-value coverage is `(samples - unavailable_count) / expected_samples`; only this valid fraction weights `avg_value`. An all-unavailable minute still contributes samples, expected samples, unavailable/reset/gap counts, and worst quality, but contributes zero numeric average weight. Min/max ignore NULL values. Hybrid averages combine that corrected rollup numeric weight with raw elapsed-time weight. Complete historical minutes use each row's stored `expected_samples`, so later cadence changes do not rewrite historical coverage; missing rows and partial boundaries add explicit uncovered expectations.
+
+`monitoring.metric_semantics` is the single statistics classifier. Gauge and rate series expose latest, min, time-aware average, max, and raw-only weighted p95. Cumulative counters expose latest, first/last timestamps, quality, reset/gap and coverage counts, but no average or p95. Categorical booleans/states, identities such as PID/start identity/endpoint, and Unix timestamps expose latest, timestamp, age, quality, and meaningful transitions without numeric min/average/max/p95. Unknown numeric metrics use the conservative fallback and receive no range, average, or p95 until classified. Rollup, streamed-minute, and hybrid results never fabricate p95.
+
+Detailed output exposes unit, semantic quality, sample/expected counts, coverage, unavailable/reset/gap counts, observation age, and source mode. Exit codes are stable: `0` success, `2` invalid input/window or missing selected entity, `3` missing/corrupt/unsupported database, `4` query/export safety limit, and `130` interrupt.
+
+`snapshot` always produces plain text. It reads the latest point independently for each selected dashboard/health series using bounded entity/metric pairs and correlated `idx_metric_points_lookup` lookups; it does not scan 48 hours or restrict all families to the newest cycle. The latest collector cycle is read separately. Every point retains its own UTC timestamp, age, cadence, quality, and stale flag. Fast values use 5-second freshness, full-socket values 30 seconds, slow filesystem/database/FD values 60 seconds, and checkpoint values the 15-minute maintenance cadence; the accepted freshness limit is 2.5 cadence intervals. A stale point may remain visible with age but is unavailable to required health decisions.
+
+`live` uses ANSI only on a real TTY; pipes, `TERM=dumb`, `NO_COLOR`, and `--no-color` use plain refreshes. Refresh is bounded to 0.2 through 60 seconds, `--iterations` permits finite runs, terminal width is sampled for each refresh, and cursor state is restored after interrupt, termination, or rendering failure. Operator timestamps use UTC ISO-8601 `Z` plus relative age rather than raw Unix timestamps.
+
+### Read-only guarantee
+
+The query layer opens SQLite with `mode=ro`, enables `PRAGMA query_only=ON` and a five-second busy timeout, and validates schema v4 using reads only. Each multi-query operation starts one explicit read transaction and rolls it back immediately after the related reads. Snapshot cycle, latest-per-series points, bounded service/tunnel metadata, display events, and health events therefore come from one coherent WAL snapshot; every live refresh opens a new transaction and no transaction is held while sleeping. Export preflight and streaming share one bounded read transaction, so a normal concurrent collector commit cannot create a false row-count mismatch. The layer never calls migration, initialization, retention, maintenance, or checkpoint functions and never executes DDL or DML. Tests inspect SQLite trace output for `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP`, `REPLACE`, `VACUUM`, and `wal_checkpoint` and exercise concurrent WAL writers.
+
 ## Events and audit trail
 
 A separate event table stores bounded, structured events:
@@ -325,17 +377,22 @@ Events contain identifiers and safe diagnostics, never credentials.
 
 ## Export
 
-Exports support JSON and CSV for a selected time window and entity scope. Every export includes:
+Exports support `summary`, `raw`, `minute`, and `auto` granularity with exact entity and metric filters. `auto` uses raw data for a recent small window and otherwise follows the raw/rollup/hybrid planner. JSON metadata includes:
 
-- schema version;
-- node ID;
-- UTC time range;
-- sample interval;
-- metric quality labels;
-- coverage metadata;
-- units.
+- export and database schema versions;
+- UTC Unix generation time;
+- requested and effective windows;
+- source mode and selected granularity;
+- filters and retention policy;
+- row count and truncation state.
 
-Secret state is never included in monitoring export.
+Export schema v2 rows include entity identity, metric, semantic category, `aggregate_kind`, `value_available`, timestamp or minute start, numeric/text value, unit, quality, reset/gap markers, and coverage fields. Gauge and rate raw-minute rows use `minute_statistics` and may expose minimum, average, and maximum. Cumulative counters, booleans, categorical state, PID/start identity, Unix timestamps, endpoints, and unknown metrics never expose an arithmetic minute average: raw-minute rows preserve the deterministic latest value and timestamp as `minute_latest`, while stored rollups that lack a meaningful last value use `historical_value_unavailable` with `value_available=false`. All-unavailable minute series use the same explicit unavailable representation and retain sample, expected, unavailable, coverage, reset/gap, quality, and source metadata. JSON and CSV carry equivalent fields for these semantics.
+
+CSV uses one stable RFC-style table with the fixed header documented by `monitoring.exporters.CSV_FIELDS`: the first `record_type=metadata` row independently carries export/schema versions, generated UTC and epoch time, requested/effective UTC and epoch windows, actual source mode, granularity, truncation, all three retention values, filters, and data-row count. Data rows repeat that metadata. Summary rows additionally preserve latest/latest timestamp, min/time-aware average/max/p95, sample/expected/coverage, unavailable/reset/gap counts, first/last timestamps, transitions, and age. A zero-data CSV still contains its metadata row; there is no ambiguous preamble.
+
+Windows are capped at 30 days, query series at 5,000, and estimated and actual export rows at 100,000. The bounded estimate is checked before an output file is created. Rows are fetched in bounded batches; files use a same-directory temporary file, mode `0600`, atomic replace, and temporary cleanup on failure. `--output -` streams to stdout.
+
+Exports read only the sanitized metric/entity tables and never raw env files or arbitrary collector state. Keys and text matching credential, username, password, token, authorization, or secret forms are removed or redacted as a second defense. Secret-canary fixtures verify that these values do not appear in JSON or CSV.
 
 ## Performance guardrails
 
@@ -375,6 +432,8 @@ Operators should reserve at least 12 GiB for the monitoring database under this 
 Process CPU/stat and aggregate RSS/thread observations remain on the fast cadence. `/proc/<pid>/fd`, process limits, cgroup file memory, filesystem capacity, and database-size observations use the slow cadence. A service PID set comes from `cgroup.procs`; MainPID fallback totals are estimated rather than exact. Only a complete authoritative cgroup PID set plus complete fast process snapshots advances process-set transition state. A missing fast snapshot makes process metrics unavailable for that cycle without emitting `pid_replaced`, and non-authoritative MainPID fallback never overwrites the last authoritative identity. Identity-bound socket and slow-process caches are neither read nor replaced when the current identity cannot be confirmed. Inactive historical source-error keys are retained for at most 48 hours and capped at 64 keys, while the global error total remains cumulative.
 
 The deterministic performance suite parses and attributes a synthetic 20,000-row socket snapshot within the five-second cycle budget and verifies that a synthetic 10,000-entry FD directory is enumerated once, not six times, across six five-second cycles.
+
+The query performance fixture uses the accepted production shape directly: 522 fast points per 5-second cycle, 9 full-socket extras per 30 seconds, 52 slow extras per 60 seconds, 583 rollup series, one NGINX service, six GOST services, six tunnels, and three interfaces. It stores 823,420 raw points plus retained-history noise and a realistic 15-minute rollup lag. It verifies 10m/30m/1h/2h results, at most ten SELECT statements per summary, 158,313 maximum rows scanned, 105,843 maximum rows buffered/materialized, and actual `idx_metric_points_time`, `idx_metric_points_lookup`, `idx_minute_rollups_time`, and `idx_events_time` query plans, including the grouped raw-minute export query.
 
 ## Acceptance tests
 
