@@ -13,13 +13,18 @@
 
 ```bash
 bash tests/run-tests.sh
+python3 -m unittest discover -s tests -p 'test_gateway*.py'
 python3 -m unittest discover -s tests -p 'test_monitoring*.py'
 ```
 
-Compile every monitoring module and test before running the suite:
+Compile every Gateway and monitoring module and test before running the suite:
 
 ```bash
-python3 -m py_compile monitoring/*.py tests/test_monitoring*.py
+python3 -m py_compile \
+  gateway/*.py \
+  monitoring/*.py \
+  tests/test_gateway*.py \
+  tests/test_monitoring*.py
 ```
 
 The tests do not require root and do not modify:
@@ -52,6 +57,18 @@ bash tests/test-systemd-linux.sh
 ```
 
 They use command stubs and never write to the host's real `/etc`, `/usr/local`, `/var/lib`, systemd, packages, NGINX, firewall, or GOST services.
+
+Gateway desired-state tests use dedicated absolute temporary paths for the
+shared document, node document, backup directory, and lock file. They cover
+strict parsing, cross-document validation, CRUD, revision conflicts,
+concurrent writers, failure injection, rollback, symlink rejection, bounded
+backups, output canaries, Direct Mode isolation, and maximum cardinality. The
+Gateway package must not call subprocesses or traffic-service commands.
+
+For a manual state-only smoke test, create a dedicated temporary directory,
+resolve its physical path, and pass every path override to
+`python3 -m gateway.cli`. Do not use the production defaults during development.
+The full CLI and schema contract is in `docs/GATEWAY-STATE-V0.2.md`.
 
 `tests/test-systemd-linux.sh` skips clearly on non-Linux hosts. On Linux it requires the real `systemd-analyze`, verifies a temporary unit against the complete host unit environment, checks every temporary executable/config path, audits production traffic isolation, and runs the temporary-root installer with real unit verification. The Ubuntu 22.04/24.04 matrix is defined in `.github/workflows/monitoring-integration.yml`.
 
