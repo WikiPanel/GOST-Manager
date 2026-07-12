@@ -605,15 +605,15 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             base = integration_sources(root, command, mono, reader)
             sources = dataclasses.replace(base, list_dir=list_dir, statvfs=statvfs)
             config = CollectorConfig(
-                sample_interval=5.0,
+                sample_interval=10.0,
                 tcp_snapshot_interval=30.0,
                 slow_sample_interval=60.0,
                 filesystem_paths=(Path("/"),),
             )
             db = str(root / "metrics.sqlite3")
-            for offset in range(0, 30, 5):
+            for offset in range(0, 60, 10):
                 collect_once(db, str(root / "env"), 1000 + offset, sources, config)
-                mono[0] += 5
+                mono[0] += 10
             self.assertEqual(process_stat_reads[0], 18)
             self.assertEqual(process_status_reads[0], 3)
             self.assertEqual(process_limits_reads[0], 3)
@@ -621,8 +621,12 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             self.assertEqual(fd_lists[0], 3)
             self.assertEqual(statvfs_calls[0], 1)
             self.assertEqual(
+                len([call for call in command_calls if call[:3] == ("ss", "-H", "-lntp")]),
+                6,
+            )
+            self.assertEqual(
                 len([call for call in command_calls if call[:3] == ("ss", "-H", "-tanp")]),
-                1,
+                2,
             )
 
     def test_historical_source_error_keys_are_bounded_and_not_rewritten(self):

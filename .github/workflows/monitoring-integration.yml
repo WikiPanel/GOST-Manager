@@ -1,0 +1,30 @@
+name: Monitoring integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - feat/monitoring-integration
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-systemd:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tool versions
+        run: |
+          shellcheck --version
+          systemd-analyze --version
+      - name: Full local gate
+        run: make check
+      - name: Real Linux systemd verification
+        run: bash tests/test-systemd-linux.sh

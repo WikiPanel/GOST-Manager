@@ -451,7 +451,7 @@ class StreamBudgetAndWatermarkTests(unittest.TestCase):
             conn.close()
             limits = QueryLimits(max_query_rows=10, max_stream_scan_rows=100)
             engine = QueryEngine(ReadOnlyDatabase(path), clock=lambda: NOW, limits=limits)
-            window = resolve_window(NOW, "2d")
+            window = resolve_window(NOW, "24h")
             with self.assertRaisesRegex(QueryLimitError, "stream_scan_limit"):
                 engine.summary(window)
             destination = Path(temp) / "must-not-exist.json"
@@ -524,7 +524,7 @@ class StreamBudgetAndWatermarkTests(unittest.TestCase):
                 limits=QueryLimits(max_query_rows=0),
             )
             with self.assertRaisesRegex(QueryLimitError, "1,000,000|1000000"):
-                engine.summary(resolve_window(NOW, "2d"))
+                engine.summary(resolve_window(NOW, "24h"))
             self.assertIn(1_000_000, observed)
 
 

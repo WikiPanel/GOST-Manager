@@ -14,7 +14,7 @@ from monitoring.schema import (
     ROLLUP_RETENTION_SECONDS,
 )
 
-MAX_WINDOW_SECONDS = 30 * 24 * 3600
+MAX_WINDOW_SECONDS = ROLLUP_RETENTION_SECONDS
 MAX_DURATION_NUMBER = 10_000_000
 DURATION_RE = re.compile(r"^(?P<number>[1-9][0-9]{0,7})(?P<unit>[smhd])$")
 DURATION_FACTORS = {"s": 1, "m": 60, "h": 3600, "d": 24 * 3600}
@@ -30,7 +30,7 @@ class RetentionPolicy:
 def parse_duration(value: str, maximum: int = MAX_WINDOW_SECONDS) -> int:
     match = DURATION_RE.fullmatch(value.strip())
     if not match:
-        raise QueryInputError("duration must use an explicit form such as 90s, 10m, 1h, or 2d")
+        raise QueryInputError("duration must use an explicit form such as 90s, 10m, 1h, or 24h")
     number = int(match.group("number"))
     if number <= 0 or number > MAX_DURATION_NUMBER:
         raise QueryInputError("duration is outside the safe range")
@@ -80,7 +80,7 @@ def resolve_window(
     if requested_start >= now:
         raise QueryInputError("future-only windows are not allowed")
     if requested_end - requested_start > maximum:
-        raise QueryInputError("window exceeds the 30-day safety limit")
+        raise QueryInputError("window exceeds the 24-hour safety limit")
     oldest = now - max(retention.rollup_seconds, retention.event_seconds)
     if requested_end <= oldest:
         raise QueryInputError("requested window is outside retained monitoring history")

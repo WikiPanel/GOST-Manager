@@ -21,6 +21,12 @@
 sudo gost-manager
 ```
 
+نصب‌کننده علاوه بر manager و runnerهای قبلی، کل پکیج مانیتورینگ را در `/usr/local/lib/gost-manager/monitoring`، سه launcher را در `/usr/local/sbin`، تنظیمات را در `/etc/gost-manager/monitoring.env`، unit را در `/etc/systemd/system/gost-monitor-collector.service` و تاریخچه را در `/var/lib/gost-manager/metrics.sqlite3` نصب می‌کند.
+
+در نصب تازه collector فعال و اجرا می‌شود. در ارتقا، config معتبر سفارشی، تاریخچه، و وضعیت enabled/active قبلی collector حفظ می‌شود. فایل‌های `/etc/gost/iran-*.env` و `/etc/gost/kharej-*.env`، unitهای تونل و وضعیت ترافیک بدون تغییر باقی می‌مانند.
+
+نصب‌کننده فقط ماژول‌های فهرست‌شده در `packaging/monitoring-runtime-manifest.txt` را کپی می‌کند. metadata مسیرهای مشترک `/usr/local/sbin` و `/etc/systemd/system` و همچنین مالکیت، mode و محتوای موجود `/etc/gost` حفظ می‌شود. برای دایرکتوری‌های خصوصی manager، mode/owner اعمال می‌شود و در rollback، metadata قبلی بازگردانده می‌شود.
+
 اجرای مستقیم هم ممکن است:
 
 ```bash
@@ -135,6 +141,85 @@ Available GOST tunnels:
 
 Select tunnel number:
 ```
+
+## مانیتورینگ محلی
+
+گزینه‌های جدید منوی اصلی بدون تغییر شماره‌های ۱ تا ۹ اضافه شده‌اند:
+
+```text
+10) Monitoring
+11) Native GOST Gateway (Coming soon)
+```
+
+زیرمنوی عادی Monitoring Lite ساده و متمرکز است:
+
+```text
+1) Live resources
+2) Last 10 minutes
+3) Last 30 minutes
+4) Last 1 hour
+5) Services and tunnels
+6) Collector status
+7) Advanced tools
+0) Back
+```
+
+نمای live فقط host، network، اتصال‌های TCP، سرویس‌ها، tunnelها و سلامت collector را در اولویت قرار می‌دهد. قابلیت‌های موجود snapshot/detail/event/export/maintenance و کنترل collector در `Advanced tools` حفظ شده‌اند. خطای مانیتورینگ از منو خارج نمی‌شود و هیچ سرویس ترافیکی را تغییر نمی‌دهد.
+
+دستورات مستقیم:
+
+```bash
+systemctl status gost-monitor-collector.service
+systemctl start gost-monitor-collector.service
+systemctl stop gost-monitor-collector.service
+systemctl restart gost-monitor-collector.service
+
+gost-monitor snapshot
+gost-monitor live
+gost-monitor summary --window 10m
+gost-monitor-admin status
+gost-monitor-admin maintenance
+```
+
+فایل تنظیمات با مالک `root:root` و mode برابر `0600` فقط کلیدهای زیر را می‌پذیرد:
+
+```text
+GOST_MONITOR_DB=/var/lib/gost-manager/metrics.sqlite3
+GOST_ENV_DIR=/etc/gost
+GOST_MONITOR_SAMPLE_INTERVAL=10
+GOST_MONITOR_TCP_INTERVAL=30
+GOST_MONITOR_SLOW_INTERVAL=60
+GOST_MONITOR_MAINTENANCE_INTERVAL=900
+```
+
+محدوده sample برابر ۵ تا ۶۰ ثانیه است؛ TCP برابر ۱۰ تا ۳۰۰ و حداقل sample؛ slow برابر ۳۰ تا ۹۰۰ و حداقل sample؛ maintenance برابر ۳۰۰ تا ۸۶۴۰۰ و حداقل slow. این فایل هرگز در Bash source یا اجرا نمی‌شود. کلید ناشناخته/تکراری، مسیر نسبی، substitution شل، quoting ناامن و cadence نامعتبر رد می‌شود.
+
+parser عمومی برای تست و library مسیر absolute امن را می‌پذیرد، اما policy نصب‌شده محدودتر است: `GOST_MONITOR_DB` باید فایل زیر `/var/lib/gost-manager` باشد و `GOST_ENV_DIR` باید خود `/etc/gost` یا زیرمجموعه آن باشد. نام جایگزین مثل `/var/lib/gost-manager/custom.sqlite3` و مسیر nested مثل `/var/lib/gost-manager/archive/current.sqlite3` مجاز است؛ مسیرهای `/srv`، `/root`، `/tmp`، prefix مشابه و عبور از symlink رد می‌شوند. فقط فیلدهای امن و بدون secret را با این فرمان ببینید:
+
+```bash
+gost-monitor-admin config --format json
+gost-monitor-admin config --format value --field database_path
+```
+
+SQLite همچنان history محلی بدون dependency خارجی و مقاوم در برابر restart را نگه می‌دارد. Monitoring Lite به‌صورت پیش‌فرض ۶ ساعت raw metric، ۲۴ ساعت minute rollup و ۲۴ ساعت event ساختاریافته را حفظ می‌کند. برآورد محافظه‌کارانه برای یک NGINX و شش سرویس GOST، با احتساب index، صفحه‌های آزاد، WAL و headroom عملیاتی، حدود ۰٫۴۸۴ GiB است؛ ۱ GiB فضا رزرو کنید. Maintenance در یک transaction انجام می‌شود و checkpoint بعد از commit است.
+
+fixture قطعی ۱٬۰۰۰ کاربر فقط سربار parsing، attribution، storage و scheduling مانیتورینگ را می‌سنجد و اثبات ظرفیت شبکه نیست. توان واقعی به CPU، kernel، NIC، encryption، GOST، NGINX، RTT، CDN و ارائه‌دهنده سرور وابسته است.
+
+daemon، اجرای one-shot و حذف مخرب history از lock خصوصی `/run/gost-manager/collector.lock` استفاده می‌کنند. collector دوم یا purge مستقیم هنگام collection با exit code برابر `4` رد می‌شود. manager پیش از one-shot، برای توقف موقت collector فعال تأیید می‌گیرد و پس از موفقیت، خطا یا interrupt آن را بازمی‌گرداند. حذف history مسیر DB پیکربندی‌شده را نشان می‌دهد، WAL را checkpoint می‌کند، در حالت busy رد می‌شود، recovery hard-link هم‌دایرکتوری می‌سازد، فقط یک replace اتمیک انجام می‌دهد و در failure، DB و sidecarهای قبلی را بازمی‌گرداند. ترافیک و `/etc/gost` دست‌نخورده می‌مانند.
+
+سرویس collector restart محدود، اولویت CPU/I/O پایین، UMask خصوصی و state mode برابر 0700 دارد و هیچ وابستگی یا hook توقف/restart/reload برای NGINX یا سرویس‌های GOST ندارد. خرابی collector، DB، maintenance یا حذف مانیتورینگ باعث توقف Direct Mode نمی‌شود.
+
+گزینه Native GOST Gateway فقط پیام `Coming soon` چاپ می‌کند و هیچ package، فایل، directory، service، database، firewall، NGINX یا GOST را تغییر نمی‌دهد.
+
+## حذف امن
+
+`sudo bash uninstall.sh` را اجرا کنید. حذف manager، سرویس مانیتورینگ، کد مانیتورینگ، config، history، سرویس‌های ترافیکی، credentialهای `/etc/gost` و باینری GOST هرکدام تأیید مستقل دارند و پیش‌فرض همه No است. قبل از اجرا plan نهایی نمایش داده می‌شود.
+
+حذف فقط مانیتورینگ، unitها و وضعیت فعال تونل‌ها، runnerها، `/etc/gost`، باینری GOST، firewall و NGINX را تغییر نمی‌دهد. config و history انتخاب‌های جدا هستند. تا وقتی collector service باقی است کد/config لازم حذف نمی‌شود و تا وقتی سرویس ترافیکی باقی است runnerها حفظ می‌شوند. اگر config/history را نگه دارید، اجرای دوباره `sudo bash install.sh` مانیتورینگ را بازیابی و DB را validate/migrate می‌کند.
+
+پس از هر تلاش حذف، وضعیت واقعی دوباره بررسی می‌شود. اگر حتی یک unit مدیریت‌شده ترافیک باقی بماند، هر دو runner، مسیر `/etc/gost` و باینری `/usr/local/bin/gost` حفظ می‌شوند. اگر collector با وجود unit گم‌شده هنوز active/enabled/loaded باشد، stop/disable انجام می‌شود و شکست آن همه کد، launcher، config و history مانیتورینگ را حفظ می‌کند. مسیر history پیش از حذف اختیاری config ذخیره می‌شود و هیچ‌گاه DB پیش‌فرض حدس زده نمی‌شود.
+
+تست `tests/test-systemd-linux.sh` از `systemd-analyze verify` واقعی و unit tree کامل host استفاده می‌کند و از `--root` ناقص استفاده نمی‌کند. workflow مانیتورینگ همین تست، نصب temporary-root و `make check` را روی Ubuntu 22.04 و 24.04 اجرا می‌کند. اگر rollback وضعیت collector قابل اثبات نباشد، installer backupها را نگه می‌دارد و فرمان‌های دقیق restore، `daemon-reload`، enable/disable، start/stop و status را چاپ می‌کند؛ backupها را پیش از موفقیت status حذف نکنید.
 
 ## مشاهده لاگ
 

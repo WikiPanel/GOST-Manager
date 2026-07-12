@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly MONITORING_LIBRARY_DIR="/usr/local/lib/gost-manager"
+export PYTHONPATH="${MONITORING_LIBRARY_DIR}"
+for argument in "$@"; do
+  case "${argument}" in
+    --policy|--policy=*|--path-root|--path-root=*)
+      printf 'Error: installed launcher policy cannot be overridden.\n' >&2
+      exit 2
+      ;;
+  esac
+done
+exec python3 -m monitoring.query_cli --policy installed --config /etc/gost-manager/monitoring.env "$@"

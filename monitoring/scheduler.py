@@ -147,8 +147,15 @@ def run_daemon(
     stop_requested: Callable[[], bool] | None = None,
     collect: Callable[..., int] = collect_once,
     record_overrun: Callable[[str, int, float, float, float], None] = record_cycle_overrun,
+    config: CollectorConfig | None = None,
 ) -> int:
     active_sources = sources or CollectorSources()
+    active_config = config or CollectorConfig(
+        sample_interval=interval,
+        maintenance_interval=maintenance_interval,
+    )
+    interval = active_config.sample_interval
+    maintenance_interval = active_config.maintenance_interval
     clock = active_sources.clock
     stop = False
 
@@ -179,7 +186,7 @@ def run_daemon(
                     db_path,
                     env_dir,
                     sources=active_sources,
-                    config=CollectorConfig(sample_interval=interval),
+                    config=active_config,
                     maintenance=maintenance,
                 )
                 record_overrun(db_path, cycle_ts, clock.monotonic(), deadline, interval)

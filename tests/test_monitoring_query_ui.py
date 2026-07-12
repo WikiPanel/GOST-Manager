@@ -15,6 +15,7 @@ from monitoring.renderers import (
     SHOW_CURSOR,
     ansi_enabled,
     render_ansi_snapshot,
+    render_live_plain,
     render_snapshot_plain,
     run_live,
 )
@@ -185,6 +186,58 @@ class RendererTests(unittest.TestCase):
             self.assertIn(section, rendered)
         self.assertNotIn("password", rendered.lower())
 
+    def test_monitoring_lite_live_view_has_only_core_operator_sections(self):
+        snapshot = representative_snapshot()
+        snapshot["metrics"].extend(
+            [
+                metric("host", "local", "memory_used_bytes", 500000, "bytes", "derived"),
+                metric("host", "local", "memory_available_bytes", 500000, "bytes"),
+                metric("host", "local", "swap_used_bytes", 0, "bytes", "derived"),
+                metric("interface", "interface:external-total", "rx_packets_per_second", 100, "packets_per_second", "derived"),
+                metric("interface", "interface:external-total", "tx_packets_per_second", 50, "packets_per_second", "derived"),
+                metric("interface", "interface:external-total", "rx_errors", 0, "count"),
+                metric("interface", "interface:external-total", "tx_errors", 0, "count"),
+                metric("interface", "interface:external-total", "rx_drops", 0, "count"),
+                metric("interface", "interface:external-total", "tx_drops", 0, "count"),
+                metric("interface", "interface:lo", "rx_bytes_per_second", 200, "bytes_per_second", "derived"),
+                metric("interface", "interface:lo", "tx_bytes_per_second", 200, "bytes_per_second", "derived"),
+                metric("host", "local", "tcp_state_syn_sent", 1, "count"),
+                metric("host", "local", "tcp_state_syn_recv", 1, "count"),
+                metric("host", "local", "tcp_state_close_wait", 0, "count"),
+                metric("host", "local", "tcp_state_time_wait", 2, "count"),
+                metric("host", "local", "tcp_retransmitted_segments_per_second", 0.1, "segments_per_second", "derived"),
+                metric("host", "local", "tcp_listen_drops", 0, "count"),
+                metric("host", "local", "tcp_listen_overflows", 0, "count"),
+            ]
+        )
+        rendered = render_live_plain(snapshot, width=100)
+        for section in (
+            "HOST",
+            "NETWORK",
+            "CONNECTIONS",
+            "SERVICES",
+            "TUNNELS",
+            "COLLECTOR",
+        ):
+            self.assertIn(section, rendered)
+        for detail in (
+            "CPU total",
+            "RAM used: 500000",
+            "RAM available: 500000",
+            "swap used: 0",
+            "external RX bytes/second: 1000",
+            "external TX packets/second: 50",
+            "external RX errors: 0",
+            "external TX drops: 0",
+            "TCP ESTABLISHED: 4",
+            "remote_established",
+            "missed_deadlines",
+            "database_size",
+        ):
+            self.assertIn(detail, rendered)
+        for advanced in ("RECENT EVENTS", "COLLECTOR / DATABASE", "history coverage"):
+            self.assertNotIn(advanced, rendered)
+
     def test_ansi_selection_and_fallbacks(self):
         self.assertTrue(ansi_enabled(lambda: True, {"TERM": "xterm"}, False))
         self.assertFalse(ansi_enabled(lambda: False, {"TERM": "xterm"}, False))
@@ -249,7 +302,13 @@ class CliTests(unittest.TestCase):
 
     def call(self, argv):
         stdout, stderr = io.StringIO(), io.StringIO()
-        code = main(argv, stdout, stderr, clock=lambda: NOW, sleeper=lambda _seconds: None)
+        code = main(
+            ["--policy", "generic", *argv],
+            stdout,
+            stderr,
+            clock=lambda: NOW,
+            sleeper=lambda _seconds: None,
+        )
         return code, stdout.getvalue(), stderr.getvalue()
 
     def test_snapshot_summary_and_export_smoke(self):

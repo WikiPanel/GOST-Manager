@@ -14,10 +14,10 @@ from monitoring.models import Event, Metric, MetricSample, QUALITY_RANK, Tunnel
 
 SCHEMA_VERSION = 4
 DEFAULT_DB_PATH = "/var/lib/gost-manager/metrics.sqlite3"
-DEFAULT_SAMPLE_INTERVAL_SECONDS = 5.0
-RAW_RETENTION_SECONDS = 48 * 3600
-ROLLUP_RETENTION_SECONDS = 30 * 24 * 3600
-EVENT_RETENTION_SECONDS = 30 * 24 * 3600
+DEFAULT_SAMPLE_INTERVAL_SECONDS = 10.0
+RAW_RETENTION_SECONDS = 6 * 60 * 60
+ROLLUP_RETENTION_SECONDS = 24 * 60 * 60
+EVENT_RETENTION_SECONDS = 24 * 60 * 60
 ROLLUP_BATCH_MINUTES = 240
 SENSITIVE_KEY_RE = re.compile(
     r"(?:^|_)(?:pass|password|token|secret|credential|auth|username|gost_user)(?:$|_)",

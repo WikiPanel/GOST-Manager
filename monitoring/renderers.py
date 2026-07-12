@@ -83,6 +83,18 @@ def _line(text: str, width: int) -> str:
     )
 
 
+def _live_value(point: dict[str, object] | None) -> str:
+    if not point:
+        return "unavailable [quality=unavailable age=unavailable]"
+    age = point.get("data_age_seconds")
+    age_text = "unavailable" if age is None else f"{age}s"
+    stale = " stale" if point.get("stale") else ""
+    return (
+        f"{_value(point)} [quality={point.get('quality', 'unavailable')} "
+        f"age={age_text}{stale}]"
+    )
+
+
 def render_snapshot_plain(
     snapshot: dict[str, object],
     width: int = 100,
@@ -229,6 +241,132 @@ def render_snapshot_plain(
     return "\n".join(_line(item, width) if item else "" for item in lines) + "\n"
 
 
+def render_live_plain(
+    snapshot: dict[str, object],
+    width: int = 100,
+    policy: HealthPolicy = HealthPolicy(),
+) -> str:
+    """Render the compact operator view used by the normal live workflow."""
+    health = evaluate_snapshot(snapshot, policy)
+    metrics = _metric_index(snapshot)
+    lines: list[str] = [f"MONITORING LITE status: {health['overall']['status']}"]
+
+    lines.extend(["", "HOST"])
+    for label, name in (
+        ("CPU total", "cpu_utilization_percent"),
+        ("load 1", "load1"),
+        ("load 5", "load5"),
+        ("load 15", "load15"),
+        ("RAM used", "memory_used_bytes"),
+        ("RAM available", "memory_available_bytes"),
+        ("swap used", "swap_used_bytes"),
+    ):
+        lines.append(f"{label}: {_live_value(metrics.get(('host', 'local', name)))}")
+    lines.append(
+        "root filesystem used: "
+        + _live_value(metrics.get(("filesystem", "fs:/", "filesystem_used_percent")))
+    )
+    lines.append(
+        "monitoring filesystem used: "
+        + _live_value(
+            metrics.get(
+                ("filesystem", "fs:/var/lib/gost-manager", "filesystem_used_percent")
+            )
+        )
+    )
+
+    lines.extend(["", "NETWORK"])
+    for label, entity, name in (
+        ("external RX bytes/second", "interface:external-total", "rx_bytes_per_second"),
+        ("external TX bytes/second", "interface:external-total", "tx_bytes_per_second"),
+        ("external RX packets/second", "interface:external-total", "rx_packets_per_second"),
+        ("external TX packets/second", "interface:external-total", "tx_packets_per_second"),
+        ("external RX errors", "interface:external-total", "rx_errors"),
+        ("external TX errors", "interface:external-total", "tx_errors"),
+        ("external RX drops", "interface:external-total", "rx_drops"),
+        ("external TX drops", "interface:external-total", "tx_drops"),
+        ("loopback RX bytes/second", "interface:lo", "rx_bytes_per_second"),
+        ("loopback TX bytes/second", "interface:lo", "tx_bytes_per_second"),
+    ):
+        lines.append(
+            f"{label}: {_live_value(metrics.get(('interface', entity, name)))}"
+        )
+
+    lines.extend(["", "CONNECTIONS"])
+    for label, name in (
+        ("TCP ESTABLISHED", "tcp_state_estab"),
+        ("SYN-SENT", "tcp_state_syn_sent"),
+        ("SYN-RECV", "tcp_state_syn_recv"),
+        ("CLOSE-WAIT", "tcp_state_close_wait"),
+        ("TIME-WAIT", "tcp_state_time_wait"),
+        ("retransmit rate", "tcp_retransmitted_segments_per_second"),
+        ("listen drops", "tcp_listen_drops"),
+        ("listen overflows", "tcp_listen_overflows"),
+    ):
+        lines.append(f"{label}: {_live_value(metrics.get(('host', 'local', name)))}")
+
+    lines.extend(["", "SERVICES"])
+    services = health["services"]
+    if not services:
+        lines.append("no managed service data")
+    for service, result in sorted(services.items()):
+        prefix = ("service", service)
+        lines.append(
+            f"{service}: state={_value(metrics.get(prefix + ('service_active_state',)))} "
+            f"cpu={_value(metrics.get(prefix + ('process_cpu_percent',)))} "
+            f"rss={_value(metrics.get(prefix + ('process_rss_bytes',)))} "
+            f"processes={_value(metrics.get(prefix + ('process_count',)))} "
+            f"fds={_value(metrics.get(prefix + ('process_open_fds',)))} "
+            f"listeners={_value(metrics.get(prefix + ('listener_owned_count',)))} "
+            f"established={_value(metrics.get(prefix + ('established_sockets_total',)))} "
+            f"restarts={_value(metrics.get(prefix + ('service_restart_count',)))} "
+            f"quality={result['source_quality']} age={result['data_age_seconds']}s"
+        )
+
+    lines.extend(["", "TUNNELS"])
+    tunnels = health["tunnels"]
+    if not tunnels:
+        lines.append("no managed tunnel data")
+    entity_meta = {
+        str(item.get("entity_id")): item.get("metadata", {})
+        for item in snapshot.get("entities", [])
+        if isinstance(item, dict) and item.get("entity_type") == "tunnel"
+    }
+    for tunnel, result in sorted(tunnels.items()):
+        prefix = ("tunnel", tunnel)
+        metadata = entity_meta.get(tunnel, {})
+        service = (
+            metadata.get("service", "unavailable")
+            if isinstance(metadata, dict)
+            else "unavailable"
+        )
+        lines.append(
+            f"{tunnel}: service={service} "
+            f"ownership={_value(metrics.get(prefix + ('listener_ownership_exact',)))} "
+            f"listeners={_value(metrics.get(prefix + ('observed_listener_count',)))}/"
+            f"{_value(metrics.get(prefix + ('configured_listener_count',)))} "
+            f"remote_established={_value(metrics.get(prefix + ('established_remote_sockets',)))} "
+            f"cpu={_value(metrics.get(prefix + ('process_cpu_percent',)))} "
+            f"rss={_value(metrics.get(prefix + ('process_rss_bytes',)))} "
+            f"fds={_value(metrics.get(prefix + ('process_open_fds',)))} "
+            f"quality={result['source_quality']} age={result['data_age_seconds']}s"
+        )
+
+    last_success = metrics.get(
+        ("collector", "local", "last_successful_cycle_timestamp")
+    )
+    lines.extend(["", "COLLECTOR"])
+    lines.append(
+        f"last_success={_utc(last_success.get('numeric_value') if last_success else None)} "
+        f"sample_age={health['overall'].get('data_age_seconds', 'unavailable')}s "
+        f"cycle_duration={_value(metrics.get(('collector', 'local', 'duration_seconds')))} "
+        f"missed_deadlines={_value(metrics.get(('collector', 'local', 'missed_deadlines')))} "
+        f"source_errors={_value(metrics.get(('collector', 'local', 'source_errors_total')))} "
+        f"database_size={_value(metrics.get(('collector', 'local', 'database_size_bytes')))}"
+    )
+    return "\n".join(_line(item, width) if item else "" for item in lines) + "\n"
+
+
 def render_summary(result: QueryResult, width: int = 120) -> str:
     lines = [
         f"SUMMARY source={result.source_mode} truncated={str(result.window.truncated).lower()}",
@@ -282,6 +420,13 @@ def render_ansi_snapshot(snapshot: dict[str, object], width: int = 100) -> str:
     return plain.replace(f"status: {health}", f"status: {colored}", 1)
 
 
+def render_live_ansi(snapshot: dict[str, object], width: int = 100) -> str:
+    plain = render_live_plain(snapshot, width)
+    health = evaluate_snapshot(snapshot)["overall"]["status"]
+    colored = f"{COLOR.get(str(health), '')}{str(health).upper()}{RESET}"
+    return plain.replace(f"status: {health}", f"status: {colored}", 1)
+
+
 def ansi_enabled(
     isatty: Callable[[], bool],
     environ: Mapping[str, str],
@@ -320,9 +465,9 @@ def run_live(
             snapshot = snapshot_provider()
             width = max(20, terminal_size().columns)
             rendered = (
-                render_ansi_snapshot(snapshot, width)
+                render_live_ansi(snapshot, width)
                 if use_ansi
-                else render_snapshot_plain(snapshot, width)
+                else render_live_plain(snapshot, width)
             )
             if use_ansi:
                 stdout.write(CLEAR_SCREEN)

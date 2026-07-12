@@ -1,0 +1,40 @@
+[Unit]
+Description=GOST Manager Monitoring Collector
+After=local-fs.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/gost-manager/monitoring.env
+ExecStartPre=/usr/local/sbin/gost-monitor-admin validate-config --config /etc/gost-manager/monitoring.env
+ExecStart=/usr/local/sbin/gost-monitor-collector --daemon
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+Nice=10
+IOSchedulingClass=idle
+OOMScoreAdjust=500
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+StateDirectory=gost-manager
+StateDirectoryMode=0700
+RuntimeDirectory=gost-manager
+RuntimeDirectoryMode=0700
+ReadWritePaths=/var/lib/gost-manager
+
+[Install]
+WantedBy=multi-user.target

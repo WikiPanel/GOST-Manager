@@ -85,7 +85,7 @@ class MonitoringTests(unittest.TestCase):
             sid=insert_sample(conn,MetricSample('iran-1',60,1,1,0,1,1,1)); insert_metric(conn,sid,Metric('t','x',2,'count','exact'))
             sid=insert_sample(conn,MetricSample('iran-1',119,1,1,0,1,1,1)); insert_metric(conn,sid,Metric('t','x',4,'count','exact'))
             rollup_completed_minutes(conn,180); rollup_completed_minutes(conn,180)
-            self.assertEqual(conn.execute('SELECT samples,avg_value,expected_samples FROM minute_rollups WHERE minute_start=60').fetchone(), (2,3.0,12))
+            self.assertEqual(conn.execute('SELECT samples,avg_value,expected_samples FROM minute_rollups WHERE minute_start=60').fetchone(), (2,3.0,6))
             old=10_000_000-RAW_RETENTION_SECONDS-1; insert_sample(conn,MetricSample('iran-1',old,1,1,0,1,1,1)); conn.execute("INSERT OR REPLACE INTO minute_rollups(entity_pk,metric_name,minute_start,samples,expected_samples,unavailable_count,coverage,unit,quality) VALUES(1,'b',?,?,?,?,?,?,?)", (10_000_000-ROLLUP_RETENTION_SECONDS-60,1,12,0,1,'x','exact'))
             apply_retention(conn,10_000_000)
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM metric_samples WHERE collected_at=?',(old,)).fetchone()[0],0)
@@ -96,9 +96,9 @@ class MonitoringTests(unittest.TestCase):
         raw_cutoff = now - RAW_RETENTION_SECONDS
         rollup_cutoff = now - ROLLUP_RETENTION_SECONDS
         event_cutoff = now - EVENT_RETENTION_SECONDS
-        self.assertEqual(RAW_RETENTION_SECONDS, 48 * 3600)
-        self.assertEqual(ROLLUP_RETENTION_SECONDS, 30 * 24 * 3600)
-        self.assertEqual(EVENT_RETENTION_SECONDS, 30 * 24 * 3600)
+        self.assertEqual(RAW_RETENTION_SECONDS, 6 * 3600)
+        self.assertEqual(ROLLUP_RETENTION_SECONDS, 24 * 3600)
+        self.assertEqual(EVENT_RETENTION_SECONDS, 24 * 3600)
 
         with tempfile.TemporaryDirectory() as td:
             conn = init_db(str(Path(td) / 'm.sqlite3'))
@@ -206,7 +206,7 @@ class MonitoringTests(unittest.TestCase):
             old = gm.collect_once
             try:
                 gm.collect_once = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))
-                self.assertEqual(gm.main(['--db', str(Path(td)/'m.sqlite3'), '--env-dir', td, '--once']), 1)
+                self.assertEqual(gm.main(['--policy', 'generic', '--db', str(Path(td)/'m.sqlite3'), '--env-dir', td, '--once']), 1)
             finally:
                 gm.collect_once = old
 
