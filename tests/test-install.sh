@@ -355,6 +355,18 @@ assert_contains "daemon-reload failure prints exact recovery" "systemctl daemon-
 assert_not_contains "daemon-reload failure avoids traffic" "gost-kharej-" "${COMMAND_LOG}"
 rm -f "${STUB_STATE_DIR}/enabled" "${STUB_STATE_DIR}/active"
 
+unit_warning_root="${TEST_HOME}/unit-warning"
+mkdir -p "${unit_warning_root}"
+unit_warning_before="$(tree_digest "${unit_warning_root}")"
+if STUB_SYSTEMD_ANALYZE_OUTPUT='gost-monitor-collector.service:1: Unknown key name' \
+  run_installer "${unit_warning_root}" >/dev/null 2>&1; then
+  fail "candidate systemd warning rejected"
+else
+  pass "candidate systemd warning rejected"
+fi
+assert_eq "candidate systemd warning causes no mutation" \
+  "${unit_warning_before}" "$(tree_digest "${unit_warning_root}")"
+
 symlink_root="${TEST_HOME}/symlink"
 outside="${TEST_HOME}/outside-canary"
 printf 'outside-safe\n' > "${outside}"

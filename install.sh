@@ -357,8 +357,15 @@ validate_unit_content() {
     die "real host systemd unit verification failed."
   fi
   if [[ -n "${output}" ]]; then
-    printf '%s\n' "${output}" >&2
-    die "real host systemd unit verification emitted warnings."
+    case "${output}" in
+      *"${MONITOR_SERVICE}"*|*"${verification_dir}"*)
+        printf '%s\n' "${output}" >&2
+        die "real host systemd unit verification emitted candidate warnings."
+        ;;
+      *)
+        info "systemd-analyze reported unrelated host-unit diagnostics; the staged monitoring unit passed."
+        ;;
+    esac
   fi
 }
 

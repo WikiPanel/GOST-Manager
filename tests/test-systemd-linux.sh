@@ -77,8 +77,32 @@ if ! "${SYSTEMD_ANALYZE_REAL}" verify "${VERIFY_UNIT}" > "${VERIFY_OUTPUT}" 2>&1
   exit 1
 fi
 if [[ -s "${VERIFY_OUTPUT}" ]]; then
-  cat "${VERIFY_OUTPUT}" >&2
-  printf 'FAIL: systemd-analyze emitted a warning or error\n' >&2
+  if grep -Fq "${VERIFY_UNIT}" "${VERIFY_OUTPUT}" || \
+     grep -Fq "${VERIFY_UNIT##*/}" "${VERIFY_OUTPUT}" || \
+     grep -Fq "${VERIFY_DIR}" "${VERIFY_OUTPUT}"; then
+    cat "${VERIFY_OUTPUT}" >&2
+    printf 'FAIL: systemd-analyze emitted a candidate warning or error\n' >&2
+    exit 1
+  fi
+  printf 'INFO: systemd-analyze emitted only unrelated host-unit diagnostics (%s line(s))\n' \
+    "$(wc -l < "${VERIFY_OUTPUT}" | tr -d ' ')"
+fi
+
+INVALID_DIR="${TEST_HOME}/invalid"
+mkdir -p "${INVALID_DIR}"
+INVALID_UNIT="${INVALID_DIR}/gost-monitor-collector-invalid.service"
+cp "${VERIFY_UNIT}" "${INVALID_UNIT}"
+printf '\nDefinitelyInvalidMonitoringDirective=true\n' >> "${INVALID_UNIT}"
+INVALID_OUTPUT="${TEST_HOME}/invalid.out"
+if "${SYSTEMD_ANALYZE_REAL}" verify "${INVALID_UNIT}" > "${INVALID_OUTPUT}" 2>&1 && \
+   [[ ! -s "${INVALID_OUTPUT}" ]]; then
+  printf 'FAIL: malformed staged unit produced no systemd-analyze diagnostic\n' >&2
+  exit 1
+fi
+if ! grep -Fq "${INVALID_UNIT}" "${INVALID_OUTPUT}" && \
+   ! grep -Fq "${INVALID_UNIT##*/}" "${INVALID_OUTPUT}"; then
+  cat "${INVALID_OUTPUT}" >&2
+  printf 'FAIL: malformed staged unit diagnostic was not attributable\n' >&2
   exit 1
 fi
 
@@ -112,6 +136,7 @@ if [[ -r /etc/os-release ]]; then
   distribution="$(. /etc/os-release && printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-unknown}")"
 fi
 printf 'PASS: real systemd-analyze host verification\n'
+printf 'PASS: malformed staged unit rejected by systemd-analyze\n'
 printf 'PASS: temporary-root install with real systemd-analyze\n'
 printf 'LINUX_DISTRIBUTION=%s\n' "${distribution}"
 printf 'SYSTEMD_VERSION=%s\n' "$(printf '%s\n' "${version_output}" | sed -n '1p')"

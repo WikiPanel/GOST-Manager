@@ -194,6 +194,7 @@ STUB
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf 'systemd-analyze %s\n' "$*" >> "${COMMAND_LOG}"
+[[ -z "${STUB_SYSTEMD_ANALYZE_OUTPUT:-}" ]] || printf '%s\n' "${STUB_SYSTEMD_ANALYZE_OUTPUT}" >&2
 [[ "${STUB_FAIL_SYSTEMD_ANALYZE:-0}" != "1" ]]
 STUB
   chmod 755 "${bin_dir}/systemctl" "${bin_dir}/ss" "${bin_dir}/chown" "${bin_dir}/systemd-analyze"
