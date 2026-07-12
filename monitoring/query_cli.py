@@ -13,12 +13,12 @@ from collections.abc import Callable, Sequence
 from typing import TextIO
 
 from monitoring.exporters import export_data
+from monitoring.config import ConfigError, config_from_environment, load_config
 from monitoring.query_db import ReadOnlyDatabase
 from monitoring.query_engine import QueryEngine
 from monitoring.query_models import QueryError, QueryInputError
 from monitoring.query_window import resolve_window
 from monitoring.renderers import render_events, render_snapshot_plain, render_summary, run_live
-from monitoring.schema import DEFAULT_DB_PATH
 
 NETWORK_HOST_METRICS = (
     "tcp_state_estab",
@@ -37,7 +37,7 @@ class QueryArgumentParser(argparse.ArgumentParser):
 
 
 def _add_database(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--db", default=DEFAULT_DB_PATH, help="monitoring SQLite database")
+    parser.add_argument("--db", help="monitoring SQLite database")
 
 
 def _add_window(parser: argparse.ArgumentParser, default: str = "10m") -> None:
@@ -59,6 +59,7 @@ def _add_metrics(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = QueryArgumentParser(prog="python3 -m monitoring.query_cli")
     parser.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--config", help="strict monitoring config file")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     snapshot = subparsers.add_parser("snapshot", help="print the current monitoring snapshot")
@@ -238,6 +239,12 @@ def main(
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
+        if args.db is None:
+            try:
+                config = load_config(args.config) if args.config else config_from_environment()
+            except ConfigError as exc:
+                raise QueryInputError(str(exc)) from exc
+            args.db = config.db_path
         return run_command(args, stdout, clock, sleeper)
     except QueryError as exc:
         stderr.write(f"error: {exc}\n")

@@ -181,6 +181,7 @@ class CollectorConfig:
     sample_interval: float = DEFAULT_SAMPLE_INTERVAL_SECONDS
     tcp_snapshot_interval: float = DEFAULT_TCP_SNAPSHOT_INTERVAL_SECONDS
     slow_sample_interval: float = DEFAULT_SLOW_SAMPLE_INTERVAL_SECONDS
+    maintenance_interval: float = 15 * 60
     max_gap_multiplier: float = DEFAULT_MAX_GAP_MULTIPLIER
     filesystem_paths: tuple[Path, ...] = (
         Path("/"),

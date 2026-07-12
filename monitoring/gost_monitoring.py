@@ -21,6 +21,19 @@ from monitoring.collector import (
     collect_tunnel_observation,
     run_command,
 )
+from monitoring.config import (
+    ALLOWED_KEYS,
+    ConfigError,
+    KEY_DB,
+    KEY_ENV_DIR,
+    KEY_MAINTENANCE,
+    KEY_SAMPLE,
+    KEY_SLOW,
+    KEY_TCP,
+    config_from_environment,
+    config_from_mapping,
+    load_config,
+)
 from monitoring.entities import (
     DEFAULT_ENV_DIR,
     discover_tunnels,
@@ -301,8 +314,13 @@ def run_daemon(
     clock: Clock = Clock(),
     sleeper: Callable[[float], None] = time.sleep,
     stop_requested: Callable[[], bool] | None = None,
+    config: CollectorConfig | None = None,
 ) -> int:
     sources = CollectorSources(clock=clock, command=runner)
+    active_config = config or CollectorConfig(
+        sample_interval=interval,
+        maintenance_interval=maintenance_interval,
+    )
     return run_daemon_with_sources(
         db_path,
         env_dir,
@@ -313,27 +331,69 @@ def run_daemon(
         stop_requested,
         collect=collect_once,
         record_overrun=record_cycle_overrun,
+        config=active_config,
     )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db", default=os.environ.get("GOST_MONITOR_DB", DEFAULT_DB_PATH))
-    parser.add_argument("--env-dir", default=os.environ.get("GOST_ENV_DIR", DEFAULT_ENV_DIR))
+    parser.add_argument("--config")
+    parser.add_argument("--db")
+    parser.add_argument("--env-dir")
+    parser.add_argument("--interval")
+    parser.add_argument("--tcp-interval")
+    parser.add_argument("--slow-interval")
+    parser.add_argument("--maintenance-interval")
     parser.add_argument("--now", type=int)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true")
     mode.add_argument("--daemon", action="store_true")
     args = parser.parse_args(argv)
+    try:
+        environment_config = (
+            load_config(args.config) if args.config else config_from_environment()
+        )
+        overrides: dict[str, object] = environment_config.as_mapping()
+        if args.db is not None:
+            overrides[KEY_DB] = args.db
+        if args.env_dir is not None:
+            overrides[KEY_ENV_DIR] = args.env_dir
+        if args.interval is not None:
+            overrides[KEY_SAMPLE] = args.interval
+        if args.tcp_interval is not None:
+            overrides[KEY_TCP] = args.tcp_interval
+        if args.slow_interval is not None:
+            overrides[KEY_SLOW] = args.slow_interval
+        if args.maintenance_interval is not None:
+            overrides[KEY_MAINTENANCE] = args.maintenance_interval
+        active = config_from_mapping(
+            {key: overrides[key] for key in ALLOWED_KEYS}, require_all=True
+        )
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    collector_config = active.collector_config()
     if args.once:
         try:
-            migrate_database(args.db)
-            collect_once(args.db, args.env_dir, args.now, maintenance=True)
+            migrate_database(active.db_path)
+            collect_once(
+                active.db_path,
+                active.env_dir,
+                args.now,
+                maintenance=True,
+                config=collector_config,
+            )
             return 0
         except Exception as exc:
             print(f"collection failed: {exc}", file=sys.stderr)
             return 1
-    return run_daemon(args.db, args.env_dir)
+    return run_daemon(
+        active.db_path,
+        active.env_dir,
+        interval=collector_config.sample_interval,
+        maintenance_interval=collector_config.maintenance_interval,
+        config=collector_config,
+    )
 
 
 if __name__ == "__main__":

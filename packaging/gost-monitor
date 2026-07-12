@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly MONITORING_LIBRARY_DIR="/usr/local/lib/gost-manager"
+export PYTHONPATH="${MONITORING_LIBRARY_DIR}"
+exec python3 -m monitoring.query_cli --config /etc/gost-manager/monitoring.env "$@"
