@@ -39,15 +39,12 @@ def parse_systemd_properties(text: str) -> dict[str, str]:
 def discover_managed_services(
     tunnels: Iterable[str],
     list_units_text: str = "",
-    include_nginx: bool = True,
 ) -> tuple[str, ...]:
     services = {service for service in tunnels if GOST_SERVICE_RE.match(service)}
     for raw in list_units_text.splitlines():
         parts = raw.split()
         if parts and GOST_SERVICE_RE.match(parts[0]):
             services.add(parts[0])
-    if include_nginx:
-        services.add("nginx.service")
     return tuple(sorted(services))
 
 

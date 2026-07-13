@@ -57,15 +57,15 @@ def representative_snapshot():
         metric("interface", "interface:external-total", "rx_bytes_per_second", 1000, "bytes_per_second", "derived"),
         metric("interface", "interface:external-total", "tx_bytes_per_second", 500, "bytes_per_second", "derived"),
         metric("host", "local", "tcp_state_estab", 4, "count"),
-        metric("service", "nginx.service", "service_active", 1, "boolean"),
-        metric("service", "nginx.service", "service_active_state", "active", "state"),
-        metric("service", "nginx.service", "process_cpu_percent", 2),
-        metric("service", "nginx.service", "process_rss_bytes", 4096, "bytes"),
-        metric("service", "nginx.service", "process_count", 3, "count"),
-        metric("service", "nginx.service", "process_open_fds", 20, "count"),
-        metric("service", "nginx.service", "listener_owned_count", 2, "count"),
-        metric("service", "nginx.service", "established_sockets_total", 4, "count"),
-        metric("service", "nginx.service", "service_restart_count", 0, "count"),
+        metric("service", "gost-iran-1.service", "service_active", 1, "boolean"),
+        metric("service", "gost-iran-1.service", "service_active_state", "active", "state"),
+        metric("service", "gost-iran-1.service", "process_cpu_percent", 2),
+        metric("service", "gost-iran-1.service", "process_rss_bytes", 4096, "bytes"),
+        metric("service", "gost-iran-1.service", "process_count", 3, "count"),
+        metric("service", "gost-iran-1.service", "process_open_fds", 20, "count"),
+        metric("service", "gost-iran-1.service", "listener_owned_count", 2, "count"),
+        metric("service", "gost-iran-1.service", "established_sockets_total", 4, "count"),
+        metric("service", "gost-iran-1.service", "service_restart_count", 0, "count"),
         metric("tunnel", "iran-1", "service_active", 1, "boolean"),
         metric("tunnel", "iran-1", "listener_ownership_exact", 1, "boolean"),
         metric("tunnel", "iran-1", "configured_listener_count", 1, "count"),
@@ -148,18 +148,18 @@ class HealthTests(unittest.TestCase):
 
     def test_service_down_unknown_and_healthy(self):
         snapshot = representative_snapshot()
-        self.assertEqual("healthy", evaluate_snapshot(snapshot)["services"]["nginx.service"]["status"])
+        self.assertEqual("healthy", evaluate_snapshot(snapshot)["services"]["gost-iran-1.service"]["status"])
         active = next(item for item in snapshot["metrics"] if item["entity_type"] == "service" and item["metric_name"] == "service_active")
         active["numeric_value"] = 0
         evaluated = evaluate_snapshot(snapshot)
-        self.assertEqual("down", evaluated["services"]["nginx.service"]["status"])
-        self.assertEqual("healthy", evaluated["overall"]["status"])
+        self.assertEqual("down", evaluated["services"]["gost-iran-1.service"]["status"])
+        self.assertEqual("critical", evaluated["overall"]["status"])
         active["numeric_value"] = None
         active["quality"] = "unavailable"
-        self.assertEqual("unknown", evaluate_snapshot(snapshot)["services"]["nginx.service"]["status"])
+        self.assertEqual("unknown", evaluate_snapshot(snapshot)["services"]["gost-iran-1.service"]["status"])
         active["numeric_value"] = 1
         active["quality"] = "estimated"
-        self.assertEqual("unknown", evaluate_snapshot(snapshot)["services"]["nginx.service"]["status"])
+        self.assertEqual("unknown", evaluate_snapshot(snapshot)["services"]["gost-iran-1.service"]["status"])
 
     def test_tunnel_down_unknown_and_healthy(self):
         snapshot = representative_snapshot()
@@ -182,8 +182,9 @@ class HealthTests(unittest.TestCase):
 class RendererTests(unittest.TestCase):
     def test_plain_snapshot_has_mandatory_sections_and_safe_values(self):
         rendered = render_snapshot_plain(representative_snapshot(), width=100)
-        for section in ("OVERALL", "HOST", "NETWORK", "TCP", "NGINX / SERVICES", "TUNNELS", "COLLECTOR / DATABASE", "RECENT EVENTS"):
+        for section in ("OVERALL", "HOST", "NETWORK", "TCP", "DIRECT MODE GOST SERVICES", "TUNNELS", "COLLECTOR / DATABASE", "RECENT EVENTS"):
             self.assertIn(section, rendered)
+        self.assertNotIn("NGINX", rendered)
         self.assertNotIn("password", rendered.lower())
 
     def test_monitoring_lite_live_view_has_only_core_operator_sections(self):

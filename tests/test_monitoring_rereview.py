@@ -39,50 +39,67 @@ except ModuleNotFoundError:
 
 
 class MonitoringTechnicalRereviewTests(unittest.TestCase):
-    def test_nginx_master_and_workers_are_aggregated_as_one_service(self):
+    def test_multi_process_service_is_aggregated_across_authoritative_pids(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            write_tunnel_env(root / "env")
+            cgroup_procs = (
+                FIXTURES
+                / "cgroup/system.slice/gost-iran-1.service/cgroup.procs"
+            )
+
+            def reader(path):
+                if path == cgroup_procs:
+                    return "3131\n3132\n3133\n"
+                return path.read_text(encoding="utf-8")
 
             def command(parts):
                 if parts[0] == "ss":
-                    return CommandResult(fixture("ss-nginx-multiprocess.txt"), "", 0)
-                return fixture("systemd-nginx.txt")
+                    return CommandResult(fixture("ss-gost-multiprocess.txt"), "", 0)
+                return fixture("systemd-gost-multiprocess.txt")
 
             db = str(root / "metrics.sqlite3")
             collect_once(
                 db,
                 str(root / "env"),
                 1000,
-                integration_sources(root, command),
+                integration_sources(root, command, read_text=reader),
                 CollectorConfig(filesystem_paths=(Path("/"),)),
             )
             conn = init_db(db)
-            self.assertEqual(stored_metric(conn, "nginx.service", "service_main_pid")[0], 3131)
-            self.assertEqual(stored_metric(conn, "nginx.service", "process_count")[0], 3)
-            self.assertEqual(stored_metric(conn, "nginx.service", "process_cpu_ticks")[0], 900)
-            self.assertEqual(stored_metric(conn, "nginx.service", "process_rss_bytes")[0], 600 * 4096)
-            self.assertEqual(stored_metric(conn, "nginx.service", "process_threads")[0], 6)
-            self.assertEqual(stored_metric(conn, "nginx.service", "process_open_fds")[0], 9)
-            self.assertEqual(stored_metric(conn, "nginx.service", "listener_owned_count")[0], 1)
-            self.assertEqual(stored_metric(conn, "nginx.service", "established_sockets_total")[0], 2)
-            self.assertEqual(stored_metric(conn, "nginx.service", "established_sockets_total")[2], "exact")
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "service_main_pid")[0], 3131)
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "process_count")[0], 3)
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "process_cpu_ticks")[0], 900)
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "process_rss_bytes")[0], 600 * 4096)
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "process_threads")[0], 6)
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "process_open_fds")[0], 9)
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "listener_owned_count")[0], 1)
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "established_sockets_total")[0], 2)
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "established_sockets_total")[2], "exact")
 
     def test_incomplete_fast_snapshot_does_not_replace_authoritative_identity(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            write_tunnel_env(root / "env")
             fail_worker = [False]
             mono = [10.0]
             failed_stat = FIXTURES / "proc/3132/stat"
+            cgroup_procs = (
+                FIXTURES
+                / "cgroup/system.slice/gost-iran-1.service/cgroup.procs"
+            )
 
             def reader(path):
+                if path == cgroup_procs:
+                    return "3131\n3132\n3133\n"
                 if fail_worker[0] and path == failed_stat:
                     raise OSError("transient process stat failure")
                 return path.read_text(encoding="utf-8")
 
             def command(parts):
                 if parts[0] == "ss":
-                    return CommandResult(fixture("ss-nginx-multiprocess.txt"), "", 0)
-                return fixture("systemd-nginx.txt")
+                    return CommandResult(fixture("ss-gost-multiprocess.txt"), "", 0)
+                return fixture("systemd-gost-multiprocess.txt")
 
             db = str(root / "metrics.sqlite3")
             sources = integration_sources(root, command, mono, reader)
@@ -91,10 +108,10 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             collect_once(db, str(root / "env"), 1000, sources, config)
             conn = init_db(db)
             initial_socket_cache = get_json_state(
-                conn, "socket_cache.service.nginx.service"
+                conn, "socket_cache.service.gost-iran-1.service"
             )
             initial_slow_cache = get_json_state(
-                conn, "process_slow_cache.service.nginx.service"
+                conn, "process_slow_cache.service.gost-iran-1.service"
             )
             conn.close()
 
@@ -103,11 +120,11 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             collect_once(db, str(root / "env"), 1005, sources, config)
             conn = init_db(db)
             self.assertEqual(
-                get_json_state(conn, "socket_cache.service.nginx.service"),
+                get_json_state(conn, "socket_cache.service.gost-iran-1.service"),
                 initial_socket_cache,
             )
             self.assertEqual(
-                get_json_state(conn, "process_slow_cache.service.nginx.service"),
+                get_json_state(conn, "process_slow_cache.service.gost-iran-1.service"),
                 initial_slow_cache,
             )
             conn.close()
@@ -118,7 +135,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             conn = init_db(db)
             qualities = conn.execute(
                 "SELECT p.ts,p.quality FROM metric_points p JOIN entities e "
-                "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                "ON e.entity_pk=p.entity_pk WHERE e.entity_id='gost-iran-1.service' "
                 "AND p.metric_name='process_rss_bytes' ORDER BY p.ts"
             ).fetchall()
             self.assertEqual(
@@ -127,7 +144,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             )
             socket_qualities = conn.execute(
                 "SELECT p.ts,p.quality FROM metric_points p JOIN entities e "
-                "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                "ON e.entity_pk=p.entity_pk WHERE e.entity_id='gost-iran-1.service' "
                 "AND p.metric_name='established_sockets_total' ORDER BY p.ts"
             ).fetchall()
             self.assertEqual(
@@ -143,34 +160,35 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             self.assertEqual(
                 conn.execute(
                     "SELECT COUNT(*) FROM events WHERE code='metric_source_unavailable' "
-                    "AND details_json LIKE '%process_fast:nginx.service:3132%'"
+                    "AND details_json LIKE '%process_fast:gost-iran-1.service:3132%'"
                 ).fetchone()[0],
                 1,
             )
             self.assertEqual(
                 conn.execute(
                     "SELECT COUNT(*) FROM events WHERE code='metric_source_available' "
-                    "AND details_json LIKE '%process_fast:nginx.service:3132%'"
+                    "AND details_json LIKE '%process_fast:gost-iran-1.service:3132%'"
                 ).fetchone()[0],
                 1,
             )
             self.assertEqual(
-                get_json_state(conn, "socket_cache.service.nginx.service"),
+                get_json_state(conn, "socket_cache.service.gost-iran-1.service"),
                 initial_socket_cache,
             )
             self.assertEqual(
-                get_json_state(conn, "process_slow_cache.service.nginx.service"),
+                get_json_state(conn, "process_slow_cache.service.gost-iran-1.service"),
                 initial_slow_cache,
             )
 
     def test_real_worker_replacement_emits_one_pid_replaced_event(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            write_tunnel_env(root / "env")
             replaced = [False]
             mono = [10.0]
             cgroup_procs = (
                 FIXTURES
-                / "cgroup/system.slice/nginx.service/cgroup.procs"
+                / "cgroup/system.slice/gost-iran-1.service/cgroup.procs"
             )
             replacement_stat = FIXTURES / "proc/4142/stat"
 
@@ -179,16 +197,16 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
                     return "3131\n4142\n3133\n"
                 if path == replacement_stat:
                     return fixture("proc/3132/stat").replace(
-                        "3132 (nginx worker)",
-                        "4142 (nginx worker)",
+                        "3132 (gost worker)",
+                        "4142 (gost worker)",
                         1,
                     ).replace(" 10001 ", " 20001 ", 1)
                 return path.read_text(encoding="utf-8")
 
             def command(parts):
                 if parts[0] == "ss":
-                    return CommandResult(fixture("ss-nginx-multiprocess.txt"), "", 0)
-                return fixture("systemd-nginx.txt")
+                    return CommandResult(fixture("ss-gost-multiprocess.txt"), "", 0)
+                return fixture("systemd-gost-multiprocess.txt")
 
             db = str(root / "metrics.sqlite3")
             sources = integration_sources(root, command, mono, reader)
@@ -209,7 +227,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             self.assertEqual(
                 conn.execute(
                     "SELECT p.quality FROM metric_points p JOIN entities e "
-                    "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                    "ON e.entity_pk=p.entity_pk WHERE e.entity_id='gost-iran-1.service' "
                     "AND p.metric_name='process_rss_bytes' AND p.ts=1005"
                 ).fetchone()[0],
                 "exact",
@@ -217,7 +235,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             self.assertEqual(
                 conn.execute(
                     "SELECT p.quality FROM metric_points p JOIN entities e "
-                    "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                    "ON e.entity_pk=p.entity_pk WHERE e.entity_id='gost-iran-1.service' "
                     "AND p.metric_name='process_open_fds' AND p.ts=1005"
                 ).fetchone()[0],
                 "unavailable",
@@ -225,7 +243,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             self.assertEqual(
                 conn.execute(
                     "SELECT p.quality FROM metric_points p JOIN entities e "
-                    "ON e.entity_pk=p.entity_pk WHERE e.entity_id='nginx.service' "
+                    "ON e.entity_pk=p.entity_pk WHERE e.entity_id='gost-iran-1.service' "
                     "AND p.metric_name='established_sockets_total' AND p.ts=1005"
                 ).fetchone()[0],
                 "unavailable",
@@ -271,6 +289,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
     def test_main_pid_fallback_is_estimated_not_an_authoritative_service_total(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            write_tunnel_env(root / "env")
             properties = fixture("systemd-gost.txt").replace(
                 "ControlGroup=/system.slice/gost-iran-1.service",
                 "ControlGroup=/missing.service",
@@ -290,11 +309,11 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
                 CollectorConfig(filesystem_paths=(Path("/"),)),
             )
             conn = init_db(db)
-            self.assertEqual(stored_metric(conn, "nginx.service", "service_main_pid")[2], "exact")
-            self.assertEqual(stored_metric(conn, "nginx.service", "process_count")[2], "estimated")
-            self.assertEqual(stored_metric(conn, "nginx.service", "process_rss_bytes")[2], "estimated")
-            self.assertEqual(stored_metric(conn, "nginx.service", "listener_owned_count")[2], "unavailable")
-            self.assertEqual(stored_metric(conn, "nginx.service", "established_sockets_total")[2], "unavailable")
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "service_main_pid")[2], "exact")
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "process_count")[2], "estimated")
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "process_rss_bytes")[2], "estimated")
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "listener_owned_count")[2], "unavailable")
+            self.assertEqual(stored_metric(conn, "gost-iran-1.service", "established_sockets_total")[2], "unavailable")
 
     def test_hostname_endpoint_correlation_is_unavailable(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -492,6 +511,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
         for label, properties, current, peak in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
+                write_tunnel_env(root / "env")
 
                 def command(parts):
                     if parts[0] == "ss":
@@ -508,11 +528,11 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
                 )
                 conn = init_db(db)
                 self.assertEqual(
-                    stored_metric(conn, "nginx.service", "cgroup_memory_current_bytes"),
+                    stored_metric(conn, "gost-iran-1.service", "cgroup_memory_current_bytes"),
                     (float(current), None, "exact"),
                 )
                 self.assertEqual(
-                    stored_metric(conn, "nginx.service", "cgroup_memory_peak_bytes"),
+                    stored_metric(conn, "gost-iran-1.service", "cgroup_memory_peak_bytes"),
                     (float(peak), None, "exact"),
                 )
                 if label == "cgroup-wins":
@@ -526,13 +546,14 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
                     )
                     conn = init_db(db)
                     self.assertEqual(
-                        stored_metric(conn, "nginx.service", "cgroup_memory_current_bytes"),
+                        stored_metric(conn, "gost-iran-1.service", "cgroup_memory_current_bytes"),
                         (float(current), None, "estimated"),
                     )
 
     def test_slow_checkpoint_is_included_in_duration_metrics(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            write_tunnel_env(root / "env")
             mono = [10.0]
 
             def command(parts):
@@ -568,6 +589,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
     def test_fast_and_slow_process_sources_have_deterministic_call_counts(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            write_tunnel_env(root / "env")
             mono = [10.0]
             process_stat_reads = [0]
             process_status_reads = [0]
@@ -578,6 +600,8 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             command_calls: list[tuple[str, ...]] = []
 
             def reader(path):
+                if path.name == "cgroup.procs":
+                    return "3131\n3132\n3133\n"
                 if path.name == "stat" and path.parent.name.isdigit():
                     process_stat_reads[0] += 1
                 elif path.name == "status" and path.parent.name.isdigit():
@@ -600,7 +624,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
                 command_calls.append(tuple(parts))
                 if parts[0] == "ss":
                     return CommandResult("", "", 0)
-                return fixture("systemd-nginx.txt")
+                return fixture("systemd-gost-multiprocess.txt")
 
             base = integration_sources(root, command, mono, reader)
             sources = dataclasses.replace(base, list_dir=list_dir, statvfs=statvfs)

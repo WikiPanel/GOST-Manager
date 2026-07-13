@@ -48,9 +48,9 @@ except ModuleNotFoundError:
 SYNTHETIC_ONLINE_USERS = 1_000
 SYNTHETIC_GOST_SERVICE_COUNT = 6
 SYNTHETIC_TCP_NOISE_ROWS = 20
-SYNTHETIC_LISTENER_ROWS = SYNTHETIC_GOST_SERVICE_COUNT + 1
+SYNTHETIC_LISTENER_ROWS = SYNTHETIC_GOST_SERVICE_COUNT
 SYNTHETIC_SOCKET_ROWS = (
-    SYNTHETIC_ONLINE_USERS * 3
+    SYNTHETIC_ONLINE_USERS * 2
     + SYNTHETIC_TCP_NOISE_ROWS
     + SYNTHETIC_LISTENER_ROWS
 )
@@ -65,9 +65,7 @@ def _maximum_rss_bytes() -> int:
 
 
 def _synthetic_socket_fixture() -> tuple[str, str, Counter[int]]:
-    listeners = [
-        'LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=3131,fd=7))'
-    ]
+    listeners = []
     for number in range(1, SYNTHETIC_GOST_SERVICE_COUNT + 1):
         listeners.append(
             "LISTEN 0 4096 127.0.0.1:{port} 0.0.0.0:* "
@@ -82,22 +80,13 @@ def _synthetic_socket_fixture() -> tuple[str, str, Counter[int]]:
     for index in range(SYNTHETIC_ONLINE_USERS):
         number = index % SYNTHETIC_GOST_SERVICE_COUNT + 1
         gost_pid = 6000 + number
-        nginx_pid = 3132 if index % 2 == 0 else 3133
         users_by_pid[gost_pid] += 1
         client_host = f"203.0.{index // 250}.{index % 250 + 1}"
         rows.append(
-            "ESTAB 0 0 203.0.113.10:443 {client}:{port} "
-            'users:(("nginx",pid={pid},fd={fd}))'.format(
-                client=client_host,
-                port=20_000 + index,
-                pid=nginx_pid,
-                fd=100 + index,
-            )
-        )
-        rows.append(
-            "ESTAB 0 0 127.0.0.1:{listener} 127.0.0.1:{peer} "
+            "ESTAB 0 0 203.0.113.10:{listener} {client}:{peer} "
             'users:(("gost",pid={pid},fd={fd}))'.format(
                 listener=2051 + number,
+                client=client_host,
                 peer=30_000 + index,
                 pid=gost_pid,
                 fd=2_000 + index,
@@ -130,7 +119,6 @@ def run_monitoring_lite_benchmark() -> dict[str, int | float]:
     parse_duration = time.perf_counter() - parse_started
 
     attribution_started = time.perf_counter()
-    nginx_total = established_socket_count(records, (3131, 3132, 3133))
     service_totals = {
         pid: established_socket_count(records, (pid,)) for pid in users_by_pid
     }
@@ -146,13 +134,11 @@ def run_monitoring_lite_benchmark() -> dict[str, int | float]:
     states = tcp_state_counts(records)
     attribution_duration = time.perf_counter() - attribution_started
 
-    if nginx_total != SYNTHETIC_ONLINE_USERS:
-        raise AssertionError("synthetic NGINX socket attribution mismatch")
     if sum(service_totals.values()) != SYNTHETIC_ONLINE_USERS * 2:
         raise AssertionError("synthetic GOST socket attribution mismatch")
     if sum(value or 0 for value in remote_totals.values()) != SYNTHETIC_ONLINE_USERS:
         raise AssertionError("synthetic remote socket attribution mismatch")
-    if states.get("ESTAB") != SYNTHETIC_ONLINE_USERS * 3:
+    if states.get("ESTAB") != SYNTHETIC_ONLINE_USERS * 2:
         raise AssertionError("synthetic TCP state count mismatch")
 
     with tempfile.TemporaryDirectory() as temp:
@@ -171,8 +157,6 @@ def run_monitoring_lite_benchmark() -> dict[str, int | float]:
                     0,
                 )
             service = parts[3]
-            if service == "nginx.service":
-                return fixture("systemd-nginx.txt")
             number = int(service.removeprefix("gost-iran-").removesuffix(".service"))
             return (
                 fixture("systemd-gost.txt")
@@ -186,8 +170,6 @@ def run_monitoring_lite_benchmark() -> dict[str, int | float]:
         def read_text(path: Path) -> str:
             if path.name == "cgroup.procs":
                 service = path.parent.name
-                if service == "nginx.service":
-                    return "3131\n3132\n3133\n"
                 number = int(
                     service.removeprefix("gost-iran-").removesuffix(".service")
                 )
@@ -206,8 +188,7 @@ def run_monitoring_lite_benchmark() -> dict[str, int | float]:
 
         def list_dir(path: Path) -> list[str]:
             pid = int(path.parent.name)
-            count = 1_200 if pid in {3131, 3132, 3133} else 400
-            return [str(index) for index in range(count)]
+            return [str(index) for index in range(400)]
 
         sources = dataclasses.replace(
             integration_sources(root, command, [10.0], read_text),
@@ -234,8 +215,6 @@ def run_monitoring_lite_benchmark() -> dict[str, int | float]:
                 "SELECT missed_deadlines FROM sample_cycles WHERE collected_at=1000"
             ).fetchone()[0]
         )
-        if stored_metric(conn, "nginx.service", "established_sockets_total")[0] != 1000:
-            raise AssertionError("stored NGINX socket count mismatch")
         for number in range(1, SYNTHETIC_GOST_SERVICE_COUNT + 1):
             expected = users_by_pid[6000 + number]
             if stored_metric(
@@ -275,15 +254,11 @@ class MonitoringPerformanceTests(unittest.TestCase):
             env_dir = root / "env"
             for number in range(1, 7):
                 write_tunnel_env(env_dir, number)
-            sockets = fixture("ss-gost-inbound-outbound.txt") + fixture(
-                "ss-nginx-multiprocess.txt"
-            )
+            sockets = fixture("ss-gost-inbound-outbound.txt")
 
             def command(parts):
                 if parts[0] == "ss":
                     return CommandResult(sockets, "", 0)
-                if parts[3] == "nginx.service":
-                    return fixture("systemd-nginx.txt")
                 return fixture("systemd-gost.txt")
 
             db = str(root / "metrics.sqlite3")
@@ -309,17 +284,17 @@ class MonitoringPerformanceTests(unittest.TestCase):
         self.assertEqual(budget.raw_retention_hours, 6)
         self.assertEqual(budget.rollup_retention_days, 1)
         self.assertEqual(budget.event_retention_days, 1)
-        self.assertEqual(budget.fast_metric_points_per_day, 4_510_080)
+        self.assertEqual(budget.fast_metric_points_per_day, 4_190_400)
         self.assertEqual(budget.full_socket_metric_points_per_day, 25_920)
-        self.assertEqual(budget.slow_metric_points_per_day, 74_880)
-        self.assertEqual(budget.metric_points_per_day, 4_610_880)
-        self.assertEqual(budget.raw_metric_points, 1_152_720)
-        self.assertEqual(budget.minute_rollup_rows, 839_520)
+        self.assertEqual(budget.slow_metric_points_per_day, 69_120)
+        self.assertEqual(budget.metric_points_per_day, 4_285_440)
+        self.assertEqual(budget.raw_metric_points, 1_071_360)
+        self.assertEqual(budget.minute_rollup_rows, 780_480)
         self.assertEqual(budget.sample_cycle_rows, 2_160)
         self.assertEqual(budget.metric_sample_rows, 15_120)
         self.assertEqual(budget.event_rows, 5_000)
         self.assertEqual(budget.entity_rows, 2_048)
-        self.assertAlmostEqual(budget.estimated_total_database_gib, 0.484, places=3)
+        self.assertAlmostEqual(budget.estimated_total_database_gib, 0.451, places=3)
         self.assertLess(budget.estimated_total_database_bytes, GIB)
         self.assertEqual(budget.recommended_disk_reservation_bytes, GIB)
         self.assertEqual(budget.recommended_disk_reservation_gib, 1.0)
@@ -356,7 +331,7 @@ class MonitoringPerformanceTests(unittest.TestCase):
         )
         self.assertEqual(seven_day_events.event_rows, 35_000)
         self.assertEqual(seven_day_events.event_retention_days, 7)
-        self.assertEqual(seven_day_events.minute_rollup_rows, 839_520)
+        self.assertEqual(seven_day_events.minute_rollup_rows, 780_480)
         self.assertEqual(seven_day_rollups.event_rows, 150_000)
         self.assertEqual(seven_day_rollups.event_retention_days, 30)
         self.assertEqual(
@@ -388,7 +363,7 @@ class MonitoringPerformanceTests(unittest.TestCase):
             + REPRESENTATIVE_FULL_SOCKET_EXTRA_POINTS
             + REPRESENTATIVE_SLOW_EXTRA_POINTS,
         )
-        self.assertEqual(result["projected_points_per_day"], 4_610_880)
+        self.assertEqual(result["projected_points_per_day"], 4_285_440)
         self.assertLess(result["projected_database_bytes"], GIB)
         self.assertEqual(result["missed_deadlines"], 0)
         self.assertEqual(result["ss_executions"], 2)

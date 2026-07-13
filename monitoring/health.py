@@ -33,11 +33,6 @@ def _required_services(snapshot: dict[str, object]) -> set[str]:
             continue
         if entity.get("entity_type") == "tunnel" and metadata.get("service"):
             required.add(str(metadata["service"]))
-        if (
-            entity.get("entity_type") == "service"
-            and metadata.get("gateway_required") is True
-        ):
-            required.add(str(entity.get("entity_id", "")))
     return required
 
 
@@ -100,8 +95,6 @@ def _required_event_codes(
         if tunnel and event_ts < current_tunnels[tunnel]:
             continue
         if service and service not in required_services:
-            continue
-        if "nginx.service" in source and "nginx.service" not in required_services:
             continue
         if code in {"metric_source_unavailable", "metric_source_available"} and source:
             required_host_sources = {"proc_stat", "proc_meminfo", "filesystem:/"}

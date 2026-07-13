@@ -108,36 +108,6 @@ printf '\n' >> "${COMMAND_LOG}"
 action=""
 unit=""
 result=0
-gateway_removed() {
-  [[ ! -e "${STUB_STATE_DIR}/gateway-removed-$1" ]]
-}
-gateway_listed() {
-  local service
-  for service in ${STUB_GATEWAY_LOADED_SERVICES:-} ${STUB_GATEWAY_ENABLED_SERVICES:-}; do
-    if [[ "${service}" == "$1" ]] && gateway_removed "${service}"; then
-      return 0
-    fi
-  done
-  return 1
-}
-gateway_active() {
-  local service
-  for service in ${STUB_GATEWAY_ACTIVE_SERVICES:-}; do
-    if [[ "${service}" == "$1" ]] && gateway_removed "${service}"; then
-      return 0
-    fi
-  done
-  return 1
-}
-gateway_enabled() {
-  local service
-  for service in ${STUB_GATEWAY_ENABLED_SERVICES:-}; do
-    if [[ "${service}" == "$1" ]] && gateway_removed "${service}"; then
-      return 0
-    fi
-  done
-  return 1
-}
 for argument in "$@"; do
   if [[ -z "${action}" ]]; then
     [[ "${argument}" == -* ]] && continue
@@ -155,20 +125,9 @@ if [[ "${STUB_FAIL_SYSTEMCTL_ACTION:-}" == "${action}" && ( -z "${STUB_FAIL_SYST
   exit 1
 fi
 case "${action}" in
-  list-units)
-    for service in ${STUB_GATEWAY_LOADED_SERVICES:-}; do
-      gateway_removed "${service}" && printf '%s%s loaded inactive dead test\n' "${STUB_GATEWAY_LIST_PREFIX:-}" "${service}"
-    done
-    ;;
-  list-unit-files)
-    for service in ${STUB_GATEWAY_ENABLED_SERVICES:-}; do
-      gateway_removed "${service}" && printf '%s enabled\n' "${service}"
-    done
-    ;;
+  list-units|list-unit-files) ;;
   is-enabled)
     if [[ "${unit}" == "gost-monitor-collector.service" && -f "${STUB_STATE_DIR}/enabled" ]]; then
-      result=0
-    elif gateway_enabled "${unit}"; then
       result=0
     else
       result=1
@@ -176,8 +135,6 @@ case "${action}" in
     ;;
   is-active)
     if [[ "${unit}" == "gost-monitor-collector.service" && -f "${STUB_STATE_DIR}/active" ]]; then
-      result=0
-    elif gateway_active "${unit}"; then
       result=0
     else
       result=1
@@ -201,9 +158,6 @@ case "${action}" in
         rm -f "${STUB_STATE_DIR}/active"
       fi
     fi
-    if [[ "${unit}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] && gateway_listed "${unit}"; then
-      touch "${STUB_STATE_DIR}/gateway-removed-${unit}"
-    fi
     ;;
   start|restart)
     [[ "${unit}" != "gost-monitor-collector.service" ]] || touch "${STUB_STATE_DIR}/active"
@@ -219,8 +173,6 @@ case "${action}" in
   daemon-reload) ;;
   show)
     if [[ "${unit}" == "gost-monitor-collector.service" && ( "${STUB_FORCE_MONITOR_LOADED:-0}" == "1" || -e "${STUB_UNIT_PATH:-/nonexistent}" || -f "${STUB_STATE_DIR}/active" || -f "${STUB_STATE_DIR}/enabled" ) ]]; then
-      printf 'loaded\n'
-    elif gateway_listed "${unit}"; then
       printf 'loaded\n'
     else
       printf 'not-found\n'

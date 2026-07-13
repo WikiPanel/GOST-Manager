@@ -27,6 +27,7 @@ GOST Manager
 7) Restart tunnel
 8) List active GOST services
 9) Clean old/broken GOST configs
+10) Monitoring
 0) Exit
 ```
 
@@ -111,3 +112,10 @@ Detects only managed files:
 ```
 
 It reports service/env mismatches, failed services, disabled orphan services, and old backup files. Nothing is deleted until you confirm.
+
+## 10) Monitoring
+
+Opens local optional Monitoring Lite with live, 10-minute, 30-minute, and
+1-hour views for the host, network, TCP connections, Direct Mode GOST services,
+tunnels, and collector. Monitoring has no traffic-path dependency and cannot
+change a tunnel service.

@@ -264,8 +264,6 @@ class ActiveMembershipTests(unittest.TestCase):
             def command(parts):
                 if parts[0] == "ss":
                     return "malformed socket output\n" if malformed_socket[0] else fixture("ss.txt")
-                if parts[3] == "nginx.service":
-                    return fixture("systemd-nginx.txt")
                 return fixture("systemd-gost.txt")
 
             def reader(path):
@@ -315,6 +313,14 @@ class ActiveMembershipTests(unittest.TestCase):
             self.assertTrue(history.series)
 
             conn = connect_db(db)
+            ensure_entity(
+                conn,
+                "service",
+                "gost-gateway-exit-retired.service",
+                None,
+                {},
+                900,
+            )
             for index in range(300):
                 ensure_entity(conn, "tunnel", f"retired-{index}", None, {}, 900)
                 ensure_entity(conn, "service", f"gost-iran-{index + 10}.service", None, {}, 900)
@@ -322,6 +328,13 @@ class ActiveMembershipTests(unittest.TestCase):
             conn.close()
             failed_latest = QueryEngine(ReadOnlyDatabase(db), clock=lambda: 1006).snapshot()
             self.assertLessEqual(len(failed_latest["entities"]), 2)
+            self.assertNotIn(
+                ("service", "gost-gateway-exit-retired.service"),
+                {
+                    (entity["entity_type"], entity["entity_id"])
+                    for entity in failed_latest["entities"]
+                },
+            )
 
             write_tunnel_env(env_dir)
             monotonic[0] += 5
@@ -363,7 +376,7 @@ class HealthEventTests(unittest.TestCase):
             "severity": "warning",
             "code": "service_state_changed",
             "message": "optional failed",
-            "details": {"service": "nginx.service", "previous": "active", "current": "failed"},
+            "details": {"service": "unmanaged.service", "previous": "active", "current": "failed"},
         }]
         self.assertEqual("healthy", evaluate_snapshot(optional)["overall"]["status"])
 

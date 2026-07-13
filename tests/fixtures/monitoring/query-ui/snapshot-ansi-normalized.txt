@@ -38,9 +38,9 @@ retransmit rate: unavailable [age=unavailable]
 listen drops: unavailable [age=unavailable]
 listen overflows: unavailable [age=unavailable]
 
-NGINX / SERVICES
-nginx.service: healthy required=false state=active cpu=2 rss=4096 processes=3 fds=20 listeners=2
-  sockets=4 restarts=0 quality=exact age=2s observed=2033-05-18T03:33:18Z
+DIRECT MODE GOST SERVICES
+gost-iran-1.service: healthy required=true state=active cpu=2 rss=4096 processes=3 fds=20
+  listeners=2 sockets=4 restarts=0 quality=exact age=2s observed=2033-05-18T03:33:18Z
 
 TUNNELS
 iran-1: healthy service=gost-iran-1.service listeners=1/1 ownership=1 remote=example.invalid:443

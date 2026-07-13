@@ -613,7 +613,7 @@ class PackagingContractTests(unittest.TestCase):
         for forbidden in (
             "Requires=", "PartOf=", "BindsTo=", "PrivateNetwork=",
             "ProtectProc=", "ProcSubset=", "InaccessiblePaths=/proc",
-            "nginx.service", "gost-iran-", "gost-kharej-",
+            "gost-iran-", "gost-kharej-",
         ):
             self.assertNotIn(forbidden, unit)
         for required in (

@@ -195,19 +195,9 @@ manifest_contains() {
   return 1
 }
 
-gateway_manifest_contains() {
-  local expected="$1"
-  local entry
-  for entry in "${GATEWAY_MANIFEST_ENTRIES[@]+"${GATEWAY_MANIFEST_ENTRIES[@]}"}"; do
-    [[ "${entry}" == "${expected}" ]] && return 0
-  done
-  return 1
-}
-
 validate_source_manifest() {
   local path entry existing
   local manifest="${SOURCE_ROOT}/packaging/monitoring-runtime-manifest.txt"
-  local gateway_manifest="${SOURCE_ROOT}/packaging/gateway-runtime-manifest.txt"
   local -a fixed=(
     "gost-manager.sh"
     "lib/gost-run-iran.sh"
@@ -218,10 +208,6 @@ validate_source_manifest() {
     "packaging/gost-monitor-collector.service"
     "packaging/monitoring.env"
     "packaging/monitoring-runtime-manifest.txt"
-    "lib/gost-run-gateway-exit.sh"
-    "packaging/gost-gateway"
-    "packaging/gost-gateway-runtime"
-    "packaging/gateway-runtime-manifest.txt"
   )
   for path in "${fixed[@]}"; do
     [[ -f "${SOURCE_ROOT}/${path}" && ! -L "${SOURCE_ROOT}/${path}" ]] || die "required source file is missing or unsafe: ${path}"
@@ -248,55 +234,25 @@ validate_source_manifest() {
     manifest_contains "${path}" || die "runtime manifest omits required module: ${path}"
   done
 
-  [[ -f "${gateway_manifest}" && ! -L "${gateway_manifest}" ]] || die "gateway runtime manifest must be a regular non-symlink file."
-  GATEWAY_MANIFEST_ENTRIES=()
-  while IFS= read -r entry || [[ -n "${entry}" ]]; do
-    [[ -n "${entry}" ]] || die "gateway runtime manifest contains a blank record."
-    [[ "${entry}" != /* && "${entry}" != *".."* ]] || die "gateway runtime manifest contains an unsafe path: ${entry}"
-    [[ "${entry}" =~ ^gateway/[A-Za-z_][A-Za-z0-9_]*\.py$ ]] || die "gateway runtime manifest contains an invalid module: ${entry}"
-    existing=0
-    for path in "${GATEWAY_MANIFEST_ENTRIES[@]+"${GATEWAY_MANIFEST_ENTRIES[@]}"}"; do
-      if [[ "${path}" == "${entry}" ]]; then
-        existing=1
-        break
-      fi
-    done
-    [[ "${existing}" == "0" ]] || die "gateway runtime manifest contains a duplicate module: ${entry}"
-    [[ -f "${SOURCE_ROOT}/${entry}" && ! -L "${SOURCE_ROOT}/${entry}" ]] || die "gateway runtime module is missing, non-regular, or symlinked: ${entry}"
-    GATEWAY_MANIFEST_ENTRIES+=("${entry}")
-  done < "${gateway_manifest}"
-  [[ "${#GATEWAY_MANIFEST_ENTRIES[@]}" -gt 1 ]] || die "gateway runtime manifest is incomplete."
-  for path in gateway/__init__.py gateway/cli.py gateway/runtime_cli.py gateway/runtime_apply.py gateway/secrets.py; do
-    gateway_manifest_contains "${path}" || die "gateway runtime manifest omits required module: ${path}"
-  done
 }
 
 stage_sources() {
   local entry destination
   STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gost-manager-install.XXXXXX")"
   "${CHMOD_BIN}" 700 "${STAGE_DIR}"
-  "${INSTALL_BIN}" -d -m 755 "${STAGE_DIR}/lib" "${STAGE_DIR}/monitoring" "${STAGE_DIR}/gateway" "${STAGE_DIR}/sbin"
+  "${INSTALL_BIN}" -d -m 755 "${STAGE_DIR}/lib" "${STAGE_DIR}/monitoring" "${STAGE_DIR}/sbin"
   "${CP_BIN}" "${SOURCE_ROOT}/gost-manager.sh" "${STAGE_DIR}/gost-manager"
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-iran.sh" "${STAGE_DIR}/lib/gost-run-iran.sh"
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-kharej.sh" "${STAGE_DIR}/lib/gost-run-kharej.sh"
-  "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-gateway-exit.sh" "${STAGE_DIR}/lib/gost-run-gateway-exit.sh"
   STAGED_MODULES=()
   for entry in "${RUNTIME_MANIFEST_ENTRIES[@]}"; do
     destination="${STAGE_DIR}/monitoring/${entry##*/}"
     "${CP_BIN}" "${SOURCE_ROOT}/${entry}" "${destination}"
     STAGED_MODULES+=("${destination}")
   done
-  STAGED_GATEWAY_MODULES=()
-  for entry in "${GATEWAY_MANIFEST_ENTRIES[@]}"; do
-    destination="${STAGE_DIR}/gateway/${entry##*/}"
-    "${CP_BIN}" "${SOURCE_ROOT}/${entry}" "${destination}"
-    STAGED_GATEWAY_MODULES+=("${destination}")
-  done
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor" "${STAGE_DIR}/sbin/gost-monitor"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor-admin" "${STAGE_DIR}/sbin/gost-monitor-admin"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor-collector" "${STAGE_DIR}/sbin/gost-monitor-collector"
-  "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-gateway" "${STAGE_DIR}/sbin/gost-gateway"
-  "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-gateway-runtime" "${STAGE_DIR}/sbin/gost-gateway-runtime"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor-collector.service" "${STAGE_DIR}/gost-monitor-collector.service"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/monitoring.env" "${STAGE_DIR}/monitoring.env"
 }
@@ -306,16 +262,13 @@ validate_staged_bash() {
     "${STAGE_DIR}/gost-manager" \
     "${STAGE_DIR}/lib/gost-run-iran.sh" \
     "${STAGE_DIR}/lib/gost-run-kharej.sh" \
-    "${STAGE_DIR}/lib/gost-run-gateway-exit.sh" \
     "${STAGE_DIR}/sbin/gost-monitor" \
     "${STAGE_DIR}/sbin/gost-monitor-admin" \
-    "${STAGE_DIR}/sbin/gost-monitor-collector" \
-    "${STAGE_DIR}/sbin/gost-gateway" \
-    "${STAGE_DIR}/sbin/gost-gateway-runtime"
+    "${STAGE_DIR}/sbin/gost-monitor-collector"
 }
 
 validate_staged_python() {
-  PYTHONPYCACHEPREFIX="${STAGE_DIR}/pycache" "${PYTHON_BIN}" -m py_compile "${STAGED_MODULES[@]}" "${STAGED_GATEWAY_MODULES[@]}"
+  PYTHONPYCACHEPREFIX="${STAGE_DIR}/pycache" "${PYTHON_BIN}" -m py_compile "${STAGED_MODULES[@]}"
 }
 
 admin_config_command() {
@@ -369,7 +322,7 @@ validate_staged_config() {
 validate_unit_content() {
   local unit="${STAGE_DIR}/gost-monitor-collector.service"
   local forbidden required verification_dir verification_unit output
-  for forbidden in 'Requires=' 'PartOf=' 'BindsTo=' 'PrivateNetwork=' 'ProtectProc=' 'ProcSubset=' 'InaccessiblePaths=/proc' 'nginx.service' 'gost-iran-' 'gost-kharej-'; do
+  for forbidden in 'Requires=' 'PartOf=' 'BindsTo=' 'PrivateNetwork=' 'ProtectProc=' 'ProcSubset=' 'InaccessiblePaths=/proc' 'gost-iran-' 'gost-kharej-'; do
     if grep -Fq "${forbidden}" "${unit}"; then
       die "monitoring unit contains forbidden setting: ${forbidden}"
     fi
@@ -577,49 +530,12 @@ install_monitoring_package() {
   FILES_CHANGED=1
 }
 
-install_gateway_package() {
-  local destination candidate backup backup_container entry
-  destination="$(path_for /usr/local/lib/gost-manager/gateway)"
-  reject_symlink_path "${destination}"
-  if [[ -e "${destination}" && ! -d "${destination}" ]]; then
-    die "gateway package destination is not a directory."
-  fi
-  [[ ! -d "${destination}" ]] || record_metadata "${destination}"
-  candidate="$(mktemp -d "${destination}.gost-manager-new.XXXXXX")"
-  PENDING_PATHS+=("${candidate}")
-  "${CHMOD_BIN}" 755 "${candidate}"
-  for entry in "${GATEWAY_MANIFEST_ENTRIES[@]}"; do
-    "${INSTALL_BIN}" -m 644 "${STAGE_DIR}/gateway/${entry##*/}" "${candidate}/${entry##*/}"
-  done
-  "${CHOWN_BIN}" -R root:root "${candidate}"
-  if [[ -d "${destination}" ]]; then
-    backup_container="$(mktemp -d "${destination}.gost-manager-backup.XXXXXX")"
-    BACKUP_CONTAINERS+=("${backup_container}")
-    "${CHMOD_BIN}" 700 "${backup_container}"
-    "${CHOWN_BIN}" root:root "${backup_container}"
-    backup="${backup_container}/original"
-    "${MV_BIN}" "${destination}" "${backup}"
-  else
-    backup=""
-  fi
-  CHANGED_DESTINATIONS+=("${destination}")
-  BACKUP_PATHS+=("${backup}")
-  "${MV_BIN}" "${candidate}" "${destination}"
-  FILES_CHANGED=1
-}
-
 install_files() {
   local config_path unit_path before_count
   ensure_shared_directory "$(path_for /usr/local/sbin)" 755
   ensure_private_directory "$(path_for /usr/local/lib/gost-manager)" 755
   ensure_legacy_directory "$(path_for /etc/gost)"
   ensure_private_directory "$(path_for /etc/gost-manager)" 700
-  ensure_private_directory "$(path_for /etc/gost-manager/secrets)" 700
-  ensure_private_directory "$(path_for /etc/gost-manager/generated)" 700
-  ensure_private_directory "$(path_for /etc/gost-manager/generated/gateway)" 700
-  ensure_private_directory "$(path_for /etc/gost-manager/generated/gateway/exits)" 700
-  ensure_private_directory "$(path_for /etc/gost-manager/backups)" 700
-  ensure_private_directory "$(path_for /etc/gost-manager/backups/gateway-runtime)" 700
   ensure_shared_directory "$(path_for /etc/systemd/system)" 755
   ensure_private_directory "$(path_for /var/lib/gost-manager)" 700
   ensure_configured_db_parent
@@ -627,14 +543,10 @@ install_files() {
   install_managed_file "${STAGE_DIR}/gost-manager" "$(path_for /usr/local/sbin/gost-manager)" 755
   install_managed_file "${STAGE_DIR}/lib/gost-run-iran.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-iran.sh)" 755
   install_managed_file "${STAGE_DIR}/lib/gost-run-kharej.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-kharej.sh)" 755
-  install_managed_file "${STAGE_DIR}/lib/gost-run-gateway-exit.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-gateway-exit.sh)" 755
   install_monitoring_package
-  install_gateway_package
   install_managed_file "${STAGE_DIR}/sbin/gost-monitor" "$(path_for /usr/local/sbin/gost-monitor)" 755
   install_managed_file "${STAGE_DIR}/sbin/gost-monitor-admin" "$(path_for /usr/local/sbin/gost-monitor-admin)" 755
   install_managed_file "${STAGE_DIR}/sbin/gost-monitor-collector" "$(path_for /usr/local/sbin/gost-monitor-collector)" 755
-  install_managed_file "${STAGE_DIR}/sbin/gost-gateway" "$(path_for /usr/local/sbin/gost-gateway)" 755
-  install_managed_file "${STAGE_DIR}/sbin/gost-gateway-runtime" "$(path_for /usr/local/sbin/gost-gateway-runtime)" 755
 
   config_path="$(path_for /etc/gost-manager/monitoring.env)"
   if [[ ! -e "${config_path}" ]]; then

@@ -1,11 +1,11 @@
-name: Monitoring and gateway integration
+name: Direct Mode and Monitoring Lite
 
 on:
   pull_request:
   push:
     branches:
       - feat/monitoring-integration
-      - feat/gateway-gost-runtime
+      - feat/direct-mode-scope-reset
 
 permissions:
   contents: read
