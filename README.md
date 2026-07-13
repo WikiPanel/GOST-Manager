@@ -1,8 +1,10 @@
 # GOST Manager
 
-GOST Manager is a menu-based Bash project for installing GOST v3 and managing numbered Iran/Kharej tunnels with systemd on Ubuntu servers.
+GOST Manager is a menu-based Bash project for installing GOST v3 and managing numbered Iran/Kharej Direct Mode tunnels with systemd on Ubuntu servers.
 
-It installs or updates the official `go-gost/gost` binary, creates independent numbered tunnel services, stores each tunnel configuration under `/etc/gost`, and provides menu actions for status, logs, restart, delete, listing, and safe cleanup.
+Direct Mode is the only supported traffic mode in v0.2. The project installs the official `go-gost/gost` release artifact unchanged; GOST Manager is only an installer, configuration, and service wrapper and does not alter upstream protocol behavior. Multiple independent Iran and Kharej profiles are supported.
+
+NGINX Gateway and Native GOST Gateway are cancelled. There is no placeholder, hidden command, route runtime, or NGINX dependency. Issue #29 is reserved for improving multi-server Direct Mode profile management.
 
 ## Supported OS
 
@@ -142,6 +144,9 @@ sudo gost-manager
 Use the menu:
 
 ```text
+1) Install / Update GOST
+2) Create Kharej tunnel
+3) Create Iran tunnel
 4) Delete tunnel
 5) Show status
 6) Show logs
@@ -149,7 +154,7 @@ Use the menu:
 8) List active GOST services
 9) Clean old/broken GOST configs
 10) Monitoring
-11) Native GOST Gateway (Coming soon)
+0) Exit
 ```
 
 For delete, status, logs, and restart, the manager now shows a numbered tunnel selector. You no longer need to type `iran` or `kharej` manually.
@@ -164,21 +169,6 @@ Select tunnel number:
 ```
 
 Each numbered tunnel is independent. Deleting `iran-2` does not affect `iran-1`; deleting `kharej-2` does not affect `kharej-1`.
-
-## Local Gateway Exit runtime
-
-The v0.2 Gateway runtime can prepare independent loopback-only GOST Exit
-services before the public NGINX milestone. It is intentionally available only
-through the installed `gost-gateway` desired-state CLI and
-`gost-gateway-runtime` secret/runtime CLI; the main menu is unchanged.
-
-Credentials live in private `0600` files below
-`/etc/gost-manager/secrets`, never in desired state or generated runtime files.
-Use hidden prompts or strict JSON on stdin, inspect `runtime plan`, then confirm
-activation with `runtime apply --yes`. Unchanged active Exit services are not
-restarted. See [Gateway Local Exit Runtime v0.2](docs/GATEWAY-RUNTIME-V0.2.md)
-for exact paths, ownership checks, rollback, and secret rotation. This milestone
-does not install or activate NGINX or firewall rules.
 
 ## Local Monitoring
 
@@ -195,7 +185,7 @@ Option `10` opens the compact Monitoring Lite workflow:
 0) Back
 ```
 
-The normal live view focuses on host, network, TCP connections, managed services, tunnels, and collector health. Existing snapshot/detail/event/export/maintenance/service-control commands remain available under `Advanced tools`. Monitoring command failures return to the manager menu and never trigger traffic service actions.
+The normal live view focuses on host, network, TCP connections, Direct Mode GOST services, tunnels, and collector health. Monitoring is local and optional, has no NGINX dependency, and never enters the traffic path. Existing snapshot/detail/event/export/maintenance/service-control commands remain available under `Advanced tools`. Monitoring command failures return to the manager menu and never trigger traffic service actions.
 
 Direct commands are also available:
 
@@ -232,26 +222,19 @@ gost-monitor-admin config --format json
 gost-monitor-admin config --format value --field database_path
 ```
 
-SQLite remains the dependency-free, restart-safe local history store. Monitoring Lite retains 6 hours of raw points, 24 hours of minute rollups, and 24 hours of structured events. The conservative estimate for one NGINX service plus six GOST services is about 0.484 GiB, including indexes, reusable pages, WAL, and operational headroom; reserve 1 GiB. `gost-monitor-admin maintenance` runs rollup/retention in one transaction and checkpoints after commit.
+SQLite remains the dependency-free, restart-safe local history store. Monitoring Lite retains 6 hours of raw points, 24 hours of minute rollups, and 24 hours of structured events. The conservative estimate for six GOST services is about 0.451 GiB, including indexes, reusable pages, WAL, and operational headroom; reserve 1 GiB. `gost-monitor-admin maintenance` runs rollup/retention in one transaction and checkpoints after commit.
 
-The deterministic 1,000-user fixture validates monitoring parsing, attribution, storage, and scheduling overhead; it is not a network-capacity claim. Production throughput still depends on CPU, kernel, NIC, encryption, GOST, NGINX, RTT, CDN, and the server provider.
+The deterministic 1,000-user fixture validates monitoring parsing, attribution, storage, and scheduling overhead; it is not a network-capacity claim. Production throughput still depends on CPU, kernel, NIC, encryption, GOST, RTT, CDN, and the server provider.
 
 The daemon, one-shot collector, and destructive history purge share the private advisory lock `/run/gost-manager/collector.lock`. A second collector or a direct purge while collection is active returns exit code `4`. The manager asks before temporarily stopping an active collector for one-shot diagnostics and restores it after success, failure, or interrupt. History deletion requires the exact phrase `DELETE MONITORING HISTORY`, resolves and displays the configured database, checkpoints WAL, refuses a busy checkpoint, creates same-directory hard-link recovery anchors, performs one atomic canonical replacement, fsyncs durability boundaries, and restores the original DB and sidecars after an injected failure. It does not touch traffic or `/etc/gost`.
 
-The collector service has bounded restart behavior, low CPU/I/O priority, private state permissions, and no `Requires=`, `PartOf=`, `BindsTo=`, stop, restart, or reload relationship with NGINX or GOST tunnel services. Collector failure, corrupt history, maintenance failure, or monitoring removal cannot stop Direct Mode traffic.
-
-Option `11`, `Native GOST Gateway (Coming soon)`, only prints a message and returns. It performs no dependency, package, filesystem, service, database, firewall, NGINX, or GOST action.
+The collector service has bounded restart behavior, low CPU/I/O priority, private state permissions, and no `Requires=`, `PartOf=`, `BindsTo=`, stop, restart, or reload relationship with GOST tunnel services. Collector failure, corrupt history, maintenance failure, or monitoring removal cannot stop Direct Mode traffic.
 
 ## Safe Uninstall
 
 Run `sudo bash uninstall.sh`. Every component defaults to No and is confirmed independently: manager CLI, monitoring service, monitoring code, monitoring config, monitoring history, managed traffic services, `/etc/gost` credentials/backups, and the GOST binary. A final plan is shown before changes.
 
-Removing monitoring only leaves tunnel units, active traffic, runners, `/etc/gost`, the GOST binary, firewall state, and NGINX unchanged. History and config are separate choices. Monitoring code cannot be removed while its service remains; runners are retained while managed traffic units remain. If history/config are retained, a later `sudo bash install.sh` restores the monitoring code and validates/migrates the retained database.
-
-Gateway runtime, desired state, private secrets, and the Gateway package are
-four separate default-No removal choices. Private secret deletion requires the
-exact phrase `DELETE GATEWAY SECRETS`; package removal is refused while any
-exact Gateway Exit service remains.
+Removing monitoring only leaves tunnel units, active traffic, runners, `/etc/gost`, the GOST binary, firewall state, and unrelated host services unchanged. History and config are separate choices. Monitoring code cannot be removed while its service remains; runners are retained while managed traffic units remain. If history/config are retained, a later `sudo bash install.sh` restores the monitoring code and validates/migrates the retained database.
 
 Removal decisions are rechecked against actual post-action state. If any exact managed traffic unit survives, both runners, `/etc/gost`, and `/usr/local/bin/gost` are preserved even when deletion was selected. If the collector is active, enabled, or loaded despite a missing unit file, removal still attempts to stop/disable it; a failure preserves monitoring code, launchers, config, and history. History removal uses the configured DB captured before optional config deletion and never guesses the default path.
 

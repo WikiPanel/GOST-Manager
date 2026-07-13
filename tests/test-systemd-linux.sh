@@ -64,7 +64,7 @@ PY
 for forbidden in \
   'Requires=' 'PartOf=' 'BindsTo=' \
   'ExecStartPost=' 'ExecStop=' 'ExecStopPost=' 'ExecReload=' \
-  'nginx.service' 'gost-iran-' 'gost-kharej-'; do
+  'gost-iran-' 'gost-kharej-'; do
   if grep -Fq "${forbidden}" "${ROOT_DIR}/packaging/gost-monitor-collector.service"; then
     printf 'FAIL: production unit contains traffic dependency/lifecycle token: %s\n' "${forbidden}" >&2
     exit 1
@@ -86,77 +86,6 @@ if [[ -s "${VERIFY_OUTPUT}" ]]; then
   fi
   printf 'INFO: systemd-analyze emitted only unrelated host-unit diagnostics (%s line(s))\n' \
     "$(wc -l < "${VERIFY_OUTPUT}" | tr -d ' ')"
-fi
-
-GATEWAY_VERIFY_DIR="${TEST_HOME}/gateway-verify"
-mkdir -p "${GATEWAY_VERIFY_DIR}/secrets" "${GATEWAY_VERIFY_DIR}/generated/exits" \
-  "${GATEWAY_VERIFY_DIR}/systemd"
-gateway_test_user="user-$(printf '%s' "${RANDOM}${RANDOM}" | shasum | cut -c1-12)"
-gateway_test_pass="pass-$(printf '%s' "${RANDOM}${RANDOM}${RANDOM}" | shasum | cut -c1-16)"
-printf 'GOST_USER=%s\nGOST_PASS=%s\n' "${gateway_test_user}" "${gateway_test_pass}" \
-  > "${GATEWAY_VERIFY_DIR}/secrets/secret-ee-primary.env"
-printf 'GATEWAY_EXIT_ID=ee-primary\nGATEWAY_LISTEN_ADDRESS=127.0.0.1\nGATEWAY_LISTEN_PORT=18081\nGATEWAY_EXIT_HOST=exit.example.org\nGATEWAY_SOCKS_PORT=28420\nGATEWAY_TARGET_ADDRESS=127.0.0.1\nGATEWAY_TARGET_PORT=18081\n' \
-  > "${GATEWAY_VERIFY_DIR}/generated/exits/ee-primary.env"
-printf '#!/usr/bin/env bash\nexit 0\n' > "${GATEWAY_VERIFY_DIR}/gost-run-gateway-exit.sh"
-chmod 755 "${GATEWAY_VERIFY_DIR}/gost-run-gateway-exit.sh"
-GATEWAY_UNIT="${GATEWAY_VERIFY_DIR}/systemd/gost-gateway-exit-ee-primary.service"
-PYTHONPATH="${ROOT_DIR}" python3 - "${GATEWAY_VERIFY_DIR}" "${GATEWAY_UNIT}" <<'PY'
-import sys
-from pathlib import Path
-from gateway.runtime_models import DesiredExitRuntime
-from gateway.runtime_paths import RuntimePaths, service_name
-from gateway.runtime_render import render_unit
-
-root = Path(sys.argv[1]).resolve()
-paths = RuntimePaths.from_values(
-    root / "secrets", root / "generated", root / "backups", root / "runtime.lock",
-    root / "systemd", root / "gost-run-gateway-exit.sh", root / "gost",
-)
-desired = DesiredExitRuntime(
-    "ee-primary", service_name("ee-primary"), "127.0.0.1", 18081,
-    "exit.example.org", 28420, "127.0.0.1", 18081,
-    "secret-ee-primary", 1,
-)
-Path(sys.argv[2]).write_bytes(render_unit(desired, paths))
-PY
-
-for required in 'LimitNOFILE=200000' 'Gateway Exit ee-primary'; do
-  grep -Fq "${required}" "${GATEWAY_UNIT}" || {
-    printf 'FAIL: generated gateway unit lacks %s\n' "${required}" >&2
-    exit 1
-  }
-done
-for forbidden in 'nginx.service' 'gost-iran-' 'gost-kharej-' \
-  'gost-monitor-collector.service' 'PrivateNetwork=true'; do
-  if grep -Fq "${forbidden}" "${GATEWAY_UNIT}"; then
-    printf 'FAIL: generated gateway unit contains forbidden token: %s\n' "${forbidden}" >&2
-    exit 1
-  fi
-done
-GATEWAY_VERIFY_OUTPUT="${TEST_HOME}/gateway-verify.out"
-if ! "${SYSTEMD_ANALYZE_REAL}" verify "${GATEWAY_UNIT}" > "${GATEWAY_VERIFY_OUTPUT}" 2>&1; then
-  cat "${GATEWAY_VERIFY_OUTPUT}" >&2
-  exit 1
-fi
-if grep -Fq "${GATEWAY_UNIT##*/}" "${GATEWAY_VERIFY_OUTPUT}"; then
-  cat "${GATEWAY_VERIFY_OUTPUT}" >&2
-  printf 'FAIL: systemd-analyze emitted a gateway candidate warning\n' >&2
-  exit 1
-fi
-
-GATEWAY_INVALID_UNIT="${GATEWAY_VERIFY_DIR}/systemd/gost-gateway-exit-invalid.service"
-cp "${GATEWAY_UNIT}" "${GATEWAY_INVALID_UNIT}"
-printf '\nDefinitelyInvalidGatewayDirective=true\n' >> "${GATEWAY_INVALID_UNIT}"
-GATEWAY_INVALID_OUTPUT="${TEST_HOME}/gateway-invalid.out"
-if "${SYSTEMD_ANALYZE_REAL}" verify "${GATEWAY_INVALID_UNIT}" > "${GATEWAY_INVALID_OUTPUT}" 2>&1 && \
-   [[ ! -s "${GATEWAY_INVALID_OUTPUT}" ]]; then
-  printf 'FAIL: malformed gateway unit produced no diagnostic\n' >&2
-  exit 1
-fi
-if ! grep -Fq "${GATEWAY_INVALID_UNIT##*/}" "${GATEWAY_INVALID_OUTPUT}"; then
-  cat "${GATEWAY_INVALID_OUTPUT}" >&2
-  printf 'FAIL: malformed gateway unit diagnostic was not attributable\n' >&2
-  exit 1
 fi
 
 INVALID_DIR="${TEST_HOME}/invalid"
@@ -209,7 +138,5 @@ fi
 printf 'PASS: real systemd-analyze host verification\n'
 printf 'PASS: malformed staged unit rejected by systemd-analyze\n'
 printf 'PASS: temporary-root install with real systemd-analyze\n'
-printf 'PASS: generated gateway Exit unit verified by real systemd-analyze\n'
-printf 'PASS: malformed gateway Exit unit rejected by real systemd-analyze\n'
 printf 'LINUX_DISTRIBUTION=%s\n' "${distribution}"
 printf 'SYSTEMD_VERSION=%s\n' "$(printf '%s\n' "${version_output}" | sed -n '1p')"

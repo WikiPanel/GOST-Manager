@@ -83,8 +83,6 @@ class SnapshotContractTests(unittest.TestCase):
             def command(parts):
                 if parts[0] == "ss":
                     return fixture("ss.txt")
-                if parts[3] == "nginx.service":
-                    return fixture("systemd-nginx.txt")
                 return fixture("systemd-gost.txt")
 
             def reader(path):
@@ -273,25 +271,14 @@ class HealthPolicyReviewTests(unittest.TestCase):
                 point("service", "gost-iran-1.service", "listener_owned_count", listeners, listener_quality, age=5),
                 point("tunnel", "iran-1", "service_active", service_active, age=5),
                 point("tunnel", "iran-1", "listener_ownership_exact", listeners, listener_quality, age=5),
-                point("service", "nginx.service", "service_active", 0, age=5),
-                point("service", "nginx.service", "process_rss_bytes", None, "unavailable", age=5),
-                point("service", "nginx.service", "listener_owned_count", None, "unavailable", age=5),
             ],
         }
 
-    def test_optional_nginx_does_not_affect_direct_mode_overall(self):
+    def test_snapshot_contains_only_current_direct_mode_service(self):
         health = evaluate_snapshot(self.snapshot())
-        self.assertEqual("down", health["services"]["nginx.service"]["status"])
-        self.assertFalse(health["services"]["nginx.service"]["required"])
+        self.assertEqual({"gost-iran-1.service"}, set(health["services"]))
+        self.assertTrue(health["services"]["gost-iran-1.service"]["required"])
         self.assertEqual("healthy", health["overall"]["status"])
-        absent = self.snapshot()
-        absent["metrics"] = [
-            item for item in absent["metrics"]
-            if item["entity_id"] != "nginx.service"
-        ]
-        absent_health = evaluate_snapshot(absent)
-        self.assertNotIn("nginx.service", absent_health["services"])
-        self.assertEqual("healthy", absent_health["overall"]["status"])
 
     def test_required_service_inactive_zero_listener_and_unavailable(self):
         self.assertEqual("critical", evaluate_snapshot(self.snapshot(service_active=0))["overall"]["status"])
@@ -315,27 +302,26 @@ class HealthPolicyReviewTests(unittest.TestCase):
                 "severity": "warning",
                 "code": "metric_source_unavailable",
                 "message": "optional source unavailable",
-                "details": {"source": "nginx_status"},
+                "details": {"source": "optional_kernel_source"},
             }
         ]
         self.assertEqual("healthy", evaluate_snapshot(snapshot)["overall"]["status"])
 
 
 class ProductionProfileQueryTests(unittest.TestCase):
-    def test_accepted_583_series_profile_windows_and_query_plans(self):
+    def test_accepted_542_series_profile_windows_and_query_plans(self):
         with tempfile.TemporaryDirectory() as temp:
             path = str(Path(temp) / "metrics.sqlite3")
             conn = init_db(path)
             entities = []
             entity_specs = [("host", "local")]
-            entity_specs += [("service", "nginx.service")]
             entity_specs += [("service", f"gost-iran-{index}.service") for index in range(1, 7)]
             entity_specs += [("tunnel", f"iran-{index}") for index in range(1, 7)]
             entity_specs += [("interface", f"interface:eth{index}") for index in range(3)]
             for kind, entity_id in entity_specs:
                 entities.append((kind, ensure_entity(conn, kind, entity_id, entity_id, {}, NOW)))
             specs = []
-            for prefix, count, cadence in (("fast", 522, 10), ("socket", 9, 30), ("slow", 52, 60)):
+            for prefix, count, cadence in (("fast", 485, 10), ("socket", 9, 30), ("slow", 48, 60)):
                 for index in range(count):
                     kind, entity_pk = entities[index % len(entities)]
                     specs.append((kind, entity_pk, f"{prefix}_{index:03d}", cadence))
@@ -423,7 +409,7 @@ class ProductionProfileQueryTests(unittest.TestCase):
             self.assertEqual("raw", results["30m"].source_mode)
             self.assertEqual("hybrid", results["1h"].source_mode)
             self.assertTrue(all(item.p95 is None for item in results["1h"].series))
-            self.assertTrue(all(len(result.series) == 583 for result in results.values()))
+            self.assertTrue(all(len(result.series) == 542 for result in results.values()))
             maximum = max(result.materialized_rows for result in results.values())
             self.assertLessEqual(maximum, 105_843)
             self.assertLessEqual(maximum, engine.limits.max_materialized_rows)
@@ -632,7 +618,7 @@ class ExportParityTests(unittest.TestCase):
             path = str(Path(temp) / "metrics.sqlite3")
             conn = init_db(path)
             insert_point(conn, NOW - 5, "host", "local", "cpu_utilization_percent", 20)
-            insert_point(conn, NOW - 4, "service", "nginx.service", "service_active_state", "active", "state")
+            insert_point(conn, NOW - 4, "service", "gost-iran-1.service", "service_active_state", "active", "state")
             insert_point(conn, NOW - 3, "host", "local", "unavailable_metric", None, "count", "unavailable")
             old = math.floor((NOW - 3 * 24 * 3600) / 60) * 60
             entity_pk = ensure_entity(conn, "host", "local", "local", {}, NOW)

@@ -78,6 +78,7 @@ from monitoring.socket_readers import (
 )
 from monitoring.systemd_readers import (
     cgroup_memory_metrics,
+    discover_managed_services,
     parse_systemd_properties,
     read_cgroup_memory,
     service_metrics,
@@ -294,13 +295,21 @@ class HostStorageCoverageTests(unittest.TestCase):
 
 
 class ServiceProcessCoverageTests(unittest.TestCase):
-    def test_nginx_gost_properties_and_optional_ip_accounting(self):
+    def test_discovery_keeps_multiple_direct_services_and_ignores_nginx(self):
+        services = discover_managed_services(
+            ("gost-iran-1.service",),
+            "nginx.service loaded active running\n"
+            "gost-kharej-2.service loaded active running\n",
+        )
+        self.assertEqual(
+            services,
+            ("gost-iran-1.service", "gost-kharej-2.service"),
+        )
+
+    def test_gost_properties_and_optional_ip_accounting(self):
         gost = service_metrics("gost-iran-1.service", parse_systemd_properties(fixture("systemd-gost.txt")))
-        nginx = service_metrics("nginx.service", parse_systemd_properties(fixture("systemd-nginx.txt")))
         self.assertEqual(metric(gost, "service_main_pid").value, 4242)
         self.assertEqual(metric(gost, "systemd_ip_ingress_bytes").quality, "exact")
-        self.assertEqual(metric(nginx, "service_active_state").value, "active")
-        self.assertEqual(metric(nginx, "systemd_ip_ingress_bytes").quality, "unavailable")
 
     def test_process_cpu_rss_threads_fds_and_pid_identity(self):
         snapshot = read_process_snapshot(
@@ -332,7 +341,7 @@ class ServiceProcessCoverageTests(unittest.TestCase):
         )
         self.assertEqual(values["memory_current"], 8_388_608)
         self.assertEqual(values["memory_peak"], 12_582_912)
-        missing = cgroup_memory_metrics("nginx.service", {})
+        missing = cgroup_memory_metrics("gost-iran-2.service", {})
         self.assertTrue(all(item.quality == "unavailable" for item in missing))
 
     def test_listener_ownership_established_count_and_process_states(self):
@@ -417,8 +426,14 @@ class EventAndCollectorCoverageTests(unittest.TestCase):
                 "MAPPINGS=2052:2052\n",
                 encoding="utf-8",
             )
+            (env_dir / "iran-2.env").write_text(
+                "KHAREJ_IP=198.51.100.21\n"
+                "TUNNEL_PORT=28421\n"
+                "MAPPINGS=2053:2053\n",
+                encoding="utf-8",
+            )
             db = str(root / "metrics.sqlite3")
-            nginx_available = [False]
+            second_service_available = [False]
             monotonic = [10.0]
 
             def command(parts):
@@ -427,8 +442,15 @@ class EventAndCollectorCoverageTests(unittest.TestCase):
                 service = parts[3]
                 if service == "gost-iran-1.service":
                     return fixture("systemd-gost.txt")
-                if service == "nginx.service" and nginx_available[0]:
-                    return fixture("systemd-nginx.txt")
+                if service == "gost-iran-2.service" and second_service_available[0]:
+                    return (
+                        fixture("systemd-gost.txt")
+                        .replace("MainPID=4242", "MainPID=0")
+                        .replace(
+                            "ControlGroup=/system.slice/gost-iran-1.service",
+                            "ControlGroup=/missing.service",
+                        )
+                    )
                 raise OSError("source unavailable")
 
             stats = SimpleNamespace(
@@ -486,7 +508,7 @@ class EventAndCollectorCoverageTests(unittest.TestCase):
                 self.assertIn(expected, metric_names)
             unavailable_count = conn.execute(
                 "SELECT COUNT(*) FROM events WHERE code='metric_source_unavailable' "
-                "AND details_json LIKE '%systemd:nginx.service%'"
+                "AND details_json LIKE '%systemd:gost-iran-2.service%'"
             ).fetchone()[0]
             self.assertEqual(unavailable_count, 1)
             self.assertEqual(
@@ -517,13 +539,13 @@ class EventAndCollectorCoverageTests(unittest.TestCase):
             self.assertNotIn("fixture-password", persisted_text)
             conn.close()
 
-            nginx_available[0] = True
+            second_service_available[0] = True
             monotonic[0] += 5.0
             collect_once(db, str(env_dir), 1010, sources, config)
             conn = init_db(db)
             recovered = conn.execute(
                 "SELECT COUNT(*) FROM events WHERE code='metric_source_available' "
-                "AND details_json LIKE '%systemd:nginx.service%'"
+                "AND details_json LIKE '%systemd:gost-iran-2.service%'"
             ).fetchone()[0]
             self.assertEqual(recovered, 1)
 

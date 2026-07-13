@@ -162,7 +162,7 @@ def render_snapshot_plain(
         point = metrics.get(("host", "local", name))
         lines.append(f"{label}: {_value(point)} [{_age(point)}]")
 
-    lines.extend(["", "NGINX / SERVICES"])
+    lines.extend(["", "DIRECT MODE GOST SERVICES"])
     services = health["services"]
     if not services:
         lines.append("no managed service data")
@@ -305,7 +305,7 @@ def render_live_plain(
     ):
         lines.append(f"{label}: {_live_value(metrics.get(('host', 'local', name)))}")
 
-    lines.extend(["", "SERVICES"])
+    lines.extend(["", "GOST SERVICES"])
     services = health["services"]
     if not services:
         lines.append("no managed service data")

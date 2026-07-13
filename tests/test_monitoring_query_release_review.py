@@ -277,8 +277,6 @@ class CollectorMembershipEventTests(unittest.TestCase):
                 if "-lntp" in parts and mode[0] == "empty":
                     return ""
                 return fixture("ss.txt")
-            if parts[3] == "nginx.service":
-                return fixture("systemd-nginx.txt")
             return fixture("systemd-gost.txt")
 
         def reader(path):

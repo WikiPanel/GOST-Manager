@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-export PYTHONPATH=/usr/local/lib/gost-manager
-exec python3 -m gateway.cli "$@"

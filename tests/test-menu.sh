@@ -73,7 +73,9 @@ for label in \
   assert_contains "legacy menu label ${label%%)*}" "${label}" "${menu_file}"
 done
 assert_contains "Monitoring appended as option 10" "10) Monitoring" "${menu_file}"
-assert_contains "Native placeholder appended as option 11" "11) Native GOST Gateway (Coming soon)" "${menu_file}"
+assert_not_contains "main menu has no option 11" "11)" "${menu_file}"
+assert_not_contains "main menu has no option 12" "12)" "${menu_file}"
+assert_not_contains "Native Gateway placeholder removed" "Coming soon" "${menu_file}"
 
 : > "${COMMAND_LOG}"
 export STUB_MONITOR_EXIT=3
@@ -88,20 +90,6 @@ live_output="${TEST_HOME}/live.out"
 monitor_query live > "${live_output}"
 assert_contains "Ctrl-C live returns to menu" "Monitoring view closed" "${live_output}"
 unset STUB_MONITOR_EXIT
-
-audit_root="${TEST_HOME}/native-complete-root"
-mkdir -p "${audit_root}/etc/gost" "${audit_root}/usr/local/sbin" "${audit_root}/var/lib/gost-manager"
-printf 'unchanged\n' > "${audit_root}/canary"
-printf 'direct\n' > "${audit_root}/etc/gost/iran-1.env"
-chmod 640 "${audit_root}/etc/gost/iran-1.env"
-ln -s "iran-1.env" "${audit_root}/etc/gost/current.env"
-tree_before="$(tree_digest "${audit_root}")"
-log_before="$(cksum "${COMMAND_LOG}")"
-native_output="${TEST_HOME}/native.out"
-native_gost_gateway_coming_soon > "${native_output}"
-assert_eq "Native placeholder filesystem no-op" "${tree_before}" "$(tree_digest "${audit_root}")"
-assert_eq "Native placeholder command no-op" "${log_before}" "$(cksum "${COMMAND_LOG}")"
-assert_contains "Native placeholder prints Coming soon" "Coming soon" "${native_output}"
 
 : > "${COMMAND_LOG}"
 status_output="${TEST_HOME}/status.out"
@@ -171,7 +159,6 @@ show_logs() { printf 'logs\n' >> "${DISPATCH_LOG}"; }
 restart_tunnel() { printf 'restart\n' >> "${DISPATCH_LOG}"; }
 list_active_gost_services() { printf 'list\n' >> "${DISPATCH_LOG}"; }
 clean_old_broken_configs() { printf 'cleanup\n' >> "${DISPATCH_LOG}"; }
-native_gost_gateway_coming_soon() { printf 'native\n' >> "${DISPATCH_LOG}"; }
 monitor_query() { printf 'query %s\n' "$*" >> "${DISPATCH_LOG}"; }
 monitor_custom_summary() { printf 'custom\n' >> "${DISPATCH_LOG}"; }
 monitor_service_detail() { printf 'service-detail\n' >> "${DISPATCH_LOG}"; }
@@ -186,10 +173,13 @@ monitor_purge_history() { printf 'purge\n' >> "${DISPATCH_LOG}"; }
 STUB
 # shellcheck source=/dev/null
 source "${dispatch_stubs}"
-(main_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n0' >/dev/null)
-assert_eq "legacy dispatch order unchanged" $'install\nkharej\niran\ndelete\nstatus\nlogs\nrestart\nlist\ncleanup' "$(sed -n '1,9p' "${DISPATCH_LOG}")"
+(
+  monitoring_menu() { printf 'monitoring\n' >> "${DISPATCH_LOG}"; }
+  main_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n0' >/dev/null
+)
+assert_eq "main dispatch order 1 through 10 exact" $'install\nkharej\niran\ndelete\nstatus\nlogs\nrestart\nlist\ncleanup\nmonitoring' "$(sed -n '1,10p' "${DISPATCH_LOG}")"
 assert_contains "main option 10 dispatches Monitoring" '10) monitoring_menu ;;' "${ROOT_DIR}/gost-manager.sh"
-assert_contains "main option 11 dispatches Native placeholder" '11) native_gost_gateway_coming_soon ;;' "${ROOT_DIR}/gost-manager.sh"
+assert_not_contains "main dispatch has no Native option" 'native_gost_gateway_coming_soon' "${ROOT_DIR}/gost-manager.sh"
 
 lite_menu_file="${TEST_HOME}/monitoring-lite-menu.txt"
 show_monitoring_menu > "${lite_menu_file}"

@@ -1197,7 +1197,7 @@ monitor_service_detail() {
   monitor_query services --window 10m
   read -r -p "Exact service name (empty to return): " service
   [[ -n "${service}" ]] || return 0
-  if [[ ! "${service}" =~ ^(nginx|gost-(iran|kharej)-[1-9][0-9]*)\.service$ ]]; then
+  if [[ ! "${service}" =~ ^gost-(iran|kharej)-[1-9][0-9]*\.service$ ]]; then
     info "Invalid managed service name."
     return 0
   fi
@@ -1460,10 +1460,6 @@ monitoring_menu() {
   done
 }
 
-native_gost_gateway_coming_soon() {
-  info "Native GOST Gateway: Coming soon."
-}
-
 show_menu() {
   cat <<'MENU'
 GOST Manager
@@ -1479,7 +1475,6 @@ GOST Manager
 8) List active GOST services
 9) Clean old/broken GOST configs
 10) Monitoring
-11) Native GOST Gateway (Coming soon)
 0) Exit
 MENU
 }
@@ -1500,7 +1495,6 @@ main_menu() {
       8) list_active_gost_services ;;
       9) clean_old_broken_configs ;;
       10) monitoring_menu ;;
-      11) native_gost_gateway_coming_soon ;;
       0) exit 0 ;;
       *) info "Invalid option." ;;
     esac

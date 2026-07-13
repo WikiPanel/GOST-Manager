@@ -1,275 +1,196 @@
 # GOST Manager
 
-مدیر GOST یک ابزار Bash منومحور برای نصب GOST v3 و مدیریت تونل‌های شماره‌دار سمت ایران و خارج روی Ubuntu 22.04 و Ubuntu 24.04 است.
+GOST Manager یک ابزار Bash منومحور برای نصب GOST v3 و مدیریت چند پروفایل
+شماره‌دار Direct Mode در سمت ایران و خارج روی Ubuntu 22.04 و Ubuntu 24.04 است.
 
-این پروژه فقط یک اسکریپت تکی نیست؛ شامل نصب‌کننده، حذف‌کننده، runner های systemd، نمونه env، مستندات و تست محلی است.
+Direct Mode تنها حالت ترافیکی پشتیبانی‌شده در v0.2 است. پروژه artifact رسمی
+go-gost/gost را بدون تغییر نصب می‌کند و فقط wrapper نصب، پیکربندی و سرویس است؛
+رفتار protocol در GOST upstream را تغییر نمی‌دهد.
 
-## معرفی پروژه
+NGINX Gateway و Native GOST Gateway لغو شده‌اند. هیچ placeholder، فرمان مخفی،
+route runtime یا وابستگی NGINX وجود ندارد. Issue #29 برای بهبود مدیریت چند
+سرور و چند پروفایل Direct Mode در آینده در نظر گرفته شده و بخشی از این نسخه
+نیست.
 
-با این ابزار می‌توانید:
+## قابلیت‌ها
 
-- GOST v3 را از Release رسمی `go-gost/gost` نصب یا به‌روزرسانی کنید
-- تونل شماره‌دار سمت خارج بسازید
-- تونل شماره‌دار سمت ایران بسازید
-- تونل‌ها را حذف، ری‌استارت، بررسی و لاگ‌گیری کنید
-- سرویس‌های فعال GOST را ببینید
-- فایل‌های خراب یا قدیمی مربوط به همین پروژه را با تایید دستی پاک کنید
+- نصب یا به‌روزرسانی artifact رسمی GOST؛
+- ساخت چند تونل مستقل Kharej؛
+- ساخت چند تونل مستقل Iran؛
+- حذف، status، log و restart هر تونل به‌صورت مستقل؛
+- پاک‌سازی امن فایل‌های خراب یا قدیمی مدیریت‌شده؛
+- Monitoring Lite محلی و اختیاری؛
+- حذف امن و component-aware.
 
-بعد از نصب:
+## نصب و اجرا
 
-```bash
-sudo gost-manager
-```
+    sudo bash install.sh
+    sudo gost-manager
 
-نصب‌کننده علاوه بر manager و runnerهای قبلی، کل پکیج مانیتورینگ را در `/usr/local/lib/gost-manager/monitoring`، سه launcher را در `/usr/local/sbin`، تنظیمات را در `/etc/gost-manager/monitoring.env`، unit را در `/etc/systemd/system/gost-monitor-collector.service` و تاریخچه را در `/var/lib/gost-manager/metrics.sqlite3` نصب می‌کند.
+اجرای مستقیم از مخزن نیز ممکن است:
 
-در نصب تازه collector فعال و اجرا می‌شود. در ارتقا، config معتبر سفارشی، تاریخچه، و وضعیت enabled/active قبلی collector حفظ می‌شود. فایل‌های `/etc/gost/iran-*.env` و `/etc/gost/kharej-*.env`، unitهای تونل و وضعیت ترافیک بدون تغییر باقی می‌مانند.
+    sudo bash gost-manager.sh
 
-نصب‌کننده فقط ماژول‌های فهرست‌شده در `packaging/monitoring-runtime-manifest.txt` را کپی می‌کند. metadata مسیرهای مشترک `/usr/local/sbin` و `/etc/systemd/system` و همچنین مالکیت، mode و محتوای موجود `/etc/gost` حفظ می‌شود. برای دایرکتوری‌های خصوصی manager، mode/owner اعمال می‌شود و در rollback، metadata قبلی بازگردانده می‌شود.
+نصب‌کننده باینری رسمی GOST، runnerهای Direct Mode، manager و Monitoring Lite
+را نصب می‌کند. در upgrade، فایل‌های موجود /etc/gost/iran-*.env و
+/etc/gost/kharej-*.env، unitهای تونل، mode فایل‌ها و وضعیت active سرویس‌های
+Direct Mode حفظ می‌شوند.
 
-اجرای مستقیم هم ممکن است:
+## مسیر ترافیک
 
-```bash
-sudo bash gost-manager.sh
-```
+سمت خارج یک SOCKS5 با GOST اجرا می‌کند. سمت ایران مستقیماً روی پورت عمومی
+گوش می‌دهد و ترافیک را از طریق SOCKS به پورت محلی مقصد روی سرور خارج
+می‌فرستد:
 
-## سناریوی ایران/خارج
+    Client
+      -> Iran GOST public listener
+      -> Kharej GOST SOCKS5
+      -> 127.0.0.1:<target-port>
 
-سمت خارج یک SOCKS5 با GOST اجرا می‌شود. سمت ایران روی پورت‌های عمومی گوش می‌دهد و ترافیک را از طریق SOCKS سمت خارج به `127.0.0.1:<target_port>` روی همان سرور خارج می‌فرستد.
+در این مسیر NGINX وجود ندارد.
 
-در این مسیر Nginx استفاده نمی‌شود. خود GOST مستقیم روی پورت عمومی ایران listen می‌کند.
+## منوی اصلی
 
-## ساخت تونل سمت خارج
+    GOST Manager
+    ============
 
-در سرور خارج اجرا کنید:
+    1) Install / Update GOST
+    2) Create Kharej tunnel
+    3) Create Iran tunnel
+    4) Delete tunnel
+    5) Show status
+    6) Show logs
+    7) Restart tunnel
+    8) List active GOST services
+    9) Clean old/broken GOST configs
+    10) Monitoring
+    0) Exit
 
-```bash
-sudo gost-manager
-```
+گزینه‌های ۱ تا ۱۰ شماره و رفتار فعلی خود را حفظ کرده‌اند. گزینه ۱۱ یا ۱۲ و
+placeholder مربوط به Native Gateway وجود ندارد.
 
-گزینه زیر را انتخاب کنید:
+## ساخت تونل Kharej
 
-```text
-2) Create Kharej tunnel
-```
+گزینه ۲ را انتخاب کنید. نمونه:
 
-نمونه ورودی:
+    Tunnel number: 1
+    SOCKS listen port: 28420
+    GOST username: maya
+    GOST password: برای ساخت خودکار خالی بگذارید
+    Iran IP allowed: YOUR_IRAN_SERVER_IP
+    Apply iptables firewall rule? yes
 
-```text
-Tunnel number: 1
-SOCKS listen port: 28420
-GOST username: maya
-GOST password: خالی بگذارید تا ساخته شود
-Iran IP allowed: YOUR_IRAN_SERVER_IP
-Apply iptables firewall rule? yes
-```
+فایل‌های مدیریت‌شده:
 
-فایل‌ها:
+    /etc/gost/kharej-1.env
+    /etc/systemd/system/gost-kharej-1.service
 
-```text
-/etc/gost/kharej-1.env
-/etc/systemd/system/gost-kharej-1.service
-```
+## ساخت تونل Iran
 
-## ساخت تونل سمت ایران
+گزینه ۳ را انتخاب کنید. نمونه:
 
-در سرور ایران اجرا کنید:
-
-```bash
-sudo gost-manager
-```
-
-گزینه زیر را انتخاب کنید:
-
-```text
-3) Create Iran tunnel
-```
-
-نمونه ورودی:
-
-```text
-Tunnel number: 1
-Kharej IP: YOUR_KHAREJ_SERVER_IP
-Kharej SOCKS port: 28420
-GOST username: maya
-GOST password: پسورد ساخته‌شده در سمت خارج
-Port mappings: 2052:2052
-```
-
-ورودی `Port mappings` برای هر تونل سمت ایران اجباری است. مقدار خالی، فرمت اشتباه، پورت نامعتبر و پورت listen تکراری قبل از ساخت فایل‌ها رد می‌شود.
-
-## مثال پورت 2052
-
-```text
-Iran :2052
--> gost-iran-1
--> Kharej :28420 SOCKS5
--> Kharej 127.0.0.1:2052
-```
-
-## مثال پورت‌های 80/8080/8880
+    Tunnel number: 1
+    Kharej IP: YOUR_KHAREJ_SERVER_IP
+    Kharej SOCKS port: 28420
+    GOST username: maya
+    GOST password: مقدار ساخته‌شده در Kharej
+    Port mappings: 2052:2052
 
 برای چند پورت:
 
-```text
-80:80,8080:8080,8880:8880
-```
+    80:80,8080:8080,8880:8880
 
-نتیجه:
+Port mappings اجباری است. فرمت اشتباه، پورت خارج از محدوده، listen port
+تکراری یا پورت مشغول پیش از نوشتن فایل رد می‌شود.
 
-```text
-Iran :80   -> Kharej 127.0.0.1:80
-Iran :8080 -> Kharej 127.0.0.1:8080
-Iran :8880 -> Kharej 127.0.0.1:8880
-```
+فایل‌های مدیریت‌شده:
 
-## مشاهده وضعیت
+    /etc/gost/iran-1.env
+    /etc/systemd/system/gost-iran-1.service
 
-گزینه:
+## مدیریت تونل
 
-```text
-5) Show status
-```
+گزینه‌های delete، status، logs و restart فهرست شماره‌دار تونل‌های Iran و
+Kharej را نشان می‌دهند. هر پروفایل مستقل است؛ حذف iran-2 روی iran-1 یا
+kharej-1 اثری ندارد.
 
-برای مشاهده وضعیت، لاگ، ری‌استارت و حذف، برنامه یک فهرست شماره‌دار از تونل‌های موجود نشان می‌دهد. دیگر لازم نیست `iran` یا `kharej` را دستی تایپ کنید.
+## Monitoring Lite
 
-```text
-Available GOST tunnels:
+گزینه ۱۰ مانیتورینگ محلی را باز می‌کند:
 
-1) gost-iran-1.service      active/running    /etc/gost/iran-1.env
-2) gost-kharej-1.service    active/running    /etc/gost/kharej-1.env
+    1) Live resources
+    2) Last 10 minutes
+    3) Last 30 minutes
+    4) Last 1 hour
+    5) Services and tunnels
+    6) Collector status
+    7) Advanced tools
+    0) Back
 
-Select tunnel number:
-```
+بخش‌های عادی آن عبارت‌اند از:
 
-## Runtime محلی Exitهای Gateway
+- HOST؛
+- NETWORK با loopback جدا از external؛
+- TCP / CONNECTIONS؛
+- همه سرویس‌های Direct Mode GOST؛
+- همه تونل‌های فعلی Iran و Kharej؛
+- COLLECTOR.
 
-در milestone فعلی v0.2 هر Exit یک سرویس مستقل GOST با listener فقط روی
-`127.0.0.1` دارد. این قابلیت فعلاً فقط با CLIهای نصب‌شدهٔ `gost-gateway` و
-`gost-gateway-runtime` در دسترس است و به منوی اصلی اضافه نشده است.
-
-Credentialها در فایل‌های خصوصی با mode برابر `0600` زیر
-`/etc/gost-manager/secrets` نگهداری می‌شوند و وارد desired state، env تولیدشده،
-unit یا manifest نمی‌شوند. ابتدا `runtime plan` را بررسی و سپس
-`runtime apply --yes` را اجرا کنید. سرویس فعال و بدون تغییر restart نمی‌شود.
-قرارداد کامل مسیرها، rotation، تشخیص مالک port و rollback در
-[Gateway Local Exit Runtime v0.2](docs/GATEWAY-RUNTIME-V0.2.md) آمده است. در این
-مرحله NGINX عمومی و firewall نصب یا فعال نمی‌شوند.
-
-## مانیتورینگ محلی
-
-گزینه‌های جدید منوی اصلی بدون تغییر شماره‌های ۱ تا ۹ اضافه شده‌اند:
-
-```text
-10) Monitoring
-11) Native GOST Gateway (Coming soon)
-```
-
-زیرمنوی عادی Monitoring Lite ساده و متمرکز است:
-
-```text
-1) Live resources
-2) Last 10 minutes
-3) Last 30 minutes
-4) Last 1 hour
-5) Services and tunnels
-6) Collector status
-7) Advanced tools
-0) Back
-```
-
-نمای live فقط host، network، اتصال‌های TCP، سرویس‌ها، tunnelها و سلامت collector را در اولویت قرار می‌دهد. قابلیت‌های موجود snapshot/detail/event/export/maintenance و کنترل collector در `Advanced tools` حفظ شده‌اند. خطای مانیتورینگ از منو خارج نمی‌شود و هیچ سرویس ترافیکی را تغییر نمی‌دهد.
+Monitoring Lite اختیاری است، به NGINX وابسته نیست و در مسیر ترافیک قرار
+نمی‌گیرد. failure، maintenance یا حذف آن هیچ سرویس GOST را stop، restart یا
+reconfigure نمی‌کند.
 
 دستورات مستقیم:
 
-```bash
-systemctl status gost-monitor-collector.service
-systemctl start gost-monitor-collector.service
-systemctl stop gost-monitor-collector.service
-systemctl restart gost-monitor-collector.service
+    gost-monitor snapshot
+    gost-monitor live
+    gost-monitor summary --window 10m
+    gost-monitor summary --window 30m
+    gost-monitor summary --window 1h
+    gost-monitor-admin status
+    gost-monitor-admin maintenance
 
-gost-monitor snapshot
-gost-monitor live
-gost-monitor summary --window 10m
-gost-monitor-admin status
-gost-monitor-admin maintenance
-```
+SQLite با schema version 4، WAL و retention محدود حفظ شده است:
 
-فایل تنظیمات با مالک `root:root` و mode برابر `0600` فقط کلیدهای زیر را می‌پذیرد:
+- raw metrics: شش ساعت؛
+- minute rollups: بیست‌وچهار ساعت؛
+- structured events: بیست‌وچهار ساعت.
 
-```text
-GOST_MONITOR_DB=/var/lib/gost-manager/metrics.sqlite3
-GOST_ENV_DIR=/etc/gost
-GOST_MONITOR_SAMPLE_INTERVAL=10
-GOST_MONITOR_TCP_INTERVAL=30
-GOST_MONITOR_SLOW_INTERVAL=60
-GOST_MONITOR_MAINTENANCE_INTERVAL=900
-```
+برای پروفایل نماینده شامل شش سرویس GOST، برآورد محافظه‌کارانه کل database
+حدود 0.451 GiB است؛ حداقل 1 GiB فضا رزرو کنید. history موجود migrate یا پاک
+نمی‌شود و rowهای generic قدیمی با retention عادی منقضی می‌شوند.
 
-محدوده sample برابر ۵ تا ۶۰ ثانیه است؛ TCP برابر ۱۰ تا ۳۰۰ و حداقل sample؛ slow برابر ۳۰ تا ۹۰۰ و حداقل sample؛ maintenance برابر ۳۰۰ تا ۸۶۴۰۰ و حداقل slow. این فایل هرگز در Bash source یا اجرا نمی‌شود. کلید ناشناخته/تکراری، مسیر نسبی، substitution شل، quoting ناامن و cadence نامعتبر رد می‌شود.
-
-parser عمومی برای تست و library مسیر absolute امن را می‌پذیرد، اما policy نصب‌شده محدودتر است: `GOST_MONITOR_DB` باید فایل زیر `/var/lib/gost-manager` باشد و `GOST_ENV_DIR` باید خود `/etc/gost` یا زیرمجموعه آن باشد. نام جایگزین مثل `/var/lib/gost-manager/custom.sqlite3` و مسیر nested مثل `/var/lib/gost-manager/archive/current.sqlite3` مجاز است؛ مسیرهای `/srv`، `/root`، `/tmp`، prefix مشابه و عبور از symlink رد می‌شوند. فقط فیلدهای امن و بدون secret را با این فرمان ببینید:
-
-```bash
-gost-monitor-admin config --format json
-gost-monitor-admin config --format value --field database_path
-```
-
-SQLite همچنان history محلی بدون dependency خارجی و مقاوم در برابر restart را نگه می‌دارد. Monitoring Lite به‌صورت پیش‌فرض ۶ ساعت raw metric، ۲۴ ساعت minute rollup و ۲۴ ساعت event ساختاریافته را حفظ می‌کند. برآورد محافظه‌کارانه برای یک NGINX و شش سرویس GOST، با احتساب index، صفحه‌های آزاد، WAL و headroom عملیاتی، حدود ۰٫۴۸۴ GiB است؛ ۱ GiB فضا رزرو کنید. Maintenance در یک transaction انجام می‌شود و checkpoint بعد از commit است.
-
-fixture قطعی ۱٬۰۰۰ کاربر فقط سربار parsing، attribution، storage و scheduling مانیتورینگ را می‌سنجد و اثبات ظرفیت شبکه نیست. توان واقعی به CPU، kernel، NIC، encryption، GOST، NGINX، RTT، CDN و ارائه‌دهنده سرور وابسته است.
-
-daemon، اجرای one-shot و حذف مخرب history از lock خصوصی `/run/gost-manager/collector.lock` استفاده می‌کنند. collector دوم یا purge مستقیم هنگام collection با exit code برابر `4` رد می‌شود. manager پیش از one-shot، برای توقف موقت collector فعال تأیید می‌گیرد و پس از موفقیت، خطا یا interrupt آن را بازمی‌گرداند. حذف history مسیر DB پیکربندی‌شده را نشان می‌دهد، WAL را checkpoint می‌کند، در حالت busy رد می‌شود، recovery hard-link هم‌دایرکتوری می‌سازد، فقط یک replace اتمیک انجام می‌دهد و در failure، DB و sidecarهای قبلی را بازمی‌گرداند. ترافیک و `/etc/gost` دست‌نخورده می‌مانند.
-
-سرویس collector restart محدود، اولویت CPU/I/O پایین، UMask خصوصی و state mode برابر 0700 دارد و هیچ وابستگی یا hook توقف/restart/reload برای NGINX یا سرویس‌های GOST ندارد. خرابی collector، DB، maintenance یا حذف مانیتورینگ باعث توقف Direct Mode نمی‌شود.
-
-گزینه Native GOST Gateway فقط پیام `Coming soon` چاپ می‌کند و هیچ package، فایل، directory، service، database، firewall، NGINX یا GOST را تغییر نمی‌دهد.
-
-حذف runtime، desired state، secretهای خصوصی و package مربوط به Gateway چهار
-انتخاب مستقل با پاسخ پیش‌فرض No هستند. حذف secret به عبارت دقیق
-`DELETE GATEWAY SECRETS` نیاز دارد و تا وقتی سرویس دقیق Gateway Exit باقی مانده
-باشد package و runner حذف نمی‌شوند.
+fixture قطعی ۱٬۰۰۰ کاربر سربار parsing، attribution، storage و scheduling را
+می‌سنجد و اثبات ظرفیت شبکه نیست. ظرفیت واقعی به CPU، kernel، NIC، encryption،
+GOST، RTT، CDN و ارائه‌دهنده بستگی دارد.
 
 ## حذف امن
 
-`sudo bash uninstall.sh` را اجرا کنید. حذف manager، سرویس مانیتورینگ، کد مانیتورینگ، config، history، سرویس‌های ترافیکی، credentialهای `/etc/gost` و باینری GOST هرکدام تأیید مستقل دارند و پیش‌فرض همه No است. قبل از اجرا plan نهایی نمایش داده می‌شود.
+    sudo bash uninstall.sh
 
-حذف فقط مانیتورینگ، unitها و وضعیت فعال تونل‌ها، runnerها، `/etc/gost`، باینری GOST، firewall و NGINX را تغییر نمی‌دهد. config و history انتخاب‌های جدا هستند. تا وقتی collector service باقی است کد/config لازم حذف نمی‌شود و تا وقتی سرویس ترافیکی باقی است runnerها حفظ می‌شوند. اگر config/history را نگه دارید، اجرای دوباره `sudo bash install.sh` مانیتورینگ را بازیابی و DB را validate/migrate می‌کند.
+حذف manager، سرویس Monitoring، کد Monitoring، config، history، سرویس‌های
+Direct Mode، فایل‌های /etc/gost و باینری رسمی GOST تأییدهای مستقل با پیش‌فرض
+No دارند. plan نهایی پیش از اجرا نمایش داده می‌شود.
 
-پس از هر تلاش حذف، وضعیت واقعی دوباره بررسی می‌شود. اگر حتی یک unit مدیریت‌شده ترافیک باقی بماند، هر دو runner، مسیر `/etc/gost` و باینری `/usr/local/bin/gost` حفظ می‌شوند. اگر collector با وجود unit گم‌شده هنوز active/enabled/loaded باشد، stop/disable انجام می‌شود و شکست آن همه کد، launcher، config و history مانیتورینگ را حفظ می‌کند. مسیر history پیش از حذف اختیاری config ذخیره می‌شود و هیچ‌گاه DB پیش‌فرض حدس زده نمی‌شود.
+اگر حتی یک unit دقیق مدیریت‌شده باقی بماند، هر دو runner، /etc/gost و باینری
+GOST حفظ می‌شوند. unmanaged unitها و ruleهای firewall نامرتبط دست‌نخورده
+می‌مانند. حذف فقط Monitoring هیچ تغییری در ترافیک Direct Mode ایجاد نمی‌کند.
 
-تست `tests/test-systemd-linux.sh` از `systemd-analyze verify` واقعی و unit tree کامل host استفاده می‌کند و از `--root` ناقص استفاده نمی‌کند. workflow مانیتورینگ همین تست، نصب temporary-root و `make check` را روی Ubuntu 22.04 و 24.04 اجرا می‌کند. اگر rollback وضعیت collector قابل اثبات نباشد، installer backupها را نگه می‌دارد و فرمان‌های دقیق restore، `daemon-reload`، enable/disable، start/stop و status را چاپ می‌کند؛ backupها را پیش از موفقیت status حذف نکنید.
+## امنیت
 
-## مشاهده لاگ
+پورت SOCKS سمت Kharej باید فقط برای IP سمت Iran قابل دسترس باشد. ruleهای
+iptables ایجادشده comment مخصوص همان tunnel number دارند و پاک‌سازی فقط همان
+ruleها را هدف می‌گیرد.
 
-گزینه:
+password، IP واقعی، token، UUID، private key یا credential را commit نکنید.
+secretها فقط در فایل‌های root-owned با mode برابر 0600 زیر /etc/gost باقی
+می‌مانند. Monitoring فقط فیلدهای topology معتبر را می‌خواند و credential را
+در metric، event، metadata، state یا export ذخیره نمی‌کند.
 
-```text
-6) Show logs
-```
+## توسعه و اعتبارسنجی
 
-این گزینه آخرین لاگ‌های سرویس systemd مربوط به همان تونل را نشان می‌دهد.
+    make check
 
-## حذف تونل
-
-گزینه:
-
-```text
-4) Delete tunnel
-```
-
-حذف `iran-2` روی `iran-1` اثری ندارد. حذف `kharej-2` روی `kharej-1` اثری ندارد.
-
-اگر تونل سمت خارج rule های iptables داشته باشد، فقط rule هایی حذف می‌شوند که comment مربوط به همان شماره تونل را دارند.
-
-## هشدار امنیتی SOCKS سمت خارج
-
-پورت SOCKS سمت خارج نباید عمومی باشد. هنگام ساخت تونل خارج، rule فایروال را فعال کنید تا فقط IP سرور ایران اجازه اتصال داشته باشد.
-
-## هشدار ماندگار نبودن iptables بعد از reboot
-
-Rule های iptables به‌صورت پیش‌فرض بعد از reboot ماندگار نیستند. برای نگه‌داری دائمی، از `netfilter-persistent` یا سیستم فایروال سرور خود استفاده کنید.
-
-## هشدار ذخیره نکردن پسورد واقعی داخل GitHub
-
-پسورد واقعی فقط باید داخل فایل‌های `/etc/gost/*.env` روی سرور باشد. فایل‌های نمونه این مخزن placeholder دارند. پسورد واقعی، IP تولیدی، token یا credential خصوصی را داخل GitHub commit نکنید.
+تست‌ها بدون root و با temporary directory و command stub اجرا می‌شوند. ماتریس
+Ubuntu 22.04 و Ubuntu 24.04 نیز gate کامل Direct Mode و Monitoring Lite را
+اجرا می‌کند.

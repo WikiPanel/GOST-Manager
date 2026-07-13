@@ -44,8 +44,8 @@ class MonitoringTests(unittest.TestCase):
         t=Tunnel('iran',1,'gost-iran-1.service','x',(80,443,2052),(80,443,2052))
         def run(cmd): return 'ActiveState=active\nSubState=running\nNRestarts=1\nMainPID=9\n' if cmd[0]=='systemctl' else text
         s=collect_sample(t,1,run); self.assertEqual(s.listen_ports_up,1)
-        def nginx_run(cmd): return 'ActiveState=active\nSubState=running\nNRestarts=1\nMainPID=11\n' if cmd[0]=='systemctl' else 'LISTEN 0 128 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=11,fd=4))\n'
-        self.assertEqual(collect_sample(t,1,nginx_run).listen_ports_up,0)
+        def foreign_run(cmd): return 'ActiveState=active\nSubState=running\nNRestarts=1\nMainPID=11\n' if cmd[0]=='systemctl' else 'LISTEN 0 128 0.0.0.0:80 0.0.0.0:* users:(("other",pid=11,fd=4))\n'
+        self.assertEqual(collect_sample(t,1,foreign_run).listen_ports_up,0)
         def missing_run(cmd): return 'ActiveState=active\nSubState=running\nNRestarts=1\nMainPID=9\n' if cmd[0]=='systemctl' else 'LISTEN 0 128 0.0.0.0:80 0.0.0.0:*\n'
         self.assertEqual(listener_quality(t, missing_run), 'unavailable')
 
@@ -321,7 +321,7 @@ class MonitoringIssue13Tests(unittest.TestCase):
             rollup_completed_minutes(conn,120)
             self.assertEqual(conn.execute("SELECT samples,unavailable_count,min_value,avg_value,max_value,quality FROM minute_rollups WHERE metric_name='x'").fetchone(), (1,1,None,None,None,'unavailable'))
 
-    def test_one_ss_and_one_systemd_per_service_per_cycle(self):
+    def test_one_socket_snapshot_and_one_systemd_call_per_service_per_cycle(self):
         with tempfile.TemporaryDirectory() as td:
             for i,p in enumerate((80,81,82),1):
                 Path(td,f'iran-{i}.env').write_text(f'MAPPINGS={p}:{p}\n',encoding='utf-8')
@@ -333,7 +333,7 @@ class MonitoringIssue13Tests(unittest.TestCase):
                 return '\n'.join(f'LISTEN 0 1 0.0.0.0:{p} 0.0.0.0:* users:(("gost",pid=1,fd=1))' for p in (80,81,82))
             collect_once(db,td,100,run)
             self.assertEqual(sum(1 for c in calls if c[:2]==('ss','-H')),2)
-            self.assertEqual(sum(1 for c in calls if c and c[0]=='systemctl'),4)
+            self.assertEqual(sum(1 for c in calls if c and c[0]=='systemctl'),3)
 
     def test_concurrent_readers_no_corruption(self):
         with tempfile.TemporaryDirectory() as td:
