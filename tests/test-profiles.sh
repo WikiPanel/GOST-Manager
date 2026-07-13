@@ -20,15 +20,25 @@ COMMAND_LOG="${TEST_HOME}/commands.log"
 SS_FIXTURE="${TEST_HOME}/ss.txt"
 SS_AFTER_FIXTURE="${TEST_HOME}/ss-after.txt"
 SS_COUNT_FILE="${TEST_HOME}/ss-count"
-mkdir -p "${ENV_DIR}" "${UNIT_DIR}" "${STUB_BIN}"
+SYSTEMD_STATE_DIR="${TEST_HOME}/systemd-state"
+IPTABLES_STATE="${TEST_HOME}/iptables.state"
+IPTABLES_LOG="${TEST_HOME}/iptables.log"
+IPTABLES_MUTATIONS="${TEST_HOME}/iptables.mutations"
+TRANSACTION_LOG="${TEST_HOME}/transaction.log"
+mkdir -p "${ENV_DIR}" "${UNIT_DIR}" "${STUB_BIN}" "${SYSTEMD_STATE_DIR}"
 : > "${COMMAND_LOG}"
 : > "${SS_FIXTURE}"
 : > "${SS_AFTER_FIXTURE}"
+: > "${IPTABLES_STATE}"
+: > "${IPTABLES_LOG}"
+: > "${TRANSACTION_LOG}"
 printf '0\n' > "${SS_COUNT_FILE}"
+printf '0\n' > "${IPTABLES_MUTATIONS}"
 
 cat > "${STUB_BIN}/ss" <<'STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+printf 'ss %s\n' "$*" >> "${TRANSACTION_LOG}"
 count="$(cat "${SS_COUNT_FILE}")"
 printf '%s\n' "$((count + 1))" > "${SS_COUNT_FILE}"
 if [[ "${SS_USE_AFTER_FIRST:-0}" == "1" && "${count}" -ge 1 ]]; then
@@ -41,32 +51,173 @@ cat > "${STUB_BIN}/systemctl" <<'STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf 'systemctl %s\n' "$*" >> "${COMMAND_LOG}"
+printf 'systemctl %s\n' "$*" >> "${TRANSACTION_LOG}"
 action="${1:-}"
 last=""
-for value in "$@"; do last="${value}"; done
-if [[ "${STUB_FAIL_ACTION:-}" == "${action}" ]]; then exit 1; fi
+service=""
+for value in "$@"; do
+  last="${value}"
+  [[ "${value}" == gost-*.service ]] && service="${value}"
+done
+service="${service:-${last}}"
+
+state_path() { printf '%s/%s.state\n' "${SYSTEMD_STATE_DIR}" "$1"; }
+default_pid() {
+  case "$1" in
+    gost-iran-*.service) number="${1#gost-iran-}"; number="${number%.service}"; printf '%s\n' "$((100 + number))" ;;
+    gost-kharej-*.service) number="${1#gost-kharej-}"; number="${number%.service}"; printf '%s\n' "$((200 + number))" ;;
+    *) printf '900\n' ;;
+  esac
+}
+ensure_state() {
+  local service="$1" path
+  path="$(state_path "${service}")"
+  [[ -f "${path}" ]] && return 0
+  if [[ -f "${GOST_SYSTEMD_DIR_TEST}/${service}" ]]; then
+    printf 'loaded|disabled|inactive|0\n' > "${path}"
+  else
+    printf 'not-found|none|inactive|0\n' > "${path}"
+  fi
+}
+read_state() {
+  local service="$1"
+  ensure_state "${service}"
+  IFS='|' read -r load_state unit_state active_state main_pid < "$(state_path "${service}")"
+}
+write_state() {
+  printf '%s|%s|%s|%s\n' "$2" "$3" "$4" "$5" > "$(state_path "$1")"
+}
+should_fail=0
+if [[ "${STUB_FAIL_ACTION:-}" == "${action}" ]]; then should_fail=1; fi
+if [[ "${STUB_FAIL_SECONDARY_ACTION:-}" == "${action}" ]]; then should_fail=1; fi
+if [[ "${STUB_FAIL_TERTIARY_ACTION:-}" == "${action}" ]]; then should_fail=1; fi
 if [[ "${STUB_FAIL_ONCE_ACTION:-}" == "${action}" && ! -e "${STUB_FAIL_ONCE_MARKER:-}" ]]; then
   touch "${STUB_FAIL_ONCE_MARKER}"
-  exit 1
+  should_fail=1
 fi
 case "${action}" in
   show)
-    if [[ " $* " == *" MainPID "* ]]; then
-      case "${last}" in
-        gost-iran-1.service) printf '101\n' ;;
-        gost-iran-2.service) printf '102\n' ;;
-        gost-kharej-1.service) printf '201\n' ;;
-        *) printf '0\n' ;;
-      esac
+    read_state "${service}"
+    if [[ " $* " == *" --property=LoadState,UnitFileState,ActiveState,MainPID "* ]]; then
+      printf 'LoadState=%s\nUnitFileState=%s\nActiveState=%s\nMainPID=%s\n' "${load_state}" "${unit_state}" "${active_state}" "${main_pid}"
+    elif [[ " $* " == *" MainPID "* ]]; then
+      printf '%s\n' "${main_pid}"
+    elif [[ " $* " == *" SubState "* ]]; then
+      if [[ "${active_state}" == "active" ]]; then printf 'running\n'; else printf 'dead\n'; fi
     else
-      printf 'running\n'
+      printf 'Id=%s\nLoadState=%s\nActiveState=%s\nSubState=%s\nUnitFileState=%s\nNRestarts=0\nMainPID=%s\n' \
+        "${service}" "${load_state}" "${active_state}" "$(if [[ "${active_state}" == "active" ]]; then printf running; else printf dead; fi)" "${unit_state}" "${main_pid}"
     fi
     ;;
   is-active)
-    [[ "${STUB_INACTIVE:-0}" != "1" ]]
-    [[ " $* " == *" --quiet "* ]] || printf 'active\n'
+    read_state "${service}"
+    [[ "${STUB_INACTIVE:-0}" != "1" && "${active_state}" == "active" ]]
+    [[ " $* " == *" --quiet "* ]] || printf '%s\n' "${active_state}"
     ;;
-  *) ;;
+  is-enabled)
+    read_state "${service}"
+    printf '%s\n' "${unit_state}"
+    [[ "${unit_state}" == "enabled" || "${unit_state}" == "enabled-runtime" ]]
+    ;;
+  enable)
+    read_state "${service}"
+    if [[ "${should_fail}" -eq 1 && "${STUB_ENABLE_FAIL_MODE:-}" == "inactive" ]]; then
+      write_state "${service}" "${load_state}" enabled inactive 0
+      exit 1
+    fi
+    if [[ "${should_fail}" -eq 1 && "${STUB_PARTIAL_FAIL_ACTION:-}" != "enable" ]]; then exit 1; fi
+    unit_state="enabled"
+    if [[ " $* " == *" --now "* ]]; then active_state="active"; main_pid="$(default_pid "${service}")"; fi
+    write_state "${service}" "${load_state}" "${unit_state}" "${active_state}" "${main_pid}"
+    [[ "${should_fail}" -eq 0 ]]
+    ;;
+  disable)
+    read_state "${service}"
+    if [[ "${should_fail}" -eq 1 && "${STUB_PARTIAL_FAIL_ACTION:-}" != "disable" ]]; then exit 1; fi
+    unit_state="disabled"
+    if [[ " $* " == *" --now "* ]]; then active_state="inactive"; main_pid=0; fi
+    write_state "${service}" "${load_state}" "${unit_state}" "${active_state}" "${main_pid}"
+    [[ "${should_fail}" -eq 0 ]]
+    ;;
+  start)
+    read_state "${service}"
+    if [[ "${should_fail}" -eq 1 && "${STUB_PARTIAL_FAIL_ACTION:-}" != "start" ]]; then exit 1; fi
+    active_state="active"
+    if [[ "${STUB_START_BAD_PID:-0}" == "1" ]]; then main_pid=0; else main_pid="$(default_pid "${service}")"; fi
+    write_state "${service}" "${load_state}" "${unit_state}" "${active_state}" "${main_pid}"
+    [[ "${should_fail}" -eq 0 ]]
+    ;;
+  stop)
+    read_state "${service}"
+    if [[ "${should_fail}" -eq 1 && "${STUB_PARTIAL_FAIL_ACTION:-}" != "stop" ]]; then exit 1; fi
+    active_state="inactive"; main_pid=0
+    write_state "${service}" "${load_state}" "${unit_state}" "${active_state}" "${main_pid}"
+    [[ "${should_fail}" -eq 0 ]]
+    ;;
+  restart)
+    read_state "${service}"
+    if [[ "${should_fail}" -eq 1 && "${STUB_PARTIAL_FAIL_ACTION:-}" != "restart" ]]; then exit 1; fi
+    active_state="active"; main_pid="$(default_pid "${service}")"
+    write_state "${service}" "${load_state}" "${unit_state}" "${active_state}" "${main_pid}"
+    [[ "${should_fail}" -eq 0 ]]
+    ;;
+  daemon-reload)
+    [[ "${should_fail}" -eq 0 ]]
+    ;;
+  *) [[ "${should_fail}" -eq 0 ]] ;;
+esac
+STUB
+cat > "${STUB_BIN}/iptables" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'iptables %s\n' "$*" >> "${IPTABLES_LOG}"
+printf 'iptables %s\n' "$*" >> "${TRANSACTION_LOG}"
+operation="${1:-}"
+if [[ "${operation}" == "-S" ]]; then
+  cat "${IPTABLES_STATE}"
+  exit 0
+fi
+count="$(cat "${IPTABLES_MUTATIONS}")"
+count=$((count + 1))
+printf '%s\n' "${count}" > "${IPTABLES_MUTATIONS}"
+if [[ -n "${IPTABLES_FAIL_AT:-}" && "${count}" == "${IPTABLES_FAIL_AT}" ]]; then exit 1; fi
+chain="${2:-}"
+tmp="${IPTABLES_STATE}.tmp"
+case "${operation}" in
+  -I)
+    position="${3}"
+    shift 3
+    line="-A ${chain} $*"
+    awk -v chain="${chain}" -v position="${position}" -v line="${line}" '
+      $1 == "-A" && $2 == chain { rule_number++ }
+      rule_number == position && !inserted { print line; inserted=1 }
+      { print }
+      END { if (!inserted) print line }
+    ' "${IPTABLES_STATE}" > "${tmp}"
+    mv "${tmp}" "${IPTABLES_STATE}"
+    ;;
+  -D)
+    if [[ "$#" -eq 3 && "${3}" =~ ^[1-9][0-9]*$ ]]; then
+      position="${3}"
+      awk -v chain="${chain}" -v position="${position}" '
+        $1 == "-A" && $2 == chain { rule_number++ }
+        rule_number == position && !removed { removed=1; next }
+        { print }
+        END { if (!removed) exit 1 }
+      ' "${IPTABLES_STATE}" > "${tmp}" || { rm -f "${tmp}"; exit 1; }
+    else
+      shift 2
+      target="-A ${chain} $*"
+      awk -v target="${target}" 'BEGIN { removed=0 } { if (!removed && $0 == target) { removed=1; next } print } END { if (!removed) exit 1 }' \
+        "${IPTABLES_STATE}" > "${tmp}" || { rm -f "${tmp}"; exit 1; }
+    fi
+    mv "${tmp}" "${IPTABLES_STATE}"
+    ;;
+  -A)
+    shift 2
+    printf -- '-A %s %s\n' "${chain}" "$*" >> "${IPTABLES_STATE}"
+    ;;
+  *) exit 1 ;;
 esac
 STUB
 cat > "${STUB_BIN}/journalctl" <<'STUB'
@@ -75,9 +226,10 @@ set -Eeuo pipefail
 printf 'journalctl %s\n' "$*" >> "${COMMAND_LOG}"
 printf 'gost started socks5://user-1:credential-canary-29@203.0.113.1:28420\n'
 STUB
-chmod 755 "${STUB_BIN}/ss" "${STUB_BIN}/systemctl" "${STUB_BIN}/journalctl"
+chmod 755 "${STUB_BIN}/ss" "${STUB_BIN}/systemctl" "${STUB_BIN}/iptables" "${STUB_BIN}/journalctl"
 
-export COMMAND_LOG SS_FIXTURE SS_AFTER_FIXTURE SS_COUNT_FILE
+export COMMAND_LOG SS_FIXTURE SS_AFTER_FIXTURE SS_COUNT_FILE SYSTEMD_STATE_DIR
+export IPTABLES_STATE IPTABLES_LOG IPTABLES_MUTATIONS TRANSACTION_LOG
 export PATH="${STUB_BIN}:${PATH}"
 export GOST_MANAGER_TESTING=1
 export GOST_ETC_DIR_TEST="${ENV_DIR}"
@@ -111,6 +263,7 @@ EOF
   chmod 600 "${ENV_DIR}/iran-${number}.env"
   printf '[Service]\n' > "${UNIT_DIR}/gost-iran-${number}.service"
   chmod 644 "${UNIT_DIR}/gost-iran-${number}.service"
+  printf 'loaded|enabled|active|%s\n' "$((100 + number))" > "${SYSTEMD_STATE_DIR}/gost-iran-${number}.service.state"
 }
 
 write_kharej() {
@@ -126,6 +279,7 @@ EOF
   chmod 600 "${ENV_DIR}/kharej-${number}.env"
   printf '[Service]\n' > "${UNIT_DIR}/gost-kharej-${number}.service"
   chmod 644 "${UNIT_DIR}/gost-kharej-${number}.service"
+  printf 'loaded|enabled|active|%s\n' "$((200 + number))" > "${SYSTEMD_STATE_DIR}/gost-kharej-${number}.service.state"
 }
 
 assert_eq "next free Iran is 1 when empty" "1" "$(next_free_profile_number iran)"
@@ -418,6 +572,228 @@ assert_absent "successful delete removes selected unit" "${UNIT_DIR}/gost-iran-2
 assert_eq "successful delete preserves unselected env bytes" "${selected_source_checksum}" "$(cksum "${ENV_DIR}/iran-1.env")"
 assert_contains "successful delete disables exact selected service" "disable --now gost-iran-2.service" "${COMMAND_LOG}"
 assert_not_contains "successful delete sends no Iran one command" "gost-iran-1.service" "${COMMAND_LOG}"
+
+# Transactional Kharej port/firewall edit regressions.
+select_existing_tunnel() {
+  SELECTED_TUNNEL_SIDE=kharej
+  SELECTED_TUNNEL_NUMBER=1
+  SELECTED_TUNNEL_SERVICE=gost-kharej-1.service
+  SELECTED_TUNNEL_SERVICE_FILE="${UNIT_DIR}/gost-kharej-1.service"
+  SELECTED_TUNNEL_ENV_FILE="${ENV_DIR}/kharej-1.env"
+}
+profile_env_load "${ENV_DIR}/kharej-1.env" kharej
+profile_env_set FIREWALL_ENABLED 1
+write_loaded_profile_env "${ENV_DIR}/kharej-1.env" kharej
+printf '%s\n' \
+  '-P INPUT ACCEPT' \
+  '-A INPUT -p tcp --dport 22 -m comment --comment unrelated:ssh -j ACCEPT' \
+  '-A INPUT -p tcp -s 198.51.100.10/32 --dport 28420 -m comment --comment gost-manager:kharej-1:allow -j ACCEPT' \
+  '-A INPUT -p tcp -s 198.51.100.11/32 --dport 28420 -m comment --comment gost-manager:kharej-1:allow -j ACCEPT' \
+  '-A INPUT -p tcp --dport 28420 -m comment --comment gost-manager:kharej-1:drop -j DROP' > "${IPTABLES_STATE}"
+printf 'loaded|enabled|active|201\n' > "${SYSTEMD_STATE_DIR}/gost-kharej-1.service.state"
+
+kharej_before_decline="$(cksum "${ENV_DIR}/kharej-1.env")"
+firewall_before_decline="$(cksum "${IPTABLES_STATE}")"
+: > "${COMMAND_LOG}"
+: > "${TRANSACTION_LOG}"
+: > "${SS_FIXTURE}"
+printf '0\n' > "${SS_COUNT_FILE}"
+decline_output="${TEST_HOME}/kharej-port-decline.out"
+edit_profile <<< $'\n\n\n29420\n\n\ny\nn\n' > "${decline_output}" 2>&1
+assert_eq "protected port migration decline leaves env unchanged" "${kharej_before_decline}" "$(cksum "${ENV_DIR}/kharej-1.env")"
+assert_eq "protected port migration decline leaves firewall unchanged" "${firewall_before_decline}" "$(cksum "${IPTABLES_STATE}")"
+assert_eq "protected port migration decline sends no systemctl command" "0" "$(wc -l < "${COMMAND_LOG}" | tr -d ' ')"
+assert_not_contains "protected port migration decline performs no firewall mutation" "iptables -I" "${TRANSACTION_LOG}"
+
+: > "${COMMAND_LOG}"
+: > "${TRANSACTION_LOG}"
+: > "${SS_FIXTURE}"
+printf 'LISTEN 0 4096 0.0.0.0:29420 0.0.0.0:* users:(("gost",pid=201,fd=3))\n' > "${SS_AFTER_FIXTURE}"
+printf '0\n' > "${SS_COUNT_FILE}"
+export SS_USE_AFTER_FIRST=1
+migration_output="${TEST_HOME}/kharej-port-success.out"
+edit_profile <<< $'\n\n\n29420\n\n\ny\ny\n' > "${migration_output}" 2>&1
+unset SS_USE_AFTER_FIRST
+assert_contains "successful protected migration stores candidate port" "TUNNEL_PORT=29420" "${ENV_DIR}/kharej-1.env"
+assert_contains "successful protected migration installs final new-port rules" "--dport 29420" "${IPTABLES_STATE}"
+assert_not_contains "successful protected migration removes obsolete old-port rules" "--dport 28420" "${IPTABLES_STATE}"
+candidate_insert_line="$(awk '/^iptables -I INPUT 1 / {print NR; exit}' "${TRANSACTION_LOG}")"
+restart_line="$(awk '/^systemctl restart gost-kharej-1.service$/ {print NR; exit}' "${TRANSACTION_LOG}")"
+listener_verify_line="$(awk '/^ss / {line=NR} END {print line}' "${TRANSACTION_LOG}")"
+old_rule_delete_line="$(awk '/^iptables -D INPUT [0-9]+$/ {print NR; exit}' "${TRANSACTION_LOG}")"
+if [[ "${candidate_insert_line}" -lt "${restart_line}" ]]; then pass "candidate protection is installed before exact restart"; else fail "candidate protection is installed before exact restart"; fi
+if [[ "${listener_verify_line}" -lt "${old_rule_delete_line}" ]]; then pass "old-port rules remain until candidate listener verification"; else fail "old-port rules remain until candidate listener verification"; fi
+assert_not_contains "successful migration sends no unselected lifecycle command" "gost-iran-1.service" "${COMMAND_LOG}"
+
+kharej_before_failed_migration="$(cksum "${ENV_DIR}/kharej-1.env")"
+firewall_before_failed_migration="$(cksum "${IPTABLES_STATE}")"
+: > "${COMMAND_LOG}"
+: > "${TRANSACTION_LOG}"
+: > "${SS_FIXTURE}"
+printf 'LISTEN 0 4096 0.0.0.0:29420 0.0.0.0:* users:(("gost",pid=201,fd=3))\n' > "${SS_AFTER_FIXTURE}"
+printf '0\n' > "${SS_COUNT_FILE}"
+export SS_USE_AFTER_FIRST=1
+export STUB_FAIL_ONCE_ACTION=restart
+export STUB_FAIL_ONCE_MARKER="${TEST_HOME}/kharej-migration-restart.failed"
+failed_migration_output="${TEST_HOME}/kharej-port-failure.out"
+if edit_profile <<< $'\n\n\n30420\n\n\ny\ny\n' > "${failed_migration_output}" 2>&1; then fail "failed protected migration returns nonzero"; else pass "failed protected migration returns nonzero"; fi
+unset SS_USE_AFTER_FIRST STUB_FAIL_ONCE_ACTION STUB_FAIL_ONCE_MARKER
+assert_eq "failed protected migration restores exact env" "${kharej_before_failed_migration}" "$(cksum "${ENV_DIR}/kharej-1.env")"
+assert_eq "failed protected migration restores exact firewall positions" "${firewall_before_failed_migration}" "$(cksum "${IPTABLES_STATE}")"
+assert_contains "failed protected migration restores active enabled service" "loaded|enabled|active|201" "${SYSTEMD_STATE_DIR}/gost-kharej-1.service.state"
+assert_contains "failed protected migration keeps old listener protected" "--dport 29420" "${IPTABLES_STATE}"
+assert_contains "failed protected migration reports verified restoration" "exact prior env, firewall, service state, and listener were restored" "${failed_migration_output}"
+assert_not_contains "failed migration sends no unselected lifecycle command" "gost-iran-1.service" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+printf 'LISTEN 0 4096 0.0.0.0:29420 0.0.0.0:* users:(("gost",pid=201,fd=3))\n' > "${SS_FIXTURE}"
+source_edit_output="${TEST_HOME}/kharej-source-edit.out"
+edit_profile <<< $'\n\n\n\n198.51.100.12\n\ny\n' > "${source_edit_output}" 2>&1
+assert_contains "source-only edit stores canonical source" "ALLOWED_IRAN_SOURCES=198.51.100.12/32" "${ENV_DIR}/kharej-1.env"
+assert_contains "source-only edit installs exact source rule" "-s 198.51.100.12/32" "${IPTABLES_STATE}"
+assert_not_contains "source-only edit does not restart GOST" "restart gost-kharej-1.service" "${COMMAND_LOG}"
+assert_contains "source-only edit reports no restart required" "no GOST restart was required" "${source_edit_output}"
+
+: > "${COMMAND_LOG}"
+firewall_disable_output="${TEST_HOME}/kharej-firewall-disable.out"
+edit_profile <<< $'\n\n\n\n\n0\ny\n' > "${firewall_disable_output}" 2>&1
+assert_contains "firewall disable stores disabled state" "FIREWALL_ENABLED=0" "${ENV_DIR}/kharej-1.env"
+assert_not_contains "firewall disable removes managed rules" "gost-manager:kharej-1:" "${IPTABLES_STATE}"
+assert_not_contains "firewall disable does not restart GOST" "restart gost-kharej-1.service" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+firewall_enable_output="${TEST_HOME}/kharej-firewall-enable.out"
+edit_profile <<< $'\n\n\n\n\n1\ny\n' > "${firewall_enable_output}" 2>&1
+assert_contains "firewall enable stores enabled state" "FIREWALL_ENABLED=1" "${ENV_DIR}/kharej-1.env"
+assert_contains "firewall enable restores managed protection" "gost-manager:kharej-1:drop" "${IPTABLES_STATE}"
+assert_not_contains "firewall enable does not restart GOST" "restart gost-kharej-1.service" "${COMMAND_LOG}"
+
+# Partial create activation and rollback regressions.
+prepare_iran_candidate() {
+  local listen_port="$1"
+  profile_env_reset
+  profile_env_set GOST_USER create-state-user
+  profile_env_set GOST_PASS create-state-canary
+  profile_env_set KHAREJ_IP 203.0.113.50
+  profile_env_set TUNNEL_PORT 29500
+  profile_env_set MAPPINGS "${listen_port}:80"
+}
+: > "${SS_FIXTURE}"
+prepare_iran_candidate 4106
+export STUB_FAIL_ACTION=enable
+export STUB_ENABLE_FAIL_MODE=inactive
+create_inactive_failure="${TEST_HOME}/create-inactive-failure.out"
+if install_new_profile_from_loaded iran 6 1 > "${create_inactive_failure}" 2>&1; then fail "enable/start failure before activation returns nonzero"; else pass "enable/start failure before activation returns nonzero"; fi
+unset STUB_FAIL_ACTION STUB_ENABLE_FAIL_MODE
+assert_absent "inactive partial activation removes env only after verified rollback" "${ENV_DIR}/iran-6.env"
+assert_absent "inactive partial activation removes unit only after verified rollback" "${UNIT_DIR}/gost-iran-6.service"
+
+prepare_iran_candidate 4107
+export STUB_FAIL_ACTION=enable
+export STUB_PARTIAL_FAIL_ACTION=enable
+create_active_failure="${TEST_HOME}/create-active-failure.out"
+if install_new_profile_from_loaded iran 7 1 > "${create_active_failure}" 2>&1; then fail "activation that returns failure after start returns nonzero"; else pass "activation that returns failure after start returns nonzero"; fi
+unset STUB_FAIL_ACTION STUB_PARTIAL_FAIL_ACTION
+assert_absent "active partial activation removes env after verified stop" "${ENV_DIR}/iran-7.env"
+assert_absent "active partial activation removes unit after verified stop" "${UNIT_DIR}/gost-iran-7.service"
+
+prepare_iran_candidate 4111
+export STUB_FAIL_ACTION=enable
+export STUB_PARTIAL_FAIL_ACTION=enable
+export STUB_FAIL_SECONDARY_ACTION=disable
+create_disable_failure="${TEST_HOME}/create-disable-failure.out"
+if install_new_profile_from_loaded iran 11 1 > "${create_disable_failure}" 2>&1; then fail "create rollback disable failure returns nonzero"; else pass "create rollback disable failure returns nonzero"; fi
+unset STUB_FAIL_ACTION STUB_PARTIAL_FAIL_ACTION STUB_FAIL_SECONDARY_ACTION
+assert_file "create rollback disable failure retains env" "${ENV_DIR}/iran-11.env"
+assert_file "create rollback disable failure retains unit" "${UNIT_DIR}/gost-iran-11.service"
+assert_contains "create rollback disable failure retains enabled inactive state" "loaded|enabled|inactive|0" "${SYSTEMD_STATE_DIR}/gost-iran-11.service.state"
+
+profile_env_reset
+profile_env_set GOST_USER create-state-user
+profile_env_set GOST_PASS create-state-canary
+profile_env_set TUNNEL_PORT 32008
+profile_env_set ALLOWED_IRAN_SOURCES 198.51.100.20/32
+profile_env_set FIREWALL_ENABLED 1
+export STUB_FAIL_ACTION=enable
+export STUB_PARTIAL_FAIL_ACTION=enable
+export STUB_FAIL_SECONDARY_ACTION=disable
+export STUB_FAIL_TERTIARY_ACTION=stop
+create_unverified_failure="${TEST_HOME}/create-unverified-failure.out"
+if install_new_profile_from_loaded kharej 8 1 > "${create_unverified_failure}" 2>&1; then fail "failed create rollback with surviving service returns nonzero"; else pass "failed create rollback with surviving service returns nonzero"; fi
+unset STUB_FAIL_ACTION STUB_PARTIAL_FAIL_ACTION STUB_FAIL_SECONDARY_ACTION STUB_FAIL_TERTIARY_ACTION
+assert_file "unverified create rollback retains env beneath surviving service" "${ENV_DIR}/kharej-8.env"
+assert_file "unverified create rollback retains unit beneath surviving service" "${UNIT_DIR}/gost-kharej-8.service"
+assert_contains "unverified create rollback retains firewall dependency" "gost-manager:kharej-8:drop" "${IPTABLES_STATE}"
+assert_contains "unverified create rollback leaves active state observable" "loaded|enabled|active|208" "${SYSTEMD_STATE_DIR}/gost-kharej-8.service.state"
+assert_contains "unverified create rollback reports retained recovery material" "Retained recovery files" "${create_unverified_failure}"
+
+prepare_iran_candidate 4109
+export STUB_FAIL_ACTION=enable
+export STUB_PARTIAL_FAIL_ACTION=enable
+export STUB_FAIL_SECONDARY_ACTION=stop
+create_stop_failure="${TEST_HOME}/create-stop-failure.out"
+if install_new_profile_from_loaded iran 9 1 > "${create_stop_failure}" 2>&1; then fail "create rollback stop failure returns nonzero"; else pass "create rollback stop failure returns nonzero"; fi
+unset STUB_FAIL_ACTION STUB_PARTIAL_FAIL_ACTION STUB_FAIL_SECONDARY_ACTION
+assert_file "create rollback stop failure retains env" "${ENV_DIR}/iran-9.env"
+assert_file "create rollback stop failure retains unit" "${UNIT_DIR}/gost-iran-9.service"
+assert_contains "create rollback stop failure retains active service state" "loaded|disabled|active|109" "${SYSTEMD_STATE_DIR}/gost-iran-9.service.state"
+
+# Stateful delete failure and exact restoration regressions.
+write_iran 10 5010 delete-state
+select_existing_tunnel() {
+  SELECTED_TUNNEL_SIDE=iran
+  SELECTED_TUNNEL_NUMBER=10
+  SELECTED_TUNNEL_SERVICE=gost-iran-10.service
+  SELECTED_TUNNEL_SERVICE_FILE="${UNIT_DIR}/gost-iran-10.service"
+  SELECTED_TUNNEL_ENV_FILE="${ENV_DIR}/iran-10.env"
+}
+printf 'LISTEN 0 4096 0.0.0.0:5010 0.0.0.0:* users:(("gost",pid=110,fd=3))\n' > "${SS_FIXTURE}"
+: > "${COMMAND_LOG}"
+export STUB_FAIL_ACTION=disable
+delete_unchanged_failure="${TEST_HOME}/delete-disable-unchanged.out"
+if (confirm() { return 0; }; delete_tunnel) > "${delete_unchanged_failure}" 2>&1; then fail "delete disable failure without state change returns nonzero"; else pass "delete disable failure without state change returns nonzero"; fi
+unset STUB_FAIL_ACTION
+assert_contains "delete disable failure restores exact active enabled state" "loaded|enabled|active|110" "${SYSTEMD_STATE_DIR}/gost-iran-10.service.state"
+assert_file "delete disable failure retains env" "${ENV_DIR}/iran-10.env"
+assert_file "delete disable failure retains unit" "${UNIT_DIR}/gost-iran-10.service"
+
+printf 'loaded|enabled|active|110\n' > "${SYSTEMD_STATE_DIR}/gost-iran-10.service.state"
+export STUB_FAIL_ACTION=disable
+export STUB_PARTIAL_FAIL_ACTION=disable
+delete_partial_failure="${TEST_HOME}/delete-disable-partial.out"
+if (confirm() { return 0; }; delete_tunnel) > "${delete_partial_failure}" 2>&1; then fail "partially applied delete disable returns nonzero"; else pass "partially applied delete disable returns nonzero"; fi
+unset STUB_FAIL_ACTION STUB_PARTIAL_FAIL_ACTION
+assert_contains "partial delete disable successfully restores prior state" "loaded|enabled|active|110" "${SYSTEMD_STATE_DIR}/gost-iran-10.service.state"
+assert_contains "partial delete disable reports verified restoration" "exact prior service state was restored" "${delete_partial_failure}"
+
+printf 'loaded|enabled|active|110\n' > "${SYSTEMD_STATE_DIR}/gost-iran-10.service.state"
+export STUB_FAIL_ACTION=disable
+export STUB_PARTIAL_FAIL_ACTION=disable
+export STUB_FAIL_SECONDARY_ACTION=enable
+delete_enable_restore_failure="${TEST_HOME}/delete-enable-restore-failure.out"
+if (confirm() { return 0; }; delete_tunnel) > "${delete_enable_restore_failure}" 2>&1; then fail "delete restoration enable failure returns nonzero"; else pass "delete restoration enable failure returns nonzero"; fi
+unset STUB_FAIL_ACTION STUB_PARTIAL_FAIL_ACTION STUB_FAIL_SECONDARY_ACTION
+assert_contains "delete restoration enable failure reports unverified state" "restoration was not proven" "${delete_enable_restore_failure}"
+if find "${ENV_DIR}" -name '.iran-10.env.rollback.*' | grep -q .; then pass "delete restoration enable failure retains env recovery snapshot"; else fail "delete restoration enable failure retains env recovery snapshot"; fi
+
+printf 'loaded|enabled|active|110\n' > "${SYSTEMD_STATE_DIR}/gost-iran-10.service.state"
+export STUB_FAIL_ACTION=disable
+export STUB_PARTIAL_FAIL_ACTION=disable
+export STUB_FAIL_SECONDARY_ACTION=start
+delete_start_restore_failure="${TEST_HOME}/delete-start-restore-failure.out"
+if (confirm() { return 0; }; delete_tunnel) > "${delete_start_restore_failure}" 2>&1; then fail "delete restoration start failure returns nonzero"; else pass "delete restoration start failure returns nonzero"; fi
+unset STUB_FAIL_ACTION STUB_PARTIAL_FAIL_ACTION STUB_FAIL_SECONDARY_ACTION
+assert_contains "delete restoration start failure retains unit recovery path" ".gost-iran-10.service.rollback." "${delete_start_restore_failure}"
+
+printf 'loaded|enabled|active|110\n' > "${SYSTEMD_STATE_DIR}/gost-iran-10.service.state"
+export STUB_FAIL_ACTION=disable
+export STUB_PARTIAL_FAIL_ACTION=disable
+export STUB_START_BAD_PID=1
+delete_verify_mismatch="${TEST_HOME}/delete-verify-mismatch.out"
+if (confirm() { return 0; }; delete_tunnel) > "${delete_verify_mismatch}" 2>&1; then fail "delete final state verification mismatch returns nonzero"; else pass "delete final state verification mismatch returns nonzero"; fi
+unset STUB_FAIL_ACTION STUB_PARTIAL_FAIL_ACTION STUB_START_BAD_PID
+assert_contains "delete verification mismatch never claims successful preservation" "restoration was not proven" "${delete_verify_mismatch}"
+assert_not_contains "stateful safety cases send zero lifecycle commands to unselected profile" "gost-iran-1.service" "${COMMAND_LOG}"
 
 performance_root="${TEST_HOME}/performance"
 mkdir -p "${performance_root}/env" "${performance_root}/units"

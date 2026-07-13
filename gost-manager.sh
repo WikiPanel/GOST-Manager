@@ -1111,6 +1111,167 @@ except Exception:
 PY
 }
 
+transition_kharej_firewall_rules() {
+  local action="$1"
+  local number="$2"
+  local port="$3"
+  local sources="$4"
+  local enabled="$5"
+  local candidate_count="${6:-0}"
+  local snapshot="${7:-}"
+  command -v iptables >/dev/null 2>&1 || return 1
+  python3 - "${action}" "${number}" "${port}" "${sources}" "${enabled}" "${candidate_count}" "${snapshot}" <<'PY'
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+action, number, port, sources_raw, enabled, count_raw, snapshot_path = sys.argv[1:]
+allow = f"gost-manager:kharej-{number}:allow"
+drop = f"gost-manager:kharej-{number}:drop"
+
+
+def run(args):
+    return subprocess.run(["iptables", *args], text=True, capture_output=True, check=False)
+
+
+def input_rules():
+    result = run(["-S", "INPUT"])
+    if result.returncode:
+        raise RuntimeError("cannot inspect INPUT rules")
+    parsed = [shlex.split(line) for line in result.stdout.splitlines() if line.strip()]
+    return [item for item in parsed if item[:2] == ["-A", "INPUT"]]
+
+
+def rule_comment(rule):
+    try:
+        return rule[rule.index("--comment") + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def is_managed(rule):
+    return rule_comment(rule) in {allow, drop}
+
+
+def candidate_rules():
+    if enabled != "1":
+        return []
+    sources = [source for source in sources_raw.split(",") if source]
+    return [
+        ["-A", "INPUT", "-p", "tcp", "-s", source, "--dport", port,
+         "-m", "comment", "--comment", allow, "-j", "ACCEPT"]
+        for source in sources
+    ] + [["-A", "INPUT", "-p", "tcp", "--dport", port,
+          "-m", "comment", "--comment", drop, "-j", "DROP"]]
+
+
+def insert_rule(position, rule):
+    if rule[:2] != ["-A", "INPUT"]:
+        raise RuntimeError("invalid rule")
+    if run(["-I", "INPUT", str(position), *rule[2:]]).returncode:
+        raise RuntimeError("rule insertion failed")
+
+
+def delete_position(position):
+    if run(["-D", "INPUT", str(position)]).returncode:
+        raise RuntimeError("rule deletion failed")
+
+
+def managed_positions(items):
+    return [(position, rule) for position, rule in enumerate(items, 1) if is_managed(rule)]
+
+
+candidate = candidate_rules()
+
+if action == "prepare":
+    before = input_rules()
+    added = 0
+    try:
+        for rule in reversed(candidate):
+            insert_rule(1, rule)
+            added += 1
+        if input_rules() != candidate + before:
+            raise RuntimeError("candidate verification failed")
+    except Exception:
+        try:
+            for _index in range(added):
+                delete_position(1)
+            if input_rules() != before:
+                raise RuntimeError("prepare rollback verification failed")
+        except Exception:
+            raise SystemExit(2)
+        raise SystemExit(1)
+    print(len(candidate))
+    raise SystemExit(0)
+
+if action == "finalize":
+    count = int(count_raw)
+    current = input_rules()
+    if count != len(candidate) or current[:count] != candidate:
+        raise SystemExit(1)
+    obsolete = [position for position, rule in managed_positions(current) if position > count]
+    try:
+        for position in sorted(obsolete, reverse=True):
+            delete_position(position)
+    except Exception:
+        raise SystemExit(1)
+    final = input_rules()
+    if final[:count] != candidate or managed_positions(final) != list(enumerate(candidate, 1)):
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+if action == "rollback":
+    count = int(count_raw)
+    current = input_rules()
+    candidate_block = current[:count]
+    if len(candidate_block) != count or any(not is_managed(rule) for rule in candidate_block):
+        raise SystemExit(1)
+    saved = []
+    if snapshot_path:
+        for line in Path(snapshot_path).read_text().splitlines():
+            if not line.strip() or "|" not in line:
+                continue
+            position_raw, rule_raw = line.split("|", 1)
+            rule = shlex.split(rule_raw)
+            if rule[:2] != ["-A", "INPUT"] or not is_managed(rule):
+                raise SystemExit(1)
+            saved.append((int(position_raw), rule))
+    try:
+        obsolete = [position for position, _rule in managed_positions(current) if position > count]
+        for position in sorted(obsolete, reverse=True):
+            delete_position(position)
+        for position, rule in sorted(saved):
+            insert_rule(position + count, rule)
+        with_candidate = input_rules()
+        expected_shifted = [(position + count, rule) for position, rule in saved]
+        actual_shifted = [item for item in managed_positions(with_candidate) if item[0] > count]
+        if with_candidate[:count] != candidate_block or actual_shifted != expected_shifted:
+            raise RuntimeError("old rule staging verification failed")
+        for _index in range(count):
+            delete_position(1)
+        if managed_positions(input_rules()) != saved:
+            raise RuntimeError("rollback verification failed")
+    except Exception:
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+prepare_kharej_firewall_transition() {
+  transition_kharej_firewall_rules prepare "$1" "$2" "$3" "$4"
+}
+
+finalize_kharej_firewall_transition() {
+  transition_kharej_firewall_rules finalize "$1" "$2" "$3" "$4" "$5"
+}
+
+rollback_kharej_firewall_transition() {
+  transition_kharej_firewall_rules rollback "$1" 1 "" 0 "$2" "$3"
+}
+
 add_kharej_firewall_rules() {
   local number="$1"
   local sources="$2"
@@ -1227,6 +1388,145 @@ take_connection_snapshot() {
   take_bounded_ss_snapshot "${output}" -H -tanp
 }
 
+capture_service_state() {
+  local service="$1"
+  local output="$2"
+  local raw line key value load_state="" unit_state="" active_state="" main_pid="" seen="|" invalid=0
+  raw="$(mktemp)"
+  if ! systemctl show "${service}" --no-pager \
+    --property=LoadState,UnitFileState,ActiveState,MainPID > "${raw}" 2>/dev/null; then
+    rm -f "${raw}"
+    return 1
+  fi
+  while IFS= read -r line; do
+    [[ "${line}" =~ ^([A-Za-z]+)=(.*)$ ]] || { invalid=1; break; }
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    [[ "${seen}" != *"|${key}|"* ]] || { invalid=1; break; }
+    seen="${seen}${key}|"
+    case "${key}" in
+      LoadState) load_state="${value}" ;;
+      UnitFileState) unit_state="${value}" ;;
+      ActiveState) active_state="${value}" ;;
+      MainPID) main_pid="${value}" ;;
+      *) invalid=1; break ;;
+    esac
+  done < "${raw}"
+  rm -f "${raw}"
+  [[ "${invalid}" -eq 0 ]] || return 1
+  [[ "${seen}" == *"|LoadState|"* && "${seen}" == *"|UnitFileState|"* && "${seen}" == *"|ActiveState|"* && "${seen}" == *"|MainPID|"* ]] || return 1
+  unit_state="${unit_state:-none}"
+  [[ "${load_state}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  [[ "${unit_state}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  [[ "${active_state}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  [[ "${main_pid}" =~ ^[0-9]+$ ]] || return 1
+  if [[ "${active_state}" == "active" ]]; then
+    [[ "${main_pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  elif [[ "${active_state}" == "inactive" ]]; then
+    [[ "${main_pid}" == "0" ]] || return 1
+  fi
+  printf '%s|%s|%s|%s\n' "${load_state}" "${unit_state}" "${active_state}" "${main_pid}" > "${output}"
+}
+
+read_captured_service_state() {
+  local state_file="$1"
+  local extra=""
+  IFS='|' read -r CAPTURED_LOAD_STATE CAPTURED_UNIT_STATE CAPTURED_ACTIVE_STATE CAPTURED_MAIN_PID extra < "${state_file}" || return 1
+  [[ -z "${extra}" ]] || return 1
+  [[ "${CAPTURED_LOAD_STATE}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  [[ "${CAPTURED_UNIT_STATE}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  [[ "${CAPTURED_ACTIVE_STATE}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  [[ "${CAPTURED_MAIN_PID}" =~ ^[0-9]+$ ]]
+}
+
+verify_service_state_matches() {
+  local service="$1"
+  local expected_file="$2"
+  local current_file expected_load expected_unit expected_active expected_pid
+  read_captured_service_state "${expected_file}" || return 1
+  expected_load="${CAPTURED_LOAD_STATE}"
+  expected_unit="${CAPTURED_UNIT_STATE}"
+  expected_active="${CAPTURED_ACTIVE_STATE}"
+  expected_pid="${CAPTURED_MAIN_PID}"
+  current_file="$(mktemp)"
+  if ! capture_service_state "${service}" "${current_file}" || ! read_captured_service_state "${current_file}"; then
+    rm -f "${current_file}"
+    return 1
+  fi
+  rm -f "${current_file}"
+  [[ "${CAPTURED_LOAD_STATE}" == "${expected_load}" ]] || return 1
+  [[ "${CAPTURED_UNIT_STATE}" == "${expected_unit}" ]] || return 1
+  [[ "${CAPTURED_ACTIVE_STATE}" == "${expected_active}" ]] || return 1
+  if [[ "${expected_active}" == "active" ]]; then
+    [[ "${CAPTURED_MAIN_PID}" =~ ^[1-9][0-9]*$ ]]
+  elif [[ "${expected_pid}" == "0" ]]; then
+    [[ "${CAPTURED_MAIN_PID}" == "0" ]]
+  fi
+}
+
+service_is_inactive_disabled() {
+  local service="$1"
+  local state_file
+  state_file="$(mktemp)"
+  if ! capture_service_state "${service}" "${state_file}" || ! read_captured_service_state "${state_file}"; then
+    rm -f "${state_file}"
+    return 1
+  fi
+  rm -f "${state_file}"
+  [[ "${CAPTURED_ACTIVE_STATE}" == "inactive" && "${CAPTURED_UNIT_STATE}" == "disabled" && "${CAPTURED_MAIN_PID}" == "0" ]]
+}
+
+service_is_inactive() {
+  local service="$1"
+  local state_file
+  state_file="$(mktemp)"
+  if ! capture_service_state "${service}" "${state_file}" || ! read_captured_service_state "${state_file}"; then
+    rm -f "${state_file}"
+    return 1
+  fi
+  rm -f "${state_file}"
+  [[ "${CAPTURED_ACTIVE_STATE}" == "inactive" && "${CAPTURED_MAIN_PID}" == "0" ]]
+}
+
+stop_disable_service_verified() {
+  local service="$1"
+  if ! systemctl disable "${service}"; then
+    :
+  fi
+  if ! systemctl stop "${service}"; then
+    :
+  fi
+  service_is_inactive_disabled "${service}"
+}
+
+stop_service_verified() {
+  local service="$1"
+  if ! systemctl stop "${service}"; then
+    :
+  fi
+  service_is_inactive "${service}"
+}
+
+restore_service_state() {
+  local service="$1"
+  local expected_file="$2"
+  local expected_unit expected_active
+  read_captured_service_state "${expected_file}" || return 1
+  expected_unit="${CAPTURED_UNIT_STATE}"
+  expected_active="${CAPTURED_ACTIVE_STATE}"
+  case "${expected_unit}" in
+    enabled) if ! systemctl enable "${service}" >/dev/null 2>&1; then :; fi ;;
+    enabled-runtime) if ! systemctl enable --runtime "${service}" >/dev/null 2>&1; then :; fi ;;
+    disabled) if ! systemctl disable "${service}" >/dev/null 2>&1; then :; fi ;;
+  esac
+  case "${expected_active}" in
+    active) if ! systemctl start "${service}" >/dev/null 2>&1; then :; fi ;;
+    inactive) if ! systemctl stop "${service}" >/dev/null 2>&1; then :; fi ;;
+    *) return 1 ;;
+  esac
+  verify_service_state_matches "${service}" "${expected_file}"
+}
+
 csv_contains() {
   local csv="$1"
   local wanted="$2"
@@ -1248,16 +1548,24 @@ validate_live_ports_snapshot() {
   local ports="$2"
   local selected_id="${3:-}"
   local unchanged_ports="${4:-}"
-  local selected_parts side number selected_pid line line_port candidate owner
+  local selected_parts side number selected_pid line line_port candidate owner needs_selected_pid=0
   local candidates=()
   selected_pid=""
+  IFS=',' read -r -a candidates <<< "${ports}"
   if [[ -n "${selected_id}" ]]; then
+    for candidate in "${candidates[@]}"; do
+      if csv_contains "${unchanged_ports}" "${candidate}"; then
+        needs_selected_pid=1
+        break
+      fi
+    done
+  fi
+  if [[ "${needs_selected_pid}" -eq 1 ]]; then
     selected_parts="$(profile_id_parts "${selected_id}")" || return 1
     side="${selected_parts%% *}"
     number="${selected_parts#* }"
     selected_pid="$(systemctl show -p MainPID --value "$(service_name "${side}" "${number}")" 2>/dev/null || true)"
   fi
-  IFS=',' read -r -a candidates <<< "${ports}"
   for candidate in "${candidates[@]}"; do
     while IFS= read -r line; do
       line_port="$(ss_line_local_port "${line}" || true)"
@@ -1308,10 +1616,14 @@ validate_profile_ports_before_write() {
 verify_profile_listeners() {
   local service="$1"
   local ports="$2"
+  local strict_pid="${3:-0}"
   local pid snapshot _attempt line line_port expected found all_found
   local expected_ports=()
   pid="$(systemctl show -p MainPID --value "${service}" 2>/dev/null || true)"
-  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 0
+  if [[ ! "${pid}" =~ ^[1-9][0-9]*$ ]]; then
+    [[ "${strict_pid}" == "0" ]]
+    return $?
+  fi
   IFS=',' read -r -a expected_ports <<< "${ports}"
   snapshot="$(mktemp)"
   for _attempt in 1 2 3 4 5; do
@@ -1337,6 +1649,20 @@ verify_profile_listeners() {
   done
   rm -f "${snapshot}"
   return 1
+}
+
+verify_active_profile_listener() {
+  local service="$1"
+  local ports="$2"
+  local state_file
+  state_file="$(mktemp)"
+  if ! capture_service_state "${service}" "${state_file}" || ! read_captured_service_state "${state_file}"; then
+    rm -f "${state_file}"
+    return 1
+  fi
+  rm -f "${state_file}"
+  [[ "${CAPTURED_ACTIVE_STATE}" == "active" && "${CAPTURED_MAIN_PID}" =~ ^[1-9][0-9]*$ ]] || return 1
+  verify_profile_listeners "${service}" "${ports}" 1
 }
 
 check_mapping_ports_free_or_die() {
@@ -1366,7 +1692,7 @@ install_new_profile_from_loaded() {
   local number="$2"
   local start_profile="${3:-1}"
   local profile_id="${side}-${number}"
-  local env_file svc_file service runner ports sources firewall snapshot failure
+  local env_file svc_file service runner ports sources firewall snapshot activation_state failure lifecycle_mutated=0 rollback_failed
 
   validate_side "${side}" || return 1
   validate_tunnel_number_or_die "${number}"
@@ -1390,9 +1716,10 @@ install_new_profile_from_loaded() {
   fi
 
   snapshot="$(mktemp)"
+  activation_state="$(mktemp)"
   chmod 600 "${snapshot}"
   if [[ "${side}" == "kharej" ]]; then
-    snapshot_kharej_firewall_rules "${number}" "${snapshot}" || { rm -f "${snapshot}"; return 1; }
+    snapshot_kharej_firewall_rules "${number}" "${snapshot}" || { rm -f "${snapshot}" "${activation_state}"; return 1; }
   fi
 
   failure=0
@@ -1411,28 +1738,44 @@ install_new_profile_from_loaded() {
     systemctl daemon-reload || failure=1
   fi
   if [[ "${failure}" -eq 0 && "${start_profile}" == "1" ]]; then
+    capture_service_state "${service}" "${activation_state}" || failure=1
+  fi
+  if [[ "${failure}" -eq 0 && "${start_profile}" == "1" ]]; then
+    lifecycle_mutated=1
     systemctl enable --now "${service}" || failure=1
     if [[ "${failure}" -eq 0 ]]; then
-      systemctl is-active --quiet "${service}" || failure=1
-    fi
-    if [[ "${failure}" -eq 0 ]]; then
-      verify_profile_listeners "${service}" "${ports}" || failure=1
+      verify_active_profile_listener "${service}" "${ports}" || failure=1
     fi
   fi
 
   if [[ "${failure}" -ne 0 ]]; then
-    systemctl disable --now "${service}" >/dev/null 2>&1 || true
-    if [[ "${side}" == "kharej" ]]; then
-      restore_kharej_firewall_rules "${number}" "${snapshot}" || true
+    if [[ "${lifecycle_mutated}" -eq 1 ]] && { ! stop_disable_service_verified "${service}" || ! verify_service_state_matches "${service}" "${activation_state}"; }; then
+      printf 'Profile %s activation failed and inactive/disabled rollback could not be proven. Retained recovery files: %s %s %s %s\n' \
+        "${profile_id}" "${env_file}" "${svc_file}" "${snapshot}" "${activation_state}" >&2
+      return 1
     fi
-    rm -f "${svc_file}" "${env_file}"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    rm -f "${snapshot}"
+    rollback_failed=0
+    if [[ "${side}" == "kharej" ]]; then
+      restore_kharej_firewall_rules "${number}" "${snapshot}" || rollback_failed=1
+    fi
+    if [[ "${rollback_failed}" -ne 0 ]]; then
+      printf 'Profile %s activation failed and firewall rollback could not be proven. Retained recovery files: %s %s %s\n' \
+        "${profile_id}" "${env_file}" "${svc_file}" "${snapshot}" >&2
+      rm -f "${activation_state}"
+      return 1
+    fi
+    if ! rm -f "${svc_file}" "${env_file}" || ! systemctl daemon-reload >/dev/null 2>&1; then
+      printf 'Profile %s activation failed; service is proven inactive/disabled but file cleanup needs operator recovery: %s %s\n' \
+        "${profile_id}" "${env_file}" "${svc_file}" >&2
+      rm -f "${snapshot}" "${activation_state}"
+      return 1
+    fi
+    rm -f "${snapshot}" "${activation_state}"
     printf 'Profile %s creation failed; only its new files and managed firewall rules were rolled back.\n' "${profile_id}" >&2
     return 1
   fi
 
-  rm -f "${snapshot}"
+  rm -f "${snapshot}" "${activation_state}"
   info "Profile ${profile_id} created successfully."
   info "Service: ${service}"
   info "Env: ${env_file}"
@@ -1663,27 +2006,11 @@ select_existing_tunnel() {
   SELECTED_TUNNEL_ENV_FILE="${selected#*|}"
 }
 
-restore_exact_service_state() {
-  local service="$1"
-  local active_state="$2"
-  local enabled_state="$3"
-  local failed=0
-  case "${enabled_state}" in
-    enabled) systemctl enable "${service}" >/dev/null 2>&1 || failed=1 ;;
-    disabled) systemctl disable "${service}" >/dev/null 2>&1 || failed=1 ;;
-  esac
-  case "${active_state}" in
-    active) systemctl start "${service}" >/dev/null 2>&1 || failed=1 ;;
-    inactive) systemctl stop "${service}" >/dev/null 2>&1 || failed=1 ;;
-  esac
-  [[ "${failed}" -eq 0 ]]
-}
-
 delete_tunnel() {
   require_root
   ensure_commands systemctl
 
-  local side number service svc_file env_file profile_id label state firewall env_snapshot unit_snapshot firewall_snapshot old_active old_enabled failed
+  local side number service svc_file env_file profile_id label state firewall env_snapshot unit_snapshot firewall_snapshot service_state old_ports="" failed command_failed
   select_existing_tunnel
   side="${SELECTED_TUNNEL_SIDE}"
   number="${SELECTED_TUNNEL_NUMBER}"
@@ -1700,6 +2027,7 @@ delete_tunnel() {
       firewall="$(profile_env_value FIREWALL_ENABLED || true)"
       firewall="${firewall:-unknown}"
     fi
+    old_ports="$(profile_local_ports_from_loaded "${side}" || true)"
   fi
   state="$(service_status_summary "${service}")"
   cat <<EOF_OUT
@@ -1719,30 +2047,46 @@ EOF_OUT
 
   validate_managed_destination "${env_file}" env || { [[ ! -e "${env_file}" && ! -L "${env_file}" ]] || die "unsafe env destination; nothing was deleted."; }
   validate_managed_destination "${svc_file}" unit || { [[ ! -e "${svc_file}" && ! -L "${svc_file}" ]] || die "unsafe unit destination; nothing was deleted."; }
+  service_state="$(mktemp)"
+  if ! capture_service_state "${service}" "${service_state}"; then
+    rm -f "${service_state}"
+    printf 'Could not capture exact service state; nothing was changed.\n' >&2
+    return 1
+  fi
   env_snapshot=""
   unit_snapshot=""
   if [[ -f "${env_file}" ]] && ! env_snapshot="$(snapshot_managed_file "${env_file}")"; then
+    rm -f "${service_state}"
     printf 'Could not snapshot the selected env; nothing was changed.\n' >&2
     return 1
   fi
   if [[ -f "${svc_file}" ]] && ! unit_snapshot="$(snapshot_managed_file "${svc_file}")"; then
-    rm -f "${env_snapshot}"
+    rm -f "${env_snapshot}" "${service_state}"
     printf 'Could not snapshot the selected unit; nothing was changed.\n' >&2
     return 1
   fi
   firewall_snapshot="$(mktemp)"
   chmod 600 "${firewall_snapshot}"
   if [[ "${side}" == "kharej" ]] && ! snapshot_kharej_firewall_rules "${number}" "${firewall_snapshot}"; then
-    rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}"
+    rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}" "${service_state}"
     printf 'Could not snapshot the selected firewall rules; nothing was changed.\n' >&2
     return 1
   fi
-  old_active="$(systemctl is-active "${service}" 2>/dev/null || true)"
-  old_enabled="$(systemctl is-enabled "${service}" 2>/dev/null || true)"
-  if ! systemctl disable --now "${service}"; then
-    restore_exact_service_state "${service}" "${old_active}" "${old_enabled}" || true
-    rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}"
-    printf 'Could not stop/disable %s; env, unit, and firewall were preserved.\n' "${service}" >&2
+  command_failed=0
+  systemctl disable --now "${service}" || command_failed=1
+  if [[ "${command_failed}" -ne 0 ]] || ! service_is_inactive_disabled "${service}"; then
+    failed=0
+    restore_service_state "${service}" "${service_state}" || failed=1
+    if [[ "${failed}" -eq 0 ]] && read_captured_service_state "${service_state}" && [[ "${CAPTURED_ACTIVE_STATE}" == "active" && -n "${old_ports}" ]]; then
+      verify_profile_listeners "${service}" "${old_ports}" 1 || failed=1
+    fi
+    if [[ "${failed}" -eq 0 ]]; then
+      rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}" "${service_state}"
+      printf 'Could not stop/disable %s; its exact prior service state was restored and files/firewall were not changed.\n' "${service}" >&2
+    else
+      printf 'Could not stop/disable %s and exact service-state restoration was not proven. Retained recovery snapshots: %s %s %s %s\n' \
+        "${service}" "${env_snapshot:-none}" "${unit_snapshot:-none}" "${firewall_snapshot}" "${service_state}" >&2
+    fi
     return 1
   fi
 
@@ -1750,13 +2094,16 @@ EOF_OUT
     if ! delete_kharej_firewall_rules "${number}"; then
       failed=0
       restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || failed=1
-      restore_exact_service_state "${service}" "${old_active}" "${old_enabled}" || failed=1
-      rm -f "${env_snapshot}" "${unit_snapshot}"
+      restore_service_state "${service}" "${service_state}" || failed=1
+      if [[ "${failed}" -eq 0 ]] && read_captured_service_state "${service_state}" && [[ "${CAPTURED_ACTIVE_STATE}" == "active" && -n "${old_ports}" ]]; then
+        verify_profile_listeners "${service}" "${old_ports}" 1 || failed=1
+      fi
       if [[ "${failed}" -eq 0 ]]; then
-        rm -f "${firewall_snapshot}"
+        rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}" "${service_state}"
         printf 'Firewall removal failed; the profile and service state were restored.\n' >&2
       else
-        printf 'Firewall removal failed and restoration could not be proven. Retained firewall snapshot: %s\n' "${firewall_snapshot}" >&2
+        printf 'Firewall removal failed and restoration could not be proven. Retained recovery snapshots: %s %s %s %s\n' \
+          "${env_snapshot:-none}" "${unit_snapshot:-none}" "${firewall_snapshot}" "${service_state}" >&2
       fi
       return 1
     fi
@@ -1775,21 +2122,25 @@ EOF_OUT
       restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || failed=2
     fi
     systemctl daemon-reload >/dev/null 2>&1 || failed=2
-    restore_exact_service_state "${service}" "${old_active}" "${old_enabled}" || failed=2
+    restore_service_state "${service}" "${service_state}" || failed=2
+    if [[ "${failed}" -ne 2 ]] && read_captured_service_state "${service_state}" && [[ "${CAPTURED_ACTIVE_STATE}" == "active" && -n "${old_ports}" ]]; then
+      verify_profile_listeners "${service}" "${old_ports}" 1 || failed=2
+    fi
     if [[ "${failed}" -eq 2 ]]; then
       if [[ "${side}" == "iran" ]]; then
         rm -f "${firewall_snapshot}"
         firewall_snapshot=""
       fi
-      printf 'Deletion failed and automatic restoration could not be proven. Recovery snapshots: %s %s %s\n' "${env_snapshot:-none}" "${unit_snapshot:-none}" "${firewall_snapshot:-none}" >&2
+      printf 'Deletion failed and automatic restoration could not be proven. Recovery snapshots: %s %s %s %s\n' \
+        "${env_snapshot:-none}" "${unit_snapshot:-none}" "${firewall_snapshot:-none}" "${service_state}" >&2
     else
-      rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}"
+      rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}" "${service_state}"
       printf 'Deletion failed; the selected profile was restored.\n' >&2
     fi
     return 1
   fi
 
-  rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}"
+  rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}" "${service_state}"
   info "Deleted only ${profile_id}."
 }
 
@@ -2102,12 +2453,69 @@ show_profile_detail() {
   show_selected_profile_detail "${SELECTED_TUNNEL_SIDE}" "${SELECTED_TUNNEL_NUMBER}"
 }
 
+verify_listener_for_captured_state() {
+  local service="$1"
+  local state_file="$2"
+  local ports="$3"
+  read_captured_service_state "${state_file}" || return 1
+  if [[ "${CAPTURED_ACTIVE_STATE}" == "active" ]]; then
+    [[ -n "${ports}" ]] || return 1
+    verify_profile_listeners "${service}" "${ports}" 1
+  fi
+}
+
+rollback_protected_kharej_edit() {
+  local number="$1"
+  local service="$2"
+  local env_snapshot="$3"
+  local env_file="$4"
+  local firewall_snapshot="$5"
+  local service_state="$6"
+  local old_ports="$7"
+  local new_firewall="$8"
+  local candidate_count="$9"
+  local failed=0
+
+  read_captured_service_state "${service_state}" || return 1
+  restore_managed_snapshot "${env_snapshot}" "${env_file}" env || failed=1
+  if ! stop_service_verified "${service}"; then
+    return 1
+  fi
+  if [[ "${new_firewall}" == "1" ]]; then
+    rollback_kharej_firewall_transition "${number}" "${candidate_count}" "${firewall_snapshot}" || failed=1
+  else
+    restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || failed=1
+  fi
+  [[ "${failed}" -eq 0 ]] || return 1
+  restore_service_state "${service}" "${service_state}" || return 1
+  verify_listener_for_captured_state "${service}" "${service_state}" "${old_ports}"
+}
+
+rollback_kharej_firewall_edit() {
+  local number="$1"
+  local env_snapshot="$2"
+  local env_file="$3"
+  local firewall_snapshot="$4"
+  local new_firewall="$5"
+  local candidate_count="$6"
+  local failed=0
+  restore_managed_snapshot "${env_snapshot}" "${env_file}" env || failed=1
+  if [[ "${new_firewall}" == "1" ]]; then
+    rollback_kharej_firewall_transition "${number}" "${candidate_count}" "${firewall_snapshot}" || failed=1
+  else
+    restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || failed=1
+  fi
+  [[ "${failed}" -eq 0 ]]
+}
+
 edit_profile() {
   require_root
   ensure_commands systemctl ss python3
   local side number service env_file profile_id old_label old_user old_password label user password
   local old_host old_port old_mappings host port mappings old_sources sources old_source_style old_firewall firewall
-  local old_ports new_ports changed=0 firewall_changed=0 env_snapshot firewall_snapshot old_active restart_answer restore_failed
+  local old_ports new_ports changed=0 credentials_changed=0 iran_runtime_changed=0 port_changed=0 sources_changed=0 firewall_state_changed=0
+  local firewall_rules_changed=0 protected_port_migration=0 needs_runtime_restart=0 env_snapshot firewall_snapshot service_state
+  local candidate_count=0 candidate_count_file prepare_status restore_failed migration_failed previous_active transition_prepared=0
 
   select_existing_tunnel
   side="${SELECTED_TUNNEL_SIDE}"
@@ -2134,8 +2542,8 @@ edit_profile() {
   validate_token_or_die "GOST password" "${password}"
 
   [[ "${label}" == "${old_label}" ]] || changed=1
-  [[ "${user}" == "${old_user}" ]] || changed=1
-  [[ "${password}" == "${old_password}" ]] || changed=1
+  [[ "${user}" == "${old_user}" ]] || { changed=1; credentials_changed=1; }
+  [[ "${password}" == "${old_password}" ]] || { changed=1; credentials_changed=1; }
   profile_env_set GOST_USER "${user}"
   profile_env_set GOST_PASS "${password}"
   if [[ -n "${label}" ]]; then profile_env_set PROFILE_LABEL "${label}"; else profile_env_unset PROFILE_LABEL; fi
@@ -2147,9 +2555,9 @@ edit_profile() {
     host="$(prompt_default "Kharej host" "${old_host}")"
     port="$(prompt_default "Kharej SOCKS port" "${old_port}")"
     mappings="$(prompt_default "Port mappings" "${old_mappings}")"
-    [[ "${host}" == "${old_host}" ]] || changed=1
-    [[ "${port}" == "${old_port}" ]] || changed=1
-    [[ "${mappings}" == "${old_mappings}" ]] || changed=1
+    [[ "${host}" == "${old_host}" ]] || { changed=1; iran_runtime_changed=1; }
+    [[ "${port}" == "${old_port}" ]] || { changed=1; iran_runtime_changed=1; }
+    [[ "${mappings}" == "${old_mappings}" ]] || { changed=1; iran_runtime_changed=1; }
     profile_env_set KHAREJ_IP "${host}"
     profile_env_set TUNNEL_PORT "${port}"
     profile_env_set MAPPINGS "${mappings}"
@@ -2167,12 +2575,12 @@ edit_profile() {
       profile_env_unset ALLOWED_IRAN_SOURCES
       profile_env_set ALLOWED_IRAN_SOURCES "${sources}"
       changed=1
-      firewall_changed=1
+      sources_changed=1
     elif [[ "${old_source_style}" == "IRAN_IP" ]]; then
       :
     fi
-    [[ "${port}" == "${old_port}" ]] || { changed=1; firewall_changed=1; }
-    [[ "${firewall}" == "${old_firewall}" ]] || { changed=1; firewall_changed=1; }
+    [[ "${port}" == "${old_port}" ]] || { changed=1; port_changed=1; }
+    [[ "${firewall}" == "${old_firewall}" ]] || { changed=1; firewall_state_changed=1; }
     profile_env_set TUNNEL_PORT "${port}"
     profile_env_set FIREWALL_ENABLED "${firewall}"
   fi
@@ -2186,9 +2594,17 @@ edit_profile() {
   new_ports="$(profile_local_ports_from_loaded "${side}")"
   validate_profile_ports_before_write "${profile_id}" "${new_ports}" "${profile_id}" "${old_ports}" || return 1
   if [[ "${side}" == "kharej" ]]; then
-    if [[ "${firewall_changed}" -eq 1 && ( "${old_firewall}" == "1" || "${firewall}" == "1" ) ]]; then
-      ensure_commands iptables
+    if [[ "${sources_changed}" -eq 1 || "${firewall_state_changed}" -eq 1 || ( "${port_changed}" -eq 1 && ( "${old_firewall}" == "1" || "${firewall}" == "1" ) ) ]]; then
+      firewall_rules_changed=1
     fi
+    if [[ "${port_changed}" -eq 1 && ( "${old_firewall}" == "1" || "${firewall}" == "1" ) ]]; then
+      protected_port_migration=1
+    fi
+    if [[ "${credentials_changed}" -eq 1 || "${port_changed}" -eq 1 ]]; then
+      needs_runtime_restart=1
+    fi
+  elif [[ "${credentials_changed}" -eq 1 || "${iran_runtime_changed}" -eq 1 ]]; then
+    needs_runtime_restart=1
   fi
   cat <<EOF_OUT
 Redacted edit for ${profile_id}
@@ -2198,66 +2614,153 @@ Credentials: $(if [[ "${user}" == "${old_user}" && "${password}" == "${old_passw
 Connectivity fields: validated
 EOF_OUT
   confirm "Save this exact profile change?" || { info "Edit cancelled; no files were changed."; return 0; }
+  if [[ "${protected_port_migration}" -eq 1 ]]; then
+    confirm "This protected Kharej port migration requires an exact service restart. Continue transactionally?" || {
+      info "Protected port migration cancelled; env, firewall, and service were not changed."
+      return 0
+    }
+  fi
+  if [[ "${firewall_rules_changed}" -eq 1 ]]; then
+    ensure_commands iptables
+  fi
 
   env_snapshot="$(snapshot_managed_file "${env_file}")" || return 1
   firewall_snapshot="$(mktemp)"
+  service_state="$(mktemp)"
   chmod 600 "${firewall_snapshot}"
   if [[ "${side}" == "kharej" ]]; then
-    snapshot_kharej_firewall_rules "${number}" "${firewall_snapshot}" || { rm -f "${env_snapshot}" "${firewall_snapshot}"; return 1; }
+    snapshot_kharej_firewall_rules "${number}" "${firewall_snapshot}" || { rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"; return 1; }
   fi
-  old_active="$(systemctl is-active "${service}" 2>/dev/null || true)"
+  if [[ "${needs_runtime_restart}" -eq 1 ]]; then
+    capture_service_state "${service}" "${service_state}" || {
+      rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"
+      printf 'Could not capture exact service state; no profile mutation was made.\n' >&2
+      return 1
+    }
+  fi
+
+  if [[ "${side}" == "kharej" && "${firewall_rules_changed}" -eq 1 ]]; then
+    transition_prepared=1
+    if [[ "${firewall}" == "1" ]]; then
+      candidate_count_file="$(mktemp)"
+      if prepare_kharej_firewall_transition "${number}" "${port}" "${sources}" "${firewall}" > "${candidate_count_file}"; then
+        candidate_count="$(cat "${candidate_count_file}")"
+        rm -f "${candidate_count_file}"
+      else
+        prepare_status=$?
+        rm -f "${candidate_count_file}" "${env_snapshot}" "${service_state}"
+        if [[ "${prepare_status}" -eq 1 ]]; then
+          rm -f "${firewall_snapshot}"
+          printf 'Candidate firewall preparation failed; exact prior rules remain unchanged.\n' >&2
+        else
+          printf 'Candidate firewall preparation and rollback could not be proven. Retained firewall snapshot: %s\n' "${firewall_snapshot}" >&2
+        fi
+        return 1
+      fi
+    fi
+  fi
+
   if ! write_loaded_profile_env "${env_file}" "${side}"; then
-    rm -f "${env_snapshot}" "${firewall_snapshot}"
+    restore_failed=0
+    if [[ "${side}" == "kharej" && "${transition_prepared}" -eq 1 ]]; then
+      rollback_kharej_firewall_edit "${number}" "${env_snapshot}" "${env_file}" "${firewall_snapshot}" "${firewall}" "${candidate_count}" || restore_failed=1
+    fi
+    if [[ "${restore_failed}" -eq 0 ]]; then
+      rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"
+    else
+      printf 'Env write failed and firewall restoration could not be proven. Retained recovery snapshots: %s %s\n' "${env_snapshot}" "${firewall_snapshot}" >&2
+      rm -f "${service_state}"
+    fi
     return 1
   fi
-  if [[ "${side}" == "kharej" && "${firewall_changed}" -eq 1 ]]; then
-    if [[ "${firewall}" == "1" ]]; then
-      if ! add_kharej_firewall_rules "${number}" "${sources}" "${port}"; then restart_answer=failure; else restart_answer=ok; fi
+
+  if [[ "${protected_port_migration}" -eq 1 ]]; then
+    migration_failed=0
+    read_captured_service_state "${service_state}" || migration_failed=1
+    previous_active="${CAPTURED_ACTIVE_STATE:-unknown}"
+    if [[ "${migration_failed}" -eq 0 && "${previous_active}" == "active" ]]; then
+      systemctl restart "${service}" || migration_failed=1
+      if [[ "${migration_failed}" -eq 0 ]]; then
+        verify_active_profile_listener "${service}" "${new_ports}" || migration_failed=1
+      fi
+    elif [[ "${migration_failed}" -eq 0 && "${previous_active}" == "inactive" ]]; then
+      verify_service_state_matches "${service}" "${service_state}" || migration_failed=1
     else
-      if ! delete_kharej_firewall_rules "${number}"; then restart_answer=failure; else restart_answer=ok; fi
+      migration_failed=1
     fi
-    if [[ "${restart_answer}" == "failure" ]]; then
-      restore_failed=0
-      restore_managed_snapshot "${env_snapshot}" "${env_file}" env || restore_failed=1
-      restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || restore_failed=1
-      if [[ "${restore_failed}" -eq 0 ]] && cmp -s "${env_snapshot}" "${env_file}"; then
-        rm -f "${env_snapshot}" "${firewall_snapshot}"
+    if [[ "${migration_failed}" -eq 0 ]]; then
+      if [[ "${firewall}" == "1" ]]; then
+        finalize_kharej_firewall_transition "${number}" "${port}" "${sources}" "${firewall}" "${candidate_count}" || migration_failed=1
+      else
+        delete_kharej_firewall_rules "${number}" || migration_failed=1
+      fi
+    fi
+    if [[ "${migration_failed}" -ne 0 ]]; then
+      if rollback_protected_kharej_edit "${number}" "${service}" "${env_snapshot}" "${env_file}" "${firewall_snapshot}" "${service_state}" "${old_ports}" "${firewall}" "${candidate_count}"; then
+        rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"
+        printf 'Protected port migration failed; exact prior env, firewall, service state, and listener were restored.\n' >&2
+      else
+        printf 'Protected port migration failed and restoration could not be proven. Retained recovery snapshots: %s %s %s\n' \
+          "${env_snapshot}" "${firewall_snapshot}" "${service_state}" >&2
+      fi
+      return 1
+    fi
+    rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"
+    info "Saved and transactionally migrated only ${profile_id}; obsolete old-port rules were removed after listener verification."
+    return 0
+  fi
+
+  if [[ "${side}" == "kharej" && "${firewall_rules_changed}" -eq 1 ]]; then
+    if [[ "${firewall}" == "1" ]]; then
+      finalize_kharej_firewall_transition "${number}" "${port}" "${sources}" "${firewall}" "${candidate_count}" || migration_failed=1
+    else
+      delete_kharej_firewall_rules "${number}" || migration_failed=1
+    fi
+    if [[ "${migration_failed:-0}" -ne 0 ]]; then
+      if rollback_kharej_firewall_edit "${number}" "${env_snapshot}" "${env_file}" "${firewall_snapshot}" "${firewall}" "${candidate_count}"; then
+        rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"
         printf 'Edit failed while applying firewall changes; the prior profile was restored.\n' >&2
       else
-        rm -f "${firewall_snapshot}"
-        printf 'Firewall edit and automatic restoration could not be proven. Retained recovery snapshot: %s\n' "${env_snapshot}" >&2
+        rm -f "${service_state}"
+        printf 'Firewall edit and automatic restoration could not be proven. Retained recovery snapshots: %s %s\n' "${env_snapshot}" "${firewall_snapshot}" >&2
       fi
       return 1
     fi
   fi
 
+  if [[ "${needs_runtime_restart}" -eq 0 ]]; then
+    rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"
+    info "Saved ${profile_id}; no GOST restart was required."
+    return 0
+  fi
   if ! confirm "Restart only ${service} now?"; then
-    rm -f "${env_snapshot}" "${firewall_snapshot}"
+    rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"
     info "Saved ${profile_id}; restart required for the running process to load it."
     return 0
   fi
-  if systemctl restart "${service}" && systemctl is-active --quiet "${service}" && verify_profile_listeners "${service}" "${new_ports}"; then
-    rm -f "${env_snapshot}" "${firewall_snapshot}"
+  if systemctl restart "${service}" && verify_active_profile_listener "${service}" "${new_ports}"; then
+    rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"
     info "Saved and restarted only ${profile_id}."
     return 0
   fi
 
   restore_failed=0
-  restore_managed_snapshot "${env_snapshot}" "${env_file}" env || restore_failed=1
-  if [[ "${side}" == "kharej" ]]; then
-    restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || restore_failed=1
-  fi
-  if [[ "${old_active}" == "active" ]]; then
-    systemctl restart "${service}" >/dev/null 2>&1 || restore_failed=1
+  if [[ "${side}" == "kharej" && "${firewall_rules_changed}" -eq 1 ]]; then
+    rollback_protected_kharej_edit "${number}" "${service}" "${env_snapshot}" "${env_file}" "${firewall_snapshot}" "${service_state}" "${old_ports}" "${firewall}" "${candidate_count}" || restore_failed=1
   else
-    systemctl stop "${service}" >/dev/null 2>&1 || restore_failed=1
+    restore_managed_snapshot "${env_snapshot}" "${env_file}" env || restore_failed=1
+    stop_service_verified "${service}" || restore_failed=1
+    if [[ "${restore_failed}" -eq 0 ]]; then
+      restore_service_state "${service}" "${service_state}" || restore_failed=1
+      verify_listener_for_captured_state "${service}" "${service_state}" "${old_ports}" || restore_failed=1
+    fi
   fi
-  if [[ "${restore_failed}" -eq 0 ]] && cmp -s "${env_snapshot}" "${env_file}"; then
-    rm -f "${env_snapshot}" "${firewall_snapshot}"
+  if [[ "${restore_failed}" -eq 0 ]]; then
+    rm -f "${env_snapshot}" "${firewall_snapshot}" "${service_state}"
     printf 'Restart verification failed; the prior env, firewall, and service state were restored.\n' >&2
   else
-    printf 'Restart and automatic restoration could not be proven. Retained recovery snapshot: %s\n' "${env_snapshot}" >&2
-    rm -f "${firewall_snapshot}"
+    printf 'Restart and automatic restoration could not be proven. Retained recovery snapshots: %s %s %s\n' \
+      "${env_snapshot}" "${firewall_snapshot}" "${service_state}" >&2
   fi
   return 1
 }
