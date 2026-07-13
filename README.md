@@ -156,6 +156,7 @@ Use the menu:
 8) List active GOST services
 9) Clean old/broken GOST configs
 10) Monitoring
+11) Server Stability
 0) Exit
 ```
 
@@ -190,6 +191,30 @@ Direct Mode profiles
 Iran and Kharej use independent positive-number spaces. Creation and clone suggest the first gap found across both env and unit files, so an orphaned file is never overwritten. `PROFILE_LABEL` is optional display metadata; the stable identity, filename, and service remain `side-number`. Existing unlabeled profiles remain valid.
 
 Create, edit, and clone validate configured local ports across both sides and take one live `ss` snapshot before activating a new port. Edit preserves unknown well-formed env keys and existing credentials unless explicitly replaced, shows a redacted diff, and performs no write or restart for a no-op. Clone never changes its source. Selected restart accepts exact comma-separated IDs, deduplicates them, and never uses a wildcard service command.
+
+## Server Stability
+
+Option `11` runs one automatic operational wizard. It reports current kernel
+values, installs the managed file
+`/etc/sysctl.d/99-gost-stability.conf`, applies it with `sysctl --system`, and
+verifies every recommended value. The managed settings cover file capacity,
+socket backlog, the local port range, SYN backlog, FIN timeout, TCP keepalive,
+and slow-start-after-idle. The wizard intentionally does not set
+`net.ipv4.tcp_tw_reuse`.
+
+For each exact existing `gost-iran-N.service` or
+`gost-kharej-N.service`, it installs
+`/etc/systemd/system/<service>.d/stability.conf` with
+`LimitNOFILE=1048576`, `TasksMax=infinity`, `OOMScoreAdjust=-500`,
+`Restart=always`, and `RestartSec=3`. Unrelated services and the original
+units/env files are not changed. At most one `systemctl daemon-reload` is run
+when drop-ins change, and no GOST service is restarted. New process limits
+therefore apply after the operator's next normal service restart.
+
+The wizard is idempotent: an already optimized host receives no unnecessary
+file replacement, sysctl apply, or daemon reload. Symlinked or conflicting
+unmanaged destinations are rejected rather than overwritten. Existing managed
+stability files are backed up before an update.
 
 ## Local Monitoring
 

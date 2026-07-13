@@ -14,6 +14,8 @@ MONITOR_EXPORT_DIR="/root"
 MONITOR_BIN="/usr/local/sbin/gost-monitor"
 MONITOR_COLLECTOR_BIN="/usr/local/sbin/gost-monitor-collector"
 MONITOR_ADMIN_BIN="/usr/local/sbin/gost-monitor-admin"
+STABILITY_SYSCTL_FILE="/etc/sysctl.d/99-gost-stability.conf"
+STABILITY_MANAGED_MARKER="# Managed by GOST Manager: Server Stability"
 
 if [[ "${GOST_MANAGER_TESTING:-0}" == "1" ]]; then
   GOST_BIN="${GOST_BIN_TEST:-${GOST_BIN}}"
@@ -27,12 +29,49 @@ if [[ "${GOST_MANAGER_TESTING:-0}" == "1" ]]; then
   MONITOR_BIN="${GOST_MONITOR_BIN_TEST:-${MONITOR_BIN}}"
   MONITOR_COLLECTOR_BIN="${GOST_MONITOR_COLLECTOR_BIN_TEST:-${MONITOR_COLLECTOR_BIN}}"
   MONITOR_ADMIN_BIN="${GOST_MONITOR_ADMIN_BIN_TEST:-${MONITOR_ADMIN_BIN}}"
+  STABILITY_SYSCTL_FILE="${GOST_STABILITY_SYSCTL_FILE_TEST:-${STABILITY_SYSCTL_FILE}}"
 fi
 
 MAX_PROFILE_NUMBER=10000
 PROFILE_ENV_KEYS=()
 PROFILE_ENV_VALUES=()
 PROFILE_ENV_PRESERVED_LINES=()
+STABILITY_SYSCTL_KEYS=(
+  fs.file-max
+  net.core.somaxconn
+  net.core.netdev_max_backlog
+  net.ipv4.ip_local_port_range
+  net.ipv4.tcp_max_syn_backlog
+  net.ipv4.tcp_fin_timeout
+  net.ipv4.tcp_keepalive_time
+  net.ipv4.tcp_keepalive_intvl
+  net.ipv4.tcp_keepalive_probes
+  net.ipv4.tcp_slow_start_after_idle
+)
+STABILITY_SYSCTL_VALUES=(
+  2097152
+  65535
+  250000
+  "10000 65000"
+  65535
+  15
+  60
+  10
+  6
+  0
+)
+STABILITY_CURRENT_VALUES=()
+STABILITY_FINAL_VALUES=()
+STABILITY_KERNEL_RESULTS=()
+STABILITY_SERVICES=()
+STABILITY_SERVICE_RESULTS=()
+STABILITY_RESTART_REQUIRED=()
+STABILITY_SYSCTL_FILE_RESULT=""
+STABILITY_SYSCTL_CHANGED=0
+STABILITY_SYSCTL_APPLY_COUNT=0
+STABILITY_DAEMON_RELOAD_COUNT=0
+STABILITY_OPTIMIZED_COUNT=0
+STABILITY_FAILURE_COUNT=0
 
 die() {
   printf 'Error: %s\n' "$*" >&2
@@ -568,6 +607,8 @@ package_for_command() {
     ss) printf 'iproute2\n' ;;
     iptables) printf 'iptables\n' ;;
     systemctl) printf 'systemd\n' ;;
+    sysctl) printf 'procps\n' ;;
+    cmp) printf 'diffutils\n' ;;
     *) printf '%s\n' "$1" ;;
   esac
 }
@@ -3042,6 +3083,455 @@ clean_old_broken_configs() {
   info "Cleanup complete."
 }
 
+render_stability_sysctl_config() {
+  cat <<EOF_OUT
+${STABILITY_MANAGED_MARKER}
+fs.file-max = 2097152
+
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 250000
+
+net.ipv4.ip_local_port_range = 10000 65000
+
+net.ipv4.tcp_max_syn_backlog = 65535
+
+net.ipv4.tcp_fin_timeout = 15
+
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF_OUT
+}
+
+render_stability_systemd_override() {
+  cat <<EOF_OUT
+${STABILITY_MANAGED_MARKER}
+[Service]
+LimitNOFILE=1048576
+TasksMax=infinity
+OOMScoreAdjust=-500
+Restart=always
+RestartSec=3
+EOF_OUT
+}
+
+stability_service_name_is_managed() {
+  local service="$1"
+  parse_tunnel_service_name "${service}" >/dev/null 2>&1
+}
+
+stability_override_path() {
+  local service="$1"
+  stability_service_name_is_managed "${service}" || return 1
+  printf '%s/%s.d/stability.conf\n' "${SYSTEMD_DIR}" "${service}"
+}
+
+normalize_stability_value() {
+  local raw="$1"
+  local fields=()
+  read -r -a fields <<< "${raw}"
+  [[ "${#fields[@]}" -gt 0 ]] || return 1
+  local IFS=' '
+  printf '%s\n' "${fields[*]}"
+}
+
+read_stability_sysctl_value() {
+  local key="$1"
+  local raw
+  raw="$(sysctl -n "${key}" 2>/dev/null)" || return 1
+  normalize_stability_value "${raw}"
+}
+
+stability_file_matches() {
+  local path="$1"
+  local renderer="$2"
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  cmp -s "${path}" <("${renderer}")
+}
+
+stability_file_is_managed() {
+  local path="$1"
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  IFS= read -r first_line < "${path}" || return 1
+  [[ "${first_line}" == "${STABILITY_MANAGED_MARKER}" ]]
+}
+
+backup_stability_file() {
+  local path="$1"
+  local backup
+  backup="$(mktemp "${path}.bak.XXXXXX")" || return 1
+  if ! cp -p "${path}" "${backup}"; then
+    rm -f "${backup}"
+    return 1
+  fi
+  fsync_file_or_directory "${backup}"
+  info "Managed stability backup: ${backup}"
+}
+
+write_stability_file() {
+  local path="$1"
+  local mode="$2"
+  local renderer="$3"
+  local directory base tmp
+  directory="$(dirname "${path}")"
+  base="$(basename "${path}")"
+  tmp="$(mktemp "${directory}/.${base}.tmp.XXXXXX")" || return 1
+  if ! chmod "${mode}" "${tmp}" ||
+     ! set_production_owner "${tmp}" ||
+     ! "${renderer}" > "${tmp}" ||
+     ! chmod "${mode}" "${tmp}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  fsync_file_or_directory "${tmp}"
+  if ! mv -f "${tmp}" "${path}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  fsync_file_or_directory "${directory}"
+}
+
+validate_stability_sysctl_destination() {
+  local path="$1"
+  local directory
+  directory="$(dirname "${path}")"
+  [[ "${path}" == "${STABILITY_SYSCTL_FILE}" ]] || return 1
+  [[ -d "${directory}" && ! -L "${directory}" ]] || return 1
+  [[ ! -L "${path}" ]] || return 1
+  [[ ! -e "${path}" || -f "${path}" ]] || return 1
+}
+
+prepare_stability_sysctl_file() {
+  local path="${STABILITY_SYSCTL_FILE}"
+  STABILITY_SYSCTL_CHANGED=0
+  if ! validate_stability_sysctl_destination "${path}"; then
+    STABILITY_SYSCTL_FILE_RESULT="Failed: unsafe path or symlink"
+    return 1
+  fi
+  if stability_file_matches "${path}" render_stability_sysctl_config; then
+    STABILITY_SYSCTL_FILE_RESULT="Already optimized"
+    return 0
+  fi
+  if [[ -e "${path}" ]]; then
+    if ! stability_file_is_managed "${path}"; then
+      STABILITY_SYSCTL_FILE_RESULT="Failed: existing file is not managed by GOST Manager"
+      return 1
+    fi
+    if ! backup_stability_file "${path}"; then
+      STABILITY_SYSCTL_FILE_RESULT="Failed: managed file backup could not be created"
+      return 1
+    fi
+    STABILITY_SYSCTL_FILE_RESULT="Updated"
+  else
+    STABILITY_SYSCTL_FILE_RESULT="Applied"
+  fi
+  if ! write_stability_file "${path}" 644 render_stability_sysctl_config ||
+     ! stability_file_matches "${path}" render_stability_sysctl_config; then
+    STABILITY_SYSCTL_FILE_RESULT="Failed: atomic write verification failed"
+    return 1
+  fi
+  STABILITY_SYSCTL_CHANGED=1
+}
+
+discover_stability_services() {
+  local output="$1"
+  local unit service
+  : > "${output}"
+  for unit in "${SYSTEMD_DIR}"/gost-iran-*.service "${SYSTEMD_DIR}"/gost-kharej-*.service; do
+    [[ -e "${unit}" || -L "${unit}" ]] || continue
+    service="${unit##*/}"
+    stability_service_name_is_managed "${service}" || continue
+    printf '%s\n' "${service}" >> "${output}"
+  done
+  LC_ALL=C sort -u -o "${output}" "${output}"
+}
+
+detect_stability_services() {
+  local inventory service
+  STABILITY_SERVICES=()
+  inventory="$(mktemp)"
+  discover_stability_services "${inventory}"
+  while IFS= read -r service; do
+    [[ -n "${service}" ]] && STABILITY_SERVICES+=("${service}")
+  done < "${inventory}"
+  rm -f "${inventory}"
+}
+
+validate_stability_override_destination() {
+  local service="$1"
+  local path="$2"
+  local unit dropin_dir expected
+  stability_service_name_is_managed "${service}" || return 1
+  unit="${SYSTEMD_DIR}/${service}"
+  expected="$(stability_override_path "${service}")" || return 1
+  dropin_dir="$(dirname "${expected}")"
+  [[ "${path}" == "${expected}" ]] || return 1
+  [[ -d "${SYSTEMD_DIR}" && ! -L "${SYSTEMD_DIR}" ]] || return 1
+  [[ -f "${unit}" && ! -L "${unit}" ]] || return 1
+  [[ ! -L "${dropin_dir}" ]] || return 1
+  [[ ! -e "${dropin_dir}" || -d "${dropin_dir}" ]] || return 1
+  [[ ! -L "${path}" ]] || return 1
+  [[ ! -e "${path}" || -f "${path}" ]] || return 1
+}
+
+prepare_stability_override() {
+  local service="$1"
+  local path dropin_dir
+  STABILITY_SYSCTL_CHANGED=0
+  path="$(stability_override_path "${service}")" || return 1
+  dropin_dir="$(dirname "${path}")"
+  if ! validate_stability_override_destination "${service}" "${path}"; then
+    return 1
+  fi
+  if [[ ! -d "${dropin_dir}" ]]; then
+    if ! mkdir "${dropin_dir}" ||
+       ! chmod 755 "${dropin_dir}" ||
+       ! set_production_owner "${dropin_dir}"; then
+      return 1
+    fi
+    fsync_file_or_directory "${SYSTEMD_DIR}"
+  fi
+  [[ -d "${dropin_dir}" && ! -L "${dropin_dir}" ]] || return 1
+  if stability_file_matches "${path}" render_stability_systemd_override; then
+    STABILITY_SYSCTL_CHANGED=0
+    return 0
+  fi
+  if [[ -e "${path}" ]]; then
+    stability_file_is_managed "${path}" || return 1
+    backup_stability_file "${path}" || return 1
+  fi
+  if ! write_stability_file "${path}" 644 render_stability_systemd_override ||
+     ! stability_file_matches "${path}" render_stability_systemd_override; then
+    return 1
+  fi
+  STABILITY_SYSCTL_CHANGED=1
+}
+
+reset_stability_state() {
+  STABILITY_CURRENT_VALUES=()
+  STABILITY_FINAL_VALUES=()
+  STABILITY_KERNEL_RESULTS=()
+  STABILITY_SERVICES=()
+  STABILITY_SERVICE_RESULTS=()
+  STABILITY_RESTART_REQUIRED=()
+  STABILITY_SYSCTL_FILE_RESULT=""
+  STABILITY_SYSCTL_CHANGED=0
+  STABILITY_SYSCTL_APPLY_COUNT=0
+  STABILITY_DAEMON_RELOAD_COUNT=0
+  STABILITY_OPTIMIZED_COUNT=0
+  STABILITY_FAILURE_COUNT=0
+}
+
+capture_stability_kernel_state() {
+  local index key value
+  for ((index = 0; index < ${#STABILITY_SYSCTL_KEYS[@]}; index++)); do
+    key="${STABILITY_SYSCTL_KEYS[${index}]}"
+    if value="$(read_stability_sysctl_value "${key}")"; then
+      STABILITY_CURRENT_VALUES[index]="${value}"
+    else
+      STABILITY_CURRENT_VALUES[index]="unavailable"
+    fi
+  done
+}
+
+stability_kernel_needs_apply() {
+  local index
+  for ((index = 0; index < ${#STABILITY_SYSCTL_KEYS[@]}; index++)); do
+    if [[ "${STABILITY_CURRENT_VALUES[${index}]}" != "${STABILITY_SYSCTL_VALUES[${index}]}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+apply_stability_kernel_settings() {
+  local config_ready=0 apply_needed=0 index key value verified=1
+  if prepare_stability_sysctl_file; then
+    config_ready=1
+  else
+    STABILITY_FAILURE_COUNT=$((STABILITY_FAILURE_COUNT + 1))
+  fi
+  if [[ "${config_ready}" -eq 1 ]]; then
+    if [[ "${STABILITY_SYSCTL_CHANGED}" -eq 1 ]] || stability_kernel_needs_apply; then
+      apply_needed=1
+    fi
+    if [[ "${apply_needed}" -eq 1 ]]; then
+      STABILITY_SYSCTL_APPLY_COUNT=$((STABILITY_SYSCTL_APPLY_COUNT + 1))
+      if ! sysctl --system >/dev/null; then
+        STABILITY_FAILURE_COUNT=$((STABILITY_FAILURE_COUNT + 1))
+      fi
+    fi
+  fi
+  for ((index = 0; index < ${#STABILITY_SYSCTL_KEYS[@]}; index++)); do
+    key="${STABILITY_SYSCTL_KEYS[${index}]}"
+    if value="$(read_stability_sysctl_value "${key}")"; then
+      STABILITY_FINAL_VALUES[index]="${value}"
+    else
+      STABILITY_FINAL_VALUES[index]="unavailable"
+    fi
+    if [[ "${STABILITY_FINAL_VALUES[${index}]}" == "${STABILITY_SYSCTL_VALUES[${index}]}" ]]; then
+      STABILITY_KERNEL_RESULTS[index]="OK"
+    else
+      STABILITY_KERNEL_RESULTS[index]="MISSING"
+      verified=0
+    fi
+  done
+  if [[ "${verified}" -eq 0 ]]; then
+    STABILITY_FAILURE_COUNT=$((STABILITY_FAILURE_COUNT + 1))
+  fi
+}
+
+apply_stability_service_overrides() {
+  local service changed_count=0
+  STABILITY_SERVICE_RESULTS=()
+  if [[ "${#STABILITY_SERVICES[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  for service in "${STABILITY_SERVICES[@]}"; do
+    STABILITY_SYSCTL_CHANGED=0
+    if prepare_stability_override "${service}"; then
+      STABILITY_OPTIMIZED_COUNT=$((STABILITY_OPTIMIZED_COUNT + 1))
+      if [[ "${STABILITY_SYSCTL_CHANGED}" -eq 1 ]]; then
+        STABILITY_SERVICE_RESULTS+=("Applied")
+        STABILITY_RESTART_REQUIRED+=("${service}")
+        changed_count=$((changed_count + 1))
+      else
+        STABILITY_SERVICE_RESULTS+=("Already optimized")
+      fi
+    else
+      STABILITY_SERVICE_RESULTS+=("Failed: unsafe or unmanaged override path")
+      STABILITY_FAILURE_COUNT=$((STABILITY_FAILURE_COUNT + 1))
+    fi
+  done
+  if [[ "${changed_count}" -gt 0 ]]; then
+    STABILITY_DAEMON_RELOAD_COUNT=$((STABILITY_DAEMON_RELOAD_COUNT + 1))
+    if ! systemctl daemon-reload; then
+      STABILITY_FAILURE_COUNT=$((STABILITY_FAILURE_COUNT + 1))
+    fi
+  fi
+}
+
+print_stability_report() {
+  local index key service result
+  printf '\nServer Stability Report\n'
+  printf '=======================\n\n'
+  printf 'Kernel configuration: %s\n\n' "${STABILITY_SYSCTL_FILE_RESULT}"
+  for ((index = 0; index < ${#STABILITY_SYSCTL_KEYS[@]}; index++)); do
+    key="${STABILITY_SYSCTL_KEYS[${index}]}"
+    printf '%s:\n' "${key}"
+    printf '  Current: %s\n' "${STABILITY_CURRENT_VALUES[${index}]}"
+    printf '  Recommended: %s\n' "${STABILITY_SYSCTL_VALUES[${index}]}"
+    printf '  Final: %s\n' "${STABILITY_FINAL_VALUES[${index}]}"
+    printf '  Result: %s\n\n' "${STABILITY_KERNEL_RESULTS[${index}]}"
+  done
+  printf 'GOST Services:\n\n'
+  if [[ "${#STABILITY_SERVICES[@]}" -eq 0 ]]; then
+    printf 'No managed GOST services detected.\n\n'
+  else
+    for ((index = 0; index < ${#STABILITY_SERVICES[@]}; index++)); do
+      service="${STABILITY_SERVICES[${index}]}"
+      result="${STABILITY_SERVICE_RESULTS[${index}]}"
+      printf '%s\n' "${service}"
+      printf '  Override: %s\n' "${result}"
+      if [[ "${result}" != Failed:* ]]; then
+        printf '  [OK] LimitNOFILE 1048576\n'
+        printf '  [OK] TasksMax infinity\n'
+        printf '  [OK] Restart always\n'
+        printf '  [OK] RestartSec 3\n'
+        printf '  [OK] OOMScoreAdjust -500\n'
+      fi
+      printf '\n'
+    done
+  fi
+  printf 'Restart required:\n\n'
+  if [[ "${#STABILITY_RESTART_REQUIRED[@]}" -eq 0 ]]; then
+    printf 'None from this run.\n\n'
+  else
+    for service in "${STABILITY_RESTART_REQUIRED[@]}"; do
+      printf '%s\n' "${service%.service}"
+    done
+    printf '\nReason:\nNew systemd limits apply after the next service restart.\n\n'
+  fi
+  if [[ "${STABILITY_FAILURE_COUNT}" -gt 0 ]]; then
+    printf 'Some stability settings could not be installed.\n'
+  elif [[ "${STABILITY_SYSCTL_FILE_RESULT}" == "Applied" ||
+          "${STABILITY_SYSCTL_FILE_RESULT}" == "Updated" ||
+          "${#STABILITY_RESTART_REQUIRED[@]}" -gt 0 ]]; then
+    printf 'Changes were installed.\n'
+  else
+    printf 'Server stability settings are already optimized.\n'
+  fi
+  printf 'Existing GOST services were not restarted.\n'
+  printf 'New limits apply after next service restart.\n\n'
+  printf '[OK] No GOST service restarted\n'
+  printf '[OK] Existing connections were not interrupted\n'
+  printf 'Services optimized: %s\n' "${STABILITY_OPTIMIZED_COUNT}"
+  printf 'Restart count: 0\n'
+  printf 'Daemon reload count: %s\n' "${STABILITY_DAEMON_RELOAD_COUNT}"
+  if [[ "${STABILITY_FAILURE_COUNT}" -gt 0 ]]; then
+    printf 'Result: completed with %s failure(s)\n' "${STABILITY_FAILURE_COUNT}"
+  else
+    printf 'Result: successful\n'
+  fi
+}
+
+run_server_stability() {
+  local index
+  reset_stability_state
+  printf '=================================\n'
+  printf '       Server Stability\n'
+  printf '=================================\n\n'
+  printf 'Checking system...\n\n'
+  capture_stability_kernel_state
+  detect_stability_services
+  printf '[OK] Kernel parameters checked\n'
+  printf '[OK] GOST services detected: %s\n' "${#STABILITY_SERVICES[@]}"
+  printf '[OK] Current limits checked\n\n'
+  printf 'Current kernel values:\n'
+  for ((index = 0; index < ${#STABILITY_SYSCTL_KEYS[@]}; index++)); do
+    printf '  %s = %s\n' "${STABILITY_SYSCTL_KEYS[${index}]}" "${STABILITY_CURRENT_VALUES[${index}]}"
+  done
+  printf '\nApplying stability settings...\n\n'
+  apply_stability_kernel_settings
+  apply_stability_service_overrides
+  if [[ "${STABILITY_SYSCTL_FILE_RESULT}" == Failed:* ]]; then
+    printf '[FAILED] Kernel tuning was not installed safely\n'
+  elif [[ "${STABILITY_SYSCTL_FILE_RESULT}" == "Already optimized" ]]; then
+    printf '[OK] Kernel tuning already optimized\n'
+  else
+    printf '[OK] Kernel tuning processed\n'
+  fi
+  printf '[OK] GOST service limits checked: %s/%s optimized\n' \
+    "${STABILITY_OPTIMIZED_COUNT}" "${#STABILITY_SERVICES[@]}"
+  if [[ "${STABILITY_FAILURE_COUNT}" -gt 0 ]]; then
+    printf '[FAILED] Verification found incomplete settings\n'
+  else
+    printf '[OK] Verification completed\n'
+  fi
+  print_stability_report
+  [[ "${STABILITY_FAILURE_COUNT}" -eq 0 ]]
+}
+
+server_stability_wizard() {
+  local status=0
+  require_root
+  ensure_commands sysctl systemctl cmp
+  if run_server_stability; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "${status}" -ne 0 ]]; then
+    info "Server Stability completed with failures. Review the report above."
+  fi
+  if ! read -r -p "Press Enter to return..."; then
+    :
+  fi
+  return 0
+}
+
 execute_monitor_command() {
   local status
   if "$@"; then
@@ -3378,6 +3868,7 @@ GOST Manager
 8) List active GOST services
 9) Clean old/broken GOST configs
 10) Monitoring
+11) Server Stability
 0) Exit
 MENU
 }
@@ -3398,6 +3889,7 @@ main_menu() {
       8) list_active_gost_services ;;
       9) clean_old_broken_configs ;;
       10) monitoring_menu ;;
+      11) server_stability_wizard ;;
       0) exit 0 ;;
       *) info "Invalid option." ;;
     esac

@@ -88,6 +88,37 @@ if [[ -s "${VERIFY_OUTPUT}" ]]; then
     "$(wc -l < "${VERIFY_OUTPUT}" | tr -d ' ')"
 fi
 
+STABILITY_VERIFY_UNIT="${VERIFY_DIR}/gost-iran-1.service"
+cat > "${STABILITY_VERIFY_UNIT}" <<'UNIT'
+[Unit]
+Description=GOST Server Stability verification
+
+[Service]
+Type=simple
+ExecStart=/bin/true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+(
+  export GOST_MANAGER_TESTING=1
+  # shellcheck source=../gost-manager.sh
+  source "${ROOT_DIR}/gost-manager.sh"
+  render_stability_systemd_override
+) >> "${STABILITY_VERIFY_UNIT}"
+STABILITY_VERIFY_OUTPUT="${TEST_HOME}/stability-verify.out"
+if ! "${SYSTEMD_ANALYZE_REAL}" verify "${STABILITY_VERIFY_UNIT}" > "${STABILITY_VERIFY_OUTPUT}" 2>&1; then
+  cat "${STABILITY_VERIFY_OUTPUT}" >&2
+  exit 1
+fi
+if [[ -s "${STABILITY_VERIFY_OUTPUT}" ]] &&
+   { grep -Fq "${STABILITY_VERIFY_UNIT}" "${STABILITY_VERIFY_OUTPUT}" ||
+     grep -Fq "${STABILITY_VERIFY_UNIT##*/}" "${STABILITY_VERIFY_OUTPUT}"; }; then
+  cat "${STABILITY_VERIFY_OUTPUT}" >&2
+  printf 'FAIL: Server Stability override emitted a systemd diagnostic\n' >&2
+  exit 1
+fi
+
 INVALID_DIR="${TEST_HOME}/invalid"
 mkdir -p "${INVALID_DIR}"
 INVALID_UNIT="${INVALID_DIR}/gost-monitor-collector-invalid.service"
@@ -136,6 +167,7 @@ if [[ -r /etc/os-release ]]; then
   distribution="$(. /etc/os-release && printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-unknown}")"
 fi
 printf 'PASS: real systemd-analyze host verification\n'
+printf 'PASS: Server Stability override verified by real systemd-analyze\n'
 printf 'PASS: malformed staged unit rejected by systemd-analyze\n'
 printf 'PASS: temporary-root install with real systemd-analyze\n'
 printf 'LINUX_DISTRIBUTION=%s\n' "${distribution}"

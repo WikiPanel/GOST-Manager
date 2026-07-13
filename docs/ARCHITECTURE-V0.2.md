@@ -69,10 +69,12 @@ GOST protocol behavior is not changed by this project.
     8) List active GOST services
     9) Clean old/broken GOST configs
     10) Monitoring
+    11) Server Stability
     0) Exit
 
-Options 1 through 10 retain their established labels and behavior. There is no
-option 11, option 12, or native-gateway placeholder.
+Options 1 through 10 retain their established labels and behavior. Option 11
+is an operational stability wizard only. There is no option 12 or
+native-gateway placeholder.
 
 Option 8 renders all profiles and opens a profile submenu for list, detail,
 edit, clone, restart-selected, and restart-all. Identity is the immutable pair
@@ -127,6 +129,17 @@ schema version and does not erase history.
 Monitoring state is separate from Direct Mode configuration. Removing
 Monitoring Lite does not remove or alter tunnel env files, units, runners, or
 the official GOST binary.
+
+The optional Server Stability wizard owns only:
+
+    /etc/sysctl.d/99-gost-stability.conf
+    /etc/systemd/system/gost-<side>-<number>.service.d/stability.conf
+
+It matches only exact numbered Direct Mode units, writes no desired traffic
+state, and never starts, stops, or restarts a GOST service. Kernel settings are
+verified live after `sysctl --system`; systemd drop-ins take effect after the
+operator's next normal service restart. Monitoring and traffic remain
+independent of this helper.
 
 ## Failure and rollback
 
