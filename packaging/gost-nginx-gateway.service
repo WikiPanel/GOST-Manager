@@ -1,0 +1,26 @@
+[Unit]
+Description=GOST Manager dedicated NGINX Gateway
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=forking
+PIDFile=/etc/gost-manager/generated/gateway/nginx/nginx.pid
+ExecStartPre=/usr/sbin/nginx -t -c /etc/gost-manager/generated/gateway/nginx/nginx.conf -p /etc/gost-manager/generated/gateway/nginx
+ExecStart=/usr/sbin/nginx -c /etc/gost-manager/generated/gateway/nginx/nginx.conf -p /etc/gost-manager/generated/gateway/nginx
+ExecReload=/usr/sbin/nginx -t -c /etc/gost-manager/generated/gateway/nginx/nginx.conf -p /etc/gost-manager/generated/gateway/nginx
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -QUIT $MAINPID
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+KillMode=mixed
+LimitNOFILE=200000
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -222,6 +222,7 @@ validate_source_manifest() {
     "packaging/gost-gateway"
     "packaging/gost-gateway-runtime"
     "packaging/gateway-runtime-manifest.txt"
+    "packaging/gost-nginx-gateway.service"
   )
   for path in "${fixed[@]}"; do
     [[ -f "${SOURCE_ROOT}/${path}" && ! -L "${SOURCE_ROOT}/${path}" ]] || die "required source file is missing or unsafe: ${path}"
@@ -299,6 +300,7 @@ stage_sources() {
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-gateway-runtime" "${STAGE_DIR}/sbin/gost-gateway-runtime"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor-collector.service" "${STAGE_DIR}/gost-monitor-collector.service"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/monitoring.env" "${STAGE_DIR}/monitoring.env"
+  "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-nginx-gateway.service" "${STAGE_DIR}/gost-nginx-gateway.service"
 }
 
 validate_staged_bash() {
@@ -368,6 +370,7 @@ validate_staged_config() {
 
 validate_unit_content() {
   local unit="${STAGE_DIR}/gost-monitor-collector.service"
+  local nginx_unit="${STAGE_DIR}/gost-nginx-gateway.service"
   local forbidden required verification_dir verification_unit output
   for forbidden in 'Requires=' 'PartOf=' 'BindsTo=' 'PrivateNetwork=' 'ProtectProc=' 'ProcSubset=' 'InaccessiblePaths=/proc' 'nginx.service' 'gost-iran-' 'gost-kharej-'; do
     if grep -Fq "${forbidden}" "${unit}"; then
@@ -382,6 +385,18 @@ validate_unit_content() {
     'RuntimeDirectory=gost-manager' 'RuntimeDirectoryMode=0700' \
     'ReadWritePaths=/var/lib/gost-manager'; do
     grep -Fq "${required}" "${unit}" || die "monitoring unit lacks required production setting: ${required}"
+  done
+  for forbidden in 'nginx.service' 'gost-iran-' 'gost-kharej-' 'gost-gateway-exit-'; do
+    if grep -Fq "${forbidden}" "${nginx_unit}"; then
+      die "NGINX gateway unit contains forbidden dependency: ${forbidden}"
+    fi
+  done
+  for required in \
+    'ExecStartPre=/usr/sbin/nginx -t -c /etc/gost-manager/generated/gateway/nginx/nginx.conf -p /etc/gost-manager/generated/gateway/nginx' \
+    'ExecStart=/usr/sbin/nginx -c /etc/gost-manager/generated/gateway/nginx/nginx.conf -p /etc/gost-manager/generated/gateway/nginx' \
+    'ExecReload=/usr/sbin/nginx -t -c /etc/gost-manager/generated/gateway/nginx/nginx.conf -p /etc/gost-manager/generated/gateway/nginx' \
+    'ExecReload=/bin/kill -HUP $MAINPID' 'LimitNOFILE=200000' 'Restart=on-failure'; do
+    grep -Fq "${required}" "${nginx_unit}" || die "NGINX gateway unit lacks required production setting: ${required}"
   done
   if ! command -v "${SYSTEMD_ANALYZE_BIN}" >/dev/null 2>&1; then
     info "systemd-analyze unavailable; deterministic unit validation passed."
@@ -652,6 +667,7 @@ install_files() {
   if [[ "${#CHANGED_DESTINATIONS[@]}" -gt "${before_count}" ]]; then
     UNIT_CHANGED=1
   fi
+  install_managed_file "${STAGE_DIR}/gost-nginx-gateway.service" "$(path_for /etc/systemd/system/gost-nginx-gateway.service)" 644
 }
 
 migrate_configured_database() {

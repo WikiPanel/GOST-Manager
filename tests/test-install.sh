@@ -75,6 +75,7 @@ assert_eq "gateway secret directory mode" "700" "$(mode_of "${fresh_root}/etc/go
 assert_eq "gateway runner mode" "755" "$(mode_of "${fresh_root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh")"
 assert_file "fresh default config installed" "${fresh_root}/etc/gost-manager/monitoring.env"
 assert_file "fresh systemd unit installed" "${fresh_root}/etc/systemd/system/gost-monitor-collector.service"
+assert_file "fresh dedicated NGINX gateway unit installed" "${fresh_root}/etc/systemd/system/gost-nginx-gateway.service"
 assert_file "fresh schema migrated" "${fresh_root}/var/lib/gost-manager/metrics.sqlite3"
 assert_eq "launcher mode" "755" "$(mode_of "${fresh_root}/usr/local/sbin/gost-monitor")"
 assert_eq "config mode" "600" "$(mode_of "${fresh_root}/etc/gost-manager/monitoring.env")"
@@ -86,7 +87,9 @@ assert_contains "fresh collector enabled" "systemctl enable gost-monitor-collect
 assert_contains "fresh collector started" "systemctl start gost-monitor-collector.service" "${COMMAND_LOG}"
 assert_not_contains "fresh install never targets Iran traffic" "gost-iran-" "${COMMAND_LOG}"
 assert_not_contains "fresh install never targets Kharej traffic" "gost-kharej-" "${COMMAND_LOG}"
-assert_not_contains "fresh install never targets NGINX" "nginx" "${COMMAND_LOG}"
+assert_not_contains "fresh install never targets distro NGINX lifecycle" "nginx.service" "${COMMAND_LOG}"
+assert_not_contains "fresh install never starts dedicated NGINX gateway" "systemctl start gost-nginx-gateway.service" "${COMMAND_LOG}"
+assert_not_contains "fresh install never enables dedicated NGINX gateway" "systemctl enable gost-nginx-gateway.service" "${COMMAND_LOG}"
 assert_not_contains "fresh install starts no gateway Exit" "gost-gateway-exit-" "${COMMAND_LOG}"
 
 launcher_bin="${TEST_HOME}/launcher-bin"

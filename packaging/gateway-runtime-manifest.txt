@@ -16,3 +16,6 @@ gateway/secrets.py
 gateway/serialization.py
 gateway/store.py
 gateway/validation.py
+gateway/nginx_paths.py
+gateway/nginx_render.py
+gateway/nginx_apply.py

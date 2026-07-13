@@ -167,3 +167,28 @@ category.
 Issue #20 will render and validate the public NGINX Gateway and connect Host +
 Path routes to these loopback Exit services. NGINX and firewall runtime remain
 intentionally unimplemented here.
+
+## Dedicated NGINX Gateway runtime (Issue #20)
+
+The public Gateway HTTP data plane is rendered into a dedicated NGINX instance
+owned by `gost-nginx-gateway.service`. The renderer writes only under
+`/etc/gost-manager/generated/gateway/nginx/` and never edits `/etc/nginx` or the
+distribution `nginx.service` configuration. The unit uses `/usr/sbin/nginx`,
+validates the generated config with `nginx -t`, and reloads the dedicated master
+with `HUP` for ordinary route changes so established upgraded connections remain
+owned by the old worker until they drain.
+
+Routing is exact Host plus exact Path only. Unknown hosts are rejected by the
+default server and unknown paths return `404`. Route locations proxy with
+HTTP/1.1 WebSocket upgrade headers, preserve the original `Host`, and pass
+`$request_uri` so the original URI and query string reach the route-specific
+loopback upstream. Active-active routes render all loopback backends in the same
+upstream tier. Active-passive routes render the first backend as primary and all
+remaining backends as NGINX `backup` servers for passive new-handshake failover.
+A loopback-only `/nginx_status` listener is generated for local status checks.
+
+The NGINX layer treats GOST Exit services as independently managed backends. It
+does not start, stop, restart, or reload Direct Mode services, Monitoring Lite,
+firewall rules, or `gost-gateway-exit-<exit-id>.service` units. Runtime metadata
+is a strict non-secret manifest containing hashes and counts only; generated
+configuration never includes Secret values or credential-derived hashes.

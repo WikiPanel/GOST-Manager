@@ -37,3 +37,11 @@
 - Added env-based configuration.
 - Added status, logs, restart, delete, list, and cleanup options.
 - Added documentation, examples, tests, and local validation.
+
+## Unreleased
+
+- Added the dedicated `gost-nginx-gateway.service` renderer and runtime helpers
+  for atomic NGINX Gateway configuration under
+  `/etc/gost-manager/generated/gateway/nginx/`, including exact Host + Path
+  WebSocket proxying, active-active upstreams, active-passive backup tiers,
+  strict non-secret manifests, and rollback-focused apply tests.
