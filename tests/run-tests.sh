@@ -75,6 +75,12 @@ assert_eq "iran service name generation" "gost-iran-2.service" "$(service_name i
 assert_eq "kharej service name generation" "gost-kharej-1.service" "$(service_name kharej 1)"
 assert_eq "iran env path generation" "/etc/gost/iran-2.env" "$(env_path iran 2)"
 assert_eq "kharej env path generation" "/etc/gost/kharej-1.env" "$(env_path kharej 1)"
+assert_eq "profile ID parses exact Iran identity" "iran 12" "$(profile_id_parts iran-12)"
+assert_failure "profile ID rejects leading zero" profile_id_parts kharej-01
+assert_success "safe profile label accepted" validate_profile_label edge.tehran_1
+assert_failure "unsafe profile label rejected" validate_profile_label "edge tehran"
+assert_eq "allowed source canonicalization" "198.51.100.0/24,198.51.100.10/32" "$(canonicalize_allowed_sources '198.51.100.10,198.51.100.1/24')"
+assert_failure "unsafe all-IPv4 source rejected" canonicalize_allowed_sources 0.0.0.0/0
 
 printf '\nResult: %s passed, %s failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if [[ "${FAIL_COUNT}" -ne 0 ]]; then

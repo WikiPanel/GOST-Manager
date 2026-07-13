@@ -43,8 +43,9 @@ gost-iran-1.service: healthy required=true state=active cpu=2 rss=4096 processes
   listeners=2 sockets=4 restarts=0 quality=exact age=2s observed=2033-05-18T03:33:18Z
 
 TUNNELS
-iran-1: healthy service=gost-iran-1.service listeners=1/1 ownership=1 remote=example.invalid:443
-  remote_sockets=1 cpu=1 rss=2048 fds=8 quality=exact age=2s observed=2033-05-18T03:33:18Z
+iran-1: healthy label=iran-edge service=gost-iran-1.service listeners=1/1 ownership=1
+  remote=example.invalid:443 remote_sockets=1 allowed_sources=0 cpu=1 rss=2048 fds=8 quality=exact
+  age=2s observed=2033-05-18T03:33:18Z
 
 COLLECTOR / DATABASE
 cycle: 1 [at=2033-05-18T03:33:18Z age=2s]

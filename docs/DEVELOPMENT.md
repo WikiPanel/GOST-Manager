@@ -43,6 +43,8 @@ Run supported Bash suites:
     bash tests/test-uninstall.sh
     bash tests/test-scope-reset.sh
     bash tests/test-systemd-linux.sh
+    bash tests/test-profiles.sh
+    bash tests/test-firewall-multi-source.sh
 
 Run the complete gate:
 
@@ -81,6 +83,13 @@ must prove:
 - Monitoring does not discover nginx.service;
 - current output contains no obsolete Gateway entities;
 - historical generic rows remain governed by existing retention.
+- strict profile parsing never executes env content or exposes credential
+  canaries;
+- configured and live local-port validation spans both Direct Mode sides;
+- edit/clone/delete rollback changes only the selected profile;
+- multi-source firewall ordering and rollback preserve unrelated rules;
+- 50 Iran plus 50 Kharej discovery, inventory, list rendering, and monitoring
+  discovery each remain under the documented three-second bound.
 
 ## Release
 

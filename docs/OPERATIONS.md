@@ -31,15 +31,17 @@ Choose `2) Create Kharej tunnel`.
 Recommended values:
 
 ```text
-Tunnel number: 1
+Kharej profile number [1]:
+Profile label (optional): kharej-edge
 SOCKS listen port: 28420
 GOST username: maya
-GOST password: leave empty to generate
-Iran IP allowed: YOUR_IRAN_SERVER_IP
-Apply iptables firewall rule? yes
+GOST password: hidden explicit value plus confirmation
+Allowed Iran IPv4/CIDRs: 198.51.100.10,198.51.100.11/32
+Apply profile-scoped iptables firewall rules? yes
 ```
 
-Save the generated password outside Git. You need it for the Iran side.
+Use the same password on the matching Iran profile. The manager never prints
+it after input; store it in an approved secret manager, never Git.
 
 ## Iran Setup
 
@@ -54,8 +56,9 @@ Choose `3) Create Iran tunnel`.
 Single-port example:
 
 ```text
-Tunnel number: 1
-Kharej IP: YOUR_KHAREJ_SERVER_IP
+Iran profile number [1]:
+Profile label (optional): iran-edge
+Kharej IP: 203.0.113.20
 Kharej SOCKS port: 28420
 GOST username: maya
 GOST password: value_from_kharej
@@ -67,8 +70,9 @@ The `Port mappings` prompt is required. Use `Iran listen port:Kharej local targe
 Multi-port example:
 
 ```text
-Tunnel number: 2
-Kharej IP: YOUR_KHAREJ_SERVER_IP
+Iran profile number [2]:
+Profile label (optional): iran-web
+Kharej IP: 203.0.113.20
 Kharej SOCKS port: 28420
 GOST username: maya
 GOST password: value_from_kharej
@@ -110,6 +114,17 @@ Available GOST tunnels:
 Select tunnel number:
 ```
 
+For several exact profiles, option `8` opens the profile submenu. Choose
+`Restart selected profiles` and enter IDs such as
+`iran-1,iran-2,kharej-1`. Review the exact service list before confirming.
+Use `Restart all profiles` only when every independent Direct Mode process may
+be interrupted.
+
+The same submenu provides safe detail, edit, and clone actions. A blank edit
+password retains the secret, a no-op writes nothing, and declining restart
+prints `restart required`. Clone requires new conflict-free local ports and
+never changes the source profile.
+
 ## Recovery If Service Fails
 
 1. Use menu option `5) Show status` and select the tunnel from the numbered list.
@@ -117,5 +132,6 @@ Select tunnel number:
 3. Verify `/etc/gost/<side>-<number>.env` exists and is permission `600`.
 4. Verify `/usr/local/bin/gost -V` works.
 5. On Iran, check whether public listen ports are already owned by another process.
-6. On Kharej, check whether firewall rules allow the Iran server IP.
+6. On Kharej, check whether the profile-scoped firewall rules allow every
+   canonical Iran source before the final managed DROP.
 7. Use menu option `9) Clean old/broken GOST configs` only after reviewing the candidate list.

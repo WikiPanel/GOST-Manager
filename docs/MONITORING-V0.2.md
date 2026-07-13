@@ -13,8 +13,8 @@ The subsystem answers four bounded questions:
 3. Are current Direct Mode services and listeners healthy?
 4. Is the collector itself current and reliable?
 
-Issue #29 may improve multi-server Direct Mode profile management later. It
-does not expand Monitoring Lite in v0.2.
+Multi-profile management does not expand Monitoring Lite into a controller.
+Monitoring remains read-only and observes every valid numbered profile.
 
 ## Runtime
 
@@ -121,14 +121,27 @@ Validated Iran and Kharej env files create current Direct Mode tunnel
 entities. Metrics include:
 
 - side and service;
+- immutable profile number and optional safe profile label;
 - configured ports;
+- canonical allowed Iran sources and source count for Kharej profiles;
 - observed listeners;
 - current connection counts;
 - quality and age.
 
+The manager's profile list counts established sockets only when the socket
+snapshot and exact GOST PID ownership are authoritative. Otherwise it prints
+`unknown`; zero means an authoritative snapshot found no owned established
+socket. Monitoring metrics retain their existing exact/estimated/unavailable
+quality labels and endpoint-correlation semantics.
+
 Only safe topology values are stored. Usernames, passwords, tokens, and other
 credentials never enter metrics, events, entity metadata, collector state, or
 exports.
+
+Legacy `IRAN_IP` is interpreted as one canonical `/32` source. New
+`ALLOWED_IRAN_SOURCES` values are canonicalized, deduplicated, and bounded.
+Labels are display metadata; the stable tunnel entity ID remains `iran-N` or
+`kharej-N`. Existing schema-version-4 history remains valid.
 
 ### Collector
 
