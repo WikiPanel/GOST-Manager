@@ -23,6 +23,11 @@ sudo gost-manager
 
 نصب‌کننده علاوه بر manager و runnerهای قبلی، کل پکیج مانیتورینگ را در `/usr/local/lib/gost-manager/monitoring`، سه launcher را در `/usr/local/sbin`، تنظیمات را در `/etc/gost-manager/monitoring.env`، unit را در `/etc/systemd/system/gost-monitor-collector.service` و تاریخچه را در `/var/lib/gost-manager/metrics.sqlite3` نصب می‌کند.
 
+پکیج Gateway، launcherهای `gost-gateway`، `gost-gateway-runtime` و
+`gost-gateway-nginx`، runnerهای اختصاصی و unit ثابت
+`gost-nginx-gateway.service` نیز نصب می‌شوند؛ اما package مربوط به NGINX،
+config تولیدشده، desired state و سرویس عمومی به‌صورت خودکار فعال نمی‌شوند.
+
 در نصب تازه collector فعال و اجرا می‌شود. در ارتقا، config معتبر سفارشی، تاریخچه، و وضعیت enabled/active قبلی collector حفظ می‌شود. فایل‌های `/etc/gost/iran-*.env` و `/etc/gost/kharej-*.env`، unitهای تونل و وضعیت ترافیک بدون تغییر باقی می‌مانند.
 
 نصب‌کننده فقط ماژول‌های فهرست‌شده در `packaging/monitoring-runtime-manifest.txt` را کپی می‌کند. metadata مسیرهای مشترک `/usr/local/sbin` و `/etc/systemd/system` و همچنین مالکیت، mode و محتوای موجود `/etc/gost` حفظ می‌شود. برای دایرکتوری‌های خصوصی manager، mode/owner اعمال می‌شود و در rollback، metadata قبلی بازگردانده می‌شود.
@@ -142,11 +147,37 @@ Available GOST tunnels:
 Select tunnel number:
 ```
 
+## حالت NGINX Gateway
+
+گزینه ۱۱ یک نمونه مستقل NGINX با سرویس `gost-nginx-gateway.service` را مدیریت
+می‌کند. این نمونه از باینری ثابت `/usr/sbin/nginx` و config اختصاصی زیر
+`/etc/gost-manager` استفاده می‌کند؛ فایل‌های `/etc/nginx` را تغییر نمی‌دهد و در
+عملیات عادی هیچ فرمانی برای `nginx.service` اجرا نمی‌کند.
+
+هر Route با Host و Path دقیق انتخاب می‌شود. active-active از `least_conn` و
+active-passive از یک primary و backup tier متن‌باز NGINX استفاده می‌کند.
+Failover فقط برای handshake جدید است؛ اتصال WebSocket برقرارشده مهاجرت نمی‌کند
+و پس از خرابی backend باید reconnect شود. تغییر عادی Route پس از `nginx -t` با
+graceful reload و بدون تغییر master PID اعمال می‌شود.
+
+نصب package مربوط به NGINX فقط با تأیید صریح انجام می‌شود. قرارداد کامل در
+[Dedicated NGINX Gateway v0.2](docs/NGINX-GATEWAY-V0.2.md) آمده است.
+
+مثال رزروشده:
+
+```text
+gateway.example.org:80/api/v1
+gateway.example.org:80/ee1/api/v1
+gateway.example.org:80/us1/api/v1
+```
+
+پورت‌های loopback داخلی وارد لینک کاربر نمی‌شوند و URI/query اصلی حفظ می‌شود.
+
 ## Runtime محلی Exitهای Gateway
 
 در milestone فعلی v0.2 هر Exit یک سرویس مستقل GOST با listener فقط روی
 `127.0.0.1` دارد. این قابلیت فعلاً فقط با CLIهای نصب‌شدهٔ `gost-gateway` و
-`gost-gateway-runtime` در دسترس است و به منوی اصلی اضافه نشده است.
+`gost-gateway-runtime` و زیرمنوی Gateway در گزینه ۱۱ در دسترس است.
 
 Credentialها در فایل‌های خصوصی با mode برابر `0600` زیر
 `/etc/gost-manager/secrets` نگهداری می‌شوند و وارد desired state، env تولیدشده،
@@ -162,7 +193,8 @@ unit یا manifest نمی‌شوند. ابتدا `runtime plan` را بررسی 
 
 ```text
 10) Monitoring
-11) Native GOST Gateway (Coming soon)
+11) NGINX Gateway Mode
+12) Native GOST Gateway (Coming soon)
 ```
 
 زیرمنوی عادی Monitoring Lite ساده و متمرکز است:
@@ -223,12 +255,16 @@ daemon، اجرای one-shot و حذف مخرب history از lock خصوصی `/r
 
 سرویس collector restart محدود، اولویت CPU/I/O پایین، UMask خصوصی و state mode برابر 0700 دارد و هیچ وابستگی یا hook توقف/restart/reload برای NGINX یا سرویس‌های GOST ندارد. خرابی collector، DB، maintenance یا حذف مانیتورینگ باعث توقف Direct Mode نمی‌شود.
 
-گزینه Native GOST Gateway فقط پیام `Coming soon` چاپ می‌کند و هیچ package، فایل، directory، service، database، firewall، NGINX یا GOST را تغییر نمی‌دهد.
+گزینه ۱۲ یعنی Native GOST Gateway فقط پیام `Coming soon` چاپ می‌کند و هیچ package، فایل، directory، service، database، firewall، NGINX یا GOST را تغییر نمی‌دهد.
 
 حذف runtime، desired state، secretهای خصوصی و package مربوط به Gateway چهار
 انتخاب مستقل با پاسخ پیش‌فرض No هستند. حذف secret به عبارت دقیق
 `DELETE GATEWAY SECRETS` نیاز دارد و تا وقتی سرویس دقیق Gateway Exit باقی مانده
 باشد package و runner حذف نمی‌شوند.
+
+حذف runtime اختصاصی NGINX یک انتخاب مستقل با پیش‌فرض No است. package اوبونتو،
+`/usr/sbin/nginx`، کل `/etc/nginx`، desired state، Exitها، Secretها، Direct Mode،
+Monitoring و firewall در این حذف دست‌نخورده می‌مانند.
 
 ## حذف امن
 

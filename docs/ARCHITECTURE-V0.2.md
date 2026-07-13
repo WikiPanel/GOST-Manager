@@ -76,13 +76,14 @@ To avoid surprising existing users, the current menu numbers remain unchanged. N
 8) List active GOST services
 9) Clean old/broken GOST configs
 10) Monitoring
-11) Native GOST Gateway (Coming soon)
+11) NGINX Gateway Mode
+12) Native GOST Gateway (Coming soon)
 0) Exit
 ```
 
-Selecting Native GOST Gateway prints a clear `Coming soon` message and returns to the menu. It must not install packages or write files.
-
-NGINX Gateway runtime and route CRUD are not part of the monitoring integration milestone and remain deferred.
+Option 11 exposes the dedicated NGINX Gateway workflow. Selecting Native GOST
+Gateway at option 12 prints a clear `Coming soon` message and returns to the
+menu. It must not install packages or write files.
 
 ## State layout
 
@@ -167,14 +168,17 @@ Local:
 
 ## NGINX generation
 
-The manager owns only clearly named managed files, for example:
+The manager runs one dedicated NGINX instance and owns only clearly named
+runtime files:
 
 ```text
-/etc/nginx/conf.d/gost-manager-gateway.conf
-/etc/nginx/snippets/gost-manager-websocket.conf
+/etc/gost-manager/generated/gateway/nginx/nginx.conf
+/etc/gost-manager/generated/gateway/nginx/runtime.json
+/etc/systemd/system/gost-nginx-gateway.service
 ```
 
-Generation lifecycle:
+It never includes or edits distribution files below `/etc/nginx`, and ordinary
+operations never control `nginx.service`. Generation lifecycle:
 
 ```text
 load desired state

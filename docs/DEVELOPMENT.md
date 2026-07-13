@@ -43,10 +43,11 @@ iptables
 shellcheck -x -P SCRIPTDIR gost-manager.sh install.sh uninstall.sh \
   lib/gost-run-iran.sh lib/gost-run-kharej.sh lib/gost-run-gateway-exit.sh \
   packaging/gost-monitor packaging/gost-monitor-admin packaging/gost-monitor-collector \
-  packaging/gost-gateway packaging/gost-gateway-runtime \
+  packaging/gost-gateway packaging/gost-gateway-runtime packaging/gost-gateway-nginx \
   tests/run-tests.sh tests/integration-test-lib.sh tests/test-install.sh \
   tests/test-menu.sh tests/test-uninstall.sh tests/test-systemd-linux.sh \
-  tests/test-gateway-runner.sh
+  tests/test-gateway-runner.sh tests/test-nginx-gateway-runner.sh \
+  tests/test-nginx-integration.sh
 ```
 
 The temporary-root Issue #6 suites are:
@@ -80,6 +81,15 @@ service-state rollback, exact service control, Direct Mode isolation, and a
 256-Exit allocation/time bound. The runtime contract and a manual temporary-root
 workflow are in `docs/GATEWAY-RUNTIME-V0.2.md`. Never use production defaults or
 start a real Gateway Exit service on a development host.
+
+Dedicated NGINX Gateway tests cover strict Path interpolation, deterministic
+config/manifest rendering, cgroup-wide listener ownership, backend readiness,
+port conflicts, first activation, metadata-only updates, no-op behavior,
+graceful reload, rollback, dependency installation, package isolation, and a
+256-Route scale bound. `tests/test-nginx-integration.sh` skips outside Linux;
+on Ubuntu with `/usr/sbin/nginx` it verifies exact Host/Path WebSocket routing,
+active-active, active-passive failover, master-PID continuity, held connections,
+and 1,000 simultaneous upgraded connections without using `/etc/nginx`.
 
 `tests/test-systemd-linux.sh` skips clearly on non-Linux hosts. On Linux it requires the real `systemd-analyze`, verifies temporary Monitoring and generated Gateway Exit units against complete fixture paths, rejects malformed controls, audits traffic isolation, and runs the temporary-root installer with real unit verification. The Ubuntu 22.04/24.04 matrix is defined in `.github/workflows/monitoring-integration.yml`.
 

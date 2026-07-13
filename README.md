@@ -30,6 +30,9 @@ The installer copies:
 - `lib/gost-run-kharej.sh` to `/usr/local/lib/gost-manager/gost-run-kharej.sh`
 - the complete monitoring package to `/usr/local/lib/gost-manager/monitoring`
 - `gost-monitor`, `gost-monitor-collector`, and `gost-monitor-admin` to `/usr/local/sbin`
+- `gost-gateway`, `gost-gateway-runtime`, and `gost-gateway-nginx` to `/usr/local/sbin`
+- the Gateway Python package and dedicated NGINX/GOST runners under `/usr/local/lib/gost-manager`
+- `/etc/systemd/system/gost-nginx-gateway.service` without enabling or starting it
 - `/etc/gost-manager/monitoring.env`
 - `/etc/systemd/system/gost-monitor-collector.service`
 - monitoring history to `/var/lib/gost-manager/metrics.sqlite3`
@@ -149,7 +152,8 @@ Use the menu:
 8) List active GOST services
 9) Clean old/broken GOST configs
 10) Monitoring
-11) Native GOST Gateway (Coming soon)
+11) NGINX Gateway Mode
+12) Native GOST Gateway (Coming soon)
 ```
 
 For delete, status, logs, and restart, the manager now shows a numbered tunnel selector. You no longer need to type `iran` or `kharej` manually.
@@ -165,12 +169,41 @@ Select tunnel number:
 
 Each numbered tunnel is independent. Deleting `iran-2` does not affect `iran-1`; deleting `kharej-2` does not affect `kharej-1`.
 
+## NGINX Gateway Mode
+
+Option `11` manages a dedicated `gost-nginx-gateway.service` that uses
+`/usr/sbin/nginx` with its own generated configuration below
+`/etc/gost-manager`. It never edits `/etc/nginx` or controls `nginx.service`
+during ordinary operations.
+
+Routes match one exact Host and exact WebSocket Path and forward to independent
+loopback GOST Exit services. Active-active uses least-connections balancing;
+active-passive uses one primary plus the open-source NGINX backup tier. Passive
+failover applies to new handshakes. Established sessions never migrate and
+clients reconnect after backend loss.
+
+NGINX package installation is a separate explicit menu/CLI action. Ordinary
+route changes are validated with `nginx -t` and use graceful reload while the
+master PID remains stable. See
+[Dedicated NGINX Gateway v0.2](docs/NGINX-GATEWAY-V0.2.md).
+
+Reserved conceptual example:
+
+```text
+gateway.example.org:80/api/v1
+gateway.example.org:80/ee1/api/v1
+gateway.example.org:80/us1/api/v1
+```
+
+Host and Path select the Route; internal loopback ports never appear in user
+links and the original URI/query is preserved.
+
 ## Local Gateway Exit runtime
 
 The v0.2 Gateway runtime can prepare independent loopback-only GOST Exit
-services before the public NGINX milestone. It is intentionally available only
-through the installed `gost-gateway` desired-state CLI and
-`gost-gateway-runtime` secret/runtime CLI; the main menu is unchanged.
+services for the public NGINX Gateway. It is available through the installed
+`gost-gateway` desired-state CLI, the `gost-gateway-runtime` secret/runtime CLI,
+and the option 11 Gateway submenu.
 
 Credentials live in private `0600` files below
 `/etc/gost-manager/secrets`, never in desired state or generated runtime files.
@@ -240,7 +273,7 @@ The daemon, one-shot collector, and destructive history purge share the private 
 
 The collector service has bounded restart behavior, low CPU/I/O priority, private state permissions, and no `Requires=`, `PartOf=`, `BindsTo=`, stop, restart, or reload relationship with NGINX or GOST tunnel services. Collector failure, corrupt history, maintenance failure, or monitoring removal cannot stop Direct Mode traffic.
 
-Option `11`, `Native GOST Gateway (Coming soon)`, only prints a message and returns. It performs no dependency, package, filesystem, service, database, firewall, NGINX, or GOST action.
+Option `12`, `Native GOST Gateway (Coming soon)`, only prints a message and returns. It performs no dependency, package, filesystem, service, database, firewall, NGINX, or GOST action.
 
 ## Safe Uninstall
 
@@ -252,6 +285,11 @@ Gateway runtime, desired state, private secrets, and the Gateway package are
 four separate default-No removal choices. Private secret deletion requires the
 exact phrase `DELETE GATEWAY SECRETS`; package removal is refused while any
 exact Gateway Exit service remains.
+
+Dedicated NGINX Gateway runtime is another independent default-No choice. Its
+removal leaves the Ubuntu `nginx` package, `/usr/sbin/nginx`, `/etc/nginx`,
+desired state, GOST Exits, Secrets, Direct Mode, Monitoring, and firewall
+untouched.
 
 Removal decisions are rechecked against actual post-action state. If any exact managed traffic unit survives, both runners, `/etc/gost`, and `/usr/local/bin/gost` are preserved even when deletion was selected. If the collector is active, enabled, or loaded despite a missing unit file, removal still attempts to stop/disable it; a failure preserves monitoring code, launchers, config, and history. History removal uses the configured DB captured before optional config deletion and never guesses the default path.
 

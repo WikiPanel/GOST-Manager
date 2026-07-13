@@ -162,8 +162,11 @@ an exact Gateway Exit service remains. A service-removal failure preserves its
 unit, env, secret, runner, and package. No option implicitly deletes another
 category.
 
-## Next milestone
+## NGINX consumer
 
-Issue #20 will render and validate the public NGINX Gateway and connect Host +
-Path routes to these loopback Exit services. NGINX and firewall runtime remain
-intentionally unimplemented here.
+Issue #20 consumes this runtime through a read-only batch readiness check before
+rendering exact Host + Path routes. It verifies current generated material,
+Secret generation, authoritative cgroup PID membership, and exact loopback
+listener ownership without changing any Exit service. The dedicated NGINX
+contract is documented in `docs/NGINX-GATEWAY-V0.2.md`; firewall runtime remains
+the next separate milestone.

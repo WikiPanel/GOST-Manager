@@ -18,7 +18,8 @@ The implementation uses only the Python 3 standard library and is available as:
 python3 -m gateway.cli --help
 ```
 
-The unfinished workflow is intentionally not exposed in the main menu.
+The same state CLI is now consumed by the option 11 NGINX Gateway menu; Bash
+does not write either JSON document directly.
 
 ## State separation
 
@@ -327,13 +328,11 @@ Human output is the default. JSON output is stable and suitable for operators
 and later integration work. Errors never echo raw unknown JSON or unsafe raw
 argument values.
 
-## Non-goals and next milestone
+## State-layer boundary
 
-This milestone does not create or resolve secret values, install NGINX, render
-NGINX or GOST files, run `nginx -t`, reload services, edit firewall rules,
-monitor routes, synchronize nodes, import/export state, or expose a production
-menu workflow.
-
-The next gateway milestone may consume this validated desired state for secret
-management and runtime rendering. Generated files must remain derived output,
-and runtime activation must retain independent validation and rollback.
+This state layer itself does not create or resolve secret values, install
+NGINX, render NGINX or GOST files, run `nginx -t`, reload services, edit
+firewall rules, monitor routes, synchronize nodes, or import/export state.
+Issue #19 and Issue #20 consume the validated documents through separate
+runtime layers. Generated files remain derived output, and runtime activation
+retains independent validation and rollback.
