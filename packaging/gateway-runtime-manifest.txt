@@ -4,6 +4,16 @@ gateway/crud.py
 gateway/errors.py
 gateway/locking.py
 gateway/models.py
+gateway/nginx_apply.py
+gateway/nginx_cli.py
+gateway/nginx_dependency.py
+gateway/nginx_inspection.py
+gateway/nginx_manifest.py
+gateway/nginx_models.py
+gateway/nginx_paths.py
+gateway/nginx_readiness.py
+gateway/nginx_render.py
+gateway/nginx_store.py
 gateway/paths.py
 gateway/runtime_apply.py
 gateway/runtime_cli.py

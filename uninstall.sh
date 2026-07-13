@@ -18,6 +18,7 @@ REMOVE_MONITOR_HISTORY=0
 REMOVE_TRAFFIC=0
 REMOVE_CREDENTIALS=0
 REMOVE_GOST_BINARY=0
+REMOVE_NGINX_GATEWAY=0
 REMOVE_GATEWAY_RUNTIME=0
 REMOVE_GATEWAY_STATE=0
 REMOVE_GATEWAY_SECRETS=0
@@ -105,17 +106,18 @@ remove_file() {
 remove_exact_tree() {
   local path="$1"
   local allowed_config allowed_credentials allowed_package allowed_gateway_package
-  local allowed_gateway_state_backups allowed_gateway_runtime_backups
+  local allowed_gateway_state_backups allowed_gateway_runtime_backups allowed_nginx_gateway_backups
   allowed_config="$(path_for /etc/gost-manager)"
   allowed_credentials="$(path_for /etc/gost)"
   allowed_package="$(path_for /usr/local/lib/gost-manager/monitoring)"
   allowed_gateway_package="$(path_for /usr/local/lib/gost-manager/gateway)"
   allowed_gateway_state_backups="$(path_for /etc/gost-manager/backups/gateway)"
   allowed_gateway_runtime_backups="$(path_for /etc/gost-manager/backups/gateway-runtime)"
+  allowed_nginx_gateway_backups="$(path_for /etc/gost-manager/backups/nginx-gateway)"
   case "${path}" in
     "${allowed_config}"|"${allowed_credentials}"|"${allowed_package}"| \
     "${allowed_gateway_package}"|"${allowed_gateway_state_backups}"| \
-    "${allowed_gateway_runtime_backups}") ;;
+    "${allowed_gateway_runtime_backups}"|"${allowed_nginx_gateway_backups}") ;;
     *)
       die "refusing unapproved recursive removal path: ${path}"
       return 1
@@ -217,6 +219,28 @@ gateway_runtime_services_exist() {
       return 0
     fi
   done <<< "$(printf '%s\n' "${candidates}" | LC_ALL=C sort -u)"
+  return 1
+}
+
+nginx_gateway_service_present() {
+  local unit state output line bullet name
+  unit="$(path_for /etc/systemd/system/gost-nginx-gateway.service)"
+  [[ -e "${unit}" ]] && return 0
+  "${SYSTEMCTL_BIN}" is-active --quiet gost-nginx-gateway.service >/dev/null 2>&1 && return 0
+  "${SYSTEMCTL_BIN}" is-enabled --quiet gost-nginx-gateway.service >/dev/null 2>&1 && return 0
+  state="$(${SYSTEMCTL_BIN} show gost-nginx-gateway.service --property=LoadState --value 2>/dev/null || true)"
+  [[ -n "${state}" && "${state}" != "not-found" ]] && return 0
+  output="$(${SYSTEMCTL_BIN} list-units --all --type=service --no-legend --plain gost-nginx-gateway.service 2>/dev/null || true)"
+  bullet=$'\342\227\217'
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    if [[ "${line}" == "${bullet}"* ]]; then
+      line="${line#"${bullet}"}"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
+    name="${line%%[[:space:]]*}"
+    [[ "${name}" != "gost-nginx-gateway.service" ]] || return 0
+  done <<< "${output}"
   return 1
 }
 
@@ -346,6 +370,10 @@ validate_dependencies() {
     die "gateway package and runner cannot be removed while gateway Exit services remain."
     return 1
   fi
+  if [[ "${REMOVE_GATEWAY_PACKAGE}" == "1" && "${REMOVE_NGINX_GATEWAY}" != "1" ]] && nginx_gateway_service_present; then
+    die "gateway package and NGINX runner cannot be removed while the dedicated NGINX Gateway service remains."
+    return 1
+  fi
   if [[ "${REMOVE_GATEWAY_SECRETS}" == "1" && "${REMOVE_GATEWAY_STATE}" != "1" ]] && ! gateway_secret_deletion_allowed; then
     gateway_secret_status="$(gateway_state_secret_status 2>/dev/null || printf 'unsafe_or_invalid_state')"
     case "${gateway_secret_status}" in
@@ -385,6 +413,7 @@ Monitoring history:            $(yes_no "${REMOVE_MONITOR_HISTORY}")
 Managed traffic services:      $(yes_no "${REMOVE_TRAFFIC}")
 /etc/gost credentials/backups: $(yes_no "${REMOVE_CREDENTIALS}")
 GOST binary:                   $(yes_no "${REMOVE_GOST_BINARY}")
+Dedicated NGINX Gateway:       $(yes_no "${REMOVE_NGINX_GATEWAY}")
 Gateway runtime/files:         $(yes_no "${REMOVE_GATEWAY_RUNTIME}")
 Gateway desired state/backups: $(yes_no "${REMOVE_GATEWAY_STATE}")
 Gateway private secrets:       $(yes_no "${REMOVE_GATEWAY_SECRETS}")
@@ -409,6 +438,7 @@ collect_plan() {
     fi
   fi
   confirm "Delete /usr/local/bin/gost?" && REMOVE_GOST_BINARY=1
+  confirm "Remove dedicated NGINX Gateway service and generated runtime?" && REMOVE_NGINX_GATEWAY=1
   confirm "Remove gateway Exit services and generated runtime files?" && REMOVE_GATEWAY_RUNTIME=1
   confirm "Remove gateway desired state and state backups?" && REMOVE_GATEWAY_STATE=1
   if confirm "Delete private gateway secrets?"; then
@@ -428,6 +458,38 @@ preserve_gateway_dependencies() {
   REMOVE_GATEWAY_SECRETS=0
   REMOVE_GATEWAY_PACKAGE=0
   info "Gateway runtime removal was incomplete; state, secrets, package, and runner were preserved."
+}
+
+preserve_nginx_gateway_dependencies() {
+  REMOVE_GATEWAY_PACKAGE=0
+  info "NGINX Gateway service removal was incomplete; config, manifest, backups, runner, CLI, package, and desired state were preserved."
+}
+
+remove_nginx_gateway() {
+  local unit config manifest backups generated
+  unit="$(path_for /etc/systemd/system/gost-nginx-gateway.service)"
+  config="$(path_for /etc/gost-manager/generated/gateway/nginx/nginx.conf)"
+  manifest="$(path_for /etc/gost-manager/generated/gateway/nginx/runtime.json)"
+  backups="$(path_for /etc/gost-manager/backups/nginx-gateway)"
+  generated="$(path_for /etc/gost-manager/generated/gateway/nginx)"
+  if nginx_gateway_service_present; then
+    if ! "${SYSTEMCTL_BIN}" disable --now gost-nginx-gateway.service; then
+      preserve_nginx_gateway_dependencies
+      FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+      return 0
+    fi
+  fi
+  remove_file "${unit}" || return 1
+  if ! "${SYSTEMCTL_BIN}" daemon-reload || nginx_gateway_service_present; then
+    preserve_nginx_gateway_dependencies
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  remove_file "${config}" || return 1
+  remove_file "${manifest}" || return 1
+  remove_exact_tree "${backups}" || return 1
+  "${RMDIR_BIN}" "${generated}" >/dev/null 2>&1 || true
+  info "The Ubuntu NGINX package and /etc/nginx were retained."
 }
 
 remove_gateway_runtime() {
@@ -500,14 +562,16 @@ remove_gateway_secrets() {
 }
 
 remove_gateway_package() {
-  if gateway_runtime_services_exist; then
+  if gateway_runtime_services_exist || nginx_gateway_service_present; then
     info "Gateway package and runner were preserved because a gateway Exit service remains."
     FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
     return 0
   fi
   remove_file "$(path_for /usr/local/sbin/gost-gateway)" || return 1
   remove_file "$(path_for /usr/local/sbin/gost-gateway-runtime)" || return 1
+  remove_file "$(path_for /usr/local/sbin/gost-gateway-nginx)" || return 1
   remove_file "$(path_for /usr/local/lib/gost-manager/gost-run-gateway-exit.sh)" || return 1
+  remove_file "$(path_for /usr/local/lib/gost-manager/gost-run-nginx-gateway.sh)" || return 1
   remove_exact_tree "$(path_for /usr/local/lib/gost-manager/gateway)" || return 1
 }
 
@@ -716,6 +780,9 @@ apply_plan() {
   if [[ "${REMOVE_TRAFFIC}" == "1" ]]; then
     remove_traffic_services || return 1
   fi
+  if [[ "${REMOVE_NGINX_GATEWAY}" == "1" ]]; then
+    remove_nginx_gateway || return 1
+  fi
   if [[ "${REMOVE_GATEWAY_RUNTIME}" == "1" ]]; then
     remove_gateway_runtime || return 1
   fi
@@ -756,7 +823,7 @@ main() {
   require_safe_root
   collect_plan
   show_plan
-  if [[ "${REMOVE_MANAGER}${REMOVE_MONITOR_SERVICE}${REMOVE_MONITOR_CODE}${REMOVE_MONITOR_CONFIG}${REMOVE_MONITOR_HISTORY}${REMOVE_TRAFFIC}${REMOVE_CREDENTIALS}${REMOVE_GOST_BINARY}${REMOVE_GATEWAY_RUNTIME}${REMOVE_GATEWAY_STATE}${REMOVE_GATEWAY_SECRETS}${REMOVE_GATEWAY_PACKAGE}" == "000000000000" ]]; then
+  if [[ "${REMOVE_MANAGER}${REMOVE_MONITOR_SERVICE}${REMOVE_MONITOR_CODE}${REMOVE_MONITOR_CONFIG}${REMOVE_MONITOR_HISTORY}${REMOVE_TRAFFIC}${REMOVE_CREDENTIALS}${REMOVE_GOST_BINARY}${REMOVE_NGINX_GATEWAY}${REMOVE_GATEWAY_RUNTIME}${REMOVE_GATEWAY_STATE}${REMOVE_GATEWAY_SECRETS}${REMOVE_GATEWAY_PACKAGE}" == "0000000000000" ]]; then
     info "No components selected; nothing changed."
     return 0
   fi

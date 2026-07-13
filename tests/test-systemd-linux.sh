@@ -144,6 +144,57 @@ if grep -Fq "${GATEWAY_UNIT##*/}" "${GATEWAY_VERIFY_OUTPUT}"; then
   exit 1
 fi
 
+NGINX_VERIFY_DIR="${TEST_HOME}/nginx-verify"
+mkdir -p "${NGINX_VERIFY_DIR}"
+NGINX_UNIT="${NGINX_VERIFY_DIR}/gost-nginx-gateway.service"
+NGINX_RUNNER="${NGINX_VERIFY_DIR}/gost-run-nginx-gateway.sh"
+cp "${ROOT_DIR}/packaging/gost-nginx-gateway.service" "${NGINX_UNIT}"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${NGINX_RUNNER}"
+chmod 755 "${NGINX_RUNNER}"
+python3 -c \
+  'import sys; from pathlib import Path; p=Path(sys.argv[1]); s=p.read_text(); s=s.replace("/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh", sys.argv[2]); p.write_text(s)' \
+  "${NGINX_UNIT}" "${NGINX_RUNNER}"
+for required in \
+  'LimitNOFILE=200000' 'RuntimeDirectory=gost-manager-nginx' \
+  'RuntimeDirectoryMode=0700' 'TasksMax=4096' 'KillMode=mixed'; do
+  grep -Fq "${required}" "${NGINX_UNIT}" || {
+    printf 'FAIL: dedicated NGINX unit lacks %s\n' "${required}" >&2
+    exit 1
+  }
+done
+for forbidden in \
+  'nginx.service' 'gost-gateway-exit-' 'gost-monitor-collector.service' \
+  'PrivateNetwork=true' 'iptables' 'nft'; do
+  if grep -Fq "${forbidden}" "${NGINX_UNIT}"; then
+    printf 'FAIL: dedicated NGINX unit contains forbidden token: %s\n' "${forbidden}" >&2
+    exit 1
+  fi
+done
+NGINX_VERIFY_OUTPUT="${TEST_HOME}/nginx-verify.out"
+if ! "${SYSTEMD_ANALYZE_REAL}" verify "${NGINX_UNIT}" > "${NGINX_VERIFY_OUTPUT}" 2>&1; then
+  cat "${NGINX_VERIFY_OUTPUT}" >&2
+  exit 1
+fi
+if grep -Fq "${NGINX_UNIT##*/}" "${NGINX_VERIFY_OUTPUT}"; then
+  cat "${NGINX_VERIFY_OUTPUT}" >&2
+  printf 'FAIL: systemd-analyze emitted a dedicated NGINX candidate warning\n' >&2
+  exit 1
+fi
+NGINX_INVALID_UNIT="${NGINX_VERIFY_DIR}/gost-nginx-gateway-invalid.service"
+cp "${NGINX_UNIT}" "${NGINX_INVALID_UNIT}"
+printf '\nDefinitelyInvalidNginxGatewayDirective=true\n' >> "${NGINX_INVALID_UNIT}"
+NGINX_INVALID_OUTPUT="${TEST_HOME}/nginx-invalid.out"
+if "${SYSTEMD_ANALYZE_REAL}" verify "${NGINX_INVALID_UNIT}" > "${NGINX_INVALID_OUTPUT}" 2>&1 && \
+   [[ ! -s "${NGINX_INVALID_OUTPUT}" ]]; then
+  printf 'FAIL: malformed dedicated NGINX unit produced no diagnostic\n' >&2
+  exit 1
+fi
+grep -Fq "${NGINX_INVALID_UNIT##*/}" "${NGINX_INVALID_OUTPUT}" || {
+  cat "${NGINX_INVALID_OUTPUT}" >&2
+  printf 'FAIL: malformed dedicated NGINX diagnostic was not attributable\n' >&2
+  exit 1
+}
+
 GATEWAY_INVALID_UNIT="${GATEWAY_VERIFY_DIR}/systemd/gost-gateway-exit-invalid.service"
 cp "${GATEWAY_UNIT}" "${GATEWAY_INVALID_UNIT}"
 printf '\nDefinitelyInvalidGatewayDirective=true\n' >> "${GATEWAY_INVALID_UNIT}"
@@ -200,6 +251,9 @@ bash "${ROOT_DIR}/install.sh" >/dev/null
 [[ -x "${INSTALL_ROOT}/usr/local/sbin/gost-monitor-admin" ]]
 [[ -f "${INSTALL_ROOT}/etc/gost-manager/monitoring.env" ]]
 [[ -f "${INSTALL_ROOT}/etc/systemd/system/gost-monitor-collector.service" ]]
+[[ -x "${INSTALL_ROOT}/usr/local/sbin/gost-gateway-nginx" ]]
+[[ -x "${INSTALL_ROOT}/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh" ]]
+[[ -f "${INSTALL_ROOT}/etc/systemd/system/gost-nginx-gateway.service" ]]
 
 distribution="unknown"
 if [[ -r /etc/os-release ]]; then
@@ -211,5 +265,7 @@ printf 'PASS: malformed staged unit rejected by systemd-analyze\n'
 printf 'PASS: temporary-root install with real systemd-analyze\n'
 printf 'PASS: generated gateway Exit unit verified by real systemd-analyze\n'
 printf 'PASS: malformed gateway Exit unit rejected by real systemd-analyze\n'
+printf 'PASS: dedicated NGINX Gateway unit verified by real systemd-analyze\n'
+printf 'PASS: malformed dedicated NGINX Gateway unit rejected by real systemd-analyze\n'
 printf 'LINUX_DISTRIBUTION=%s\n' "${distribution}"
 printf 'SYSTEMD_VERSION=%s\n' "$(printf '%s\n' "${version_output}" | sed -n '1p')"

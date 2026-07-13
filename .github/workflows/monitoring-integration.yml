@@ -6,6 +6,7 @@ on:
     branches:
       - feat/monitoring-integration
       - feat/gateway-gost-runtime
+      - feat/nginx-gateway-runtime
 
 permissions:
   contents: read
@@ -21,11 +22,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install real NGINX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nginx
+          sudo systemctl stop nginx.service || true
+          sudo systemctl disable nginx.service || true
       - name: Tool versions
         run: |
           shellcheck --version
           systemd-analyze --version
+          /usr/sbin/nginx -v
       - name: Full local gate
         run: make check
       - name: Real Linux systemd verification
         run: bash tests/test-systemd-linux.sh
+      - name: Real NGINX routing, failover, reload, and 1,000 connections
+        run: bash tests/test-nginx-integration.sh

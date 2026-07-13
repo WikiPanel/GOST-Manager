@@ -39,7 +39,8 @@ create_source_fixture() {
   mkdir -p "${destination}/lib" "${destination}/packaging"
   cp "${ROOT_DIR}/gost-manager.sh" "${destination}/gost-manager.sh"
   cp "${ROOT_DIR}/lib/gost-run-iran.sh" "${ROOT_DIR}/lib/gost-run-kharej.sh" \
-    "${ROOT_DIR}/lib/gost-run-gateway-exit.sh" "${destination}/lib/"
+    "${ROOT_DIR}/lib/gost-run-gateway-exit.sh" \
+    "${ROOT_DIR}/lib/gost-run-nginx-gateway.sh" "${destination}/lib/"
   cp -R "${ROOT_DIR}/monitoring" "${destination}/monitoring"
   cp -R "${ROOT_DIR}/gateway" "${destination}/gateway"
   cp "${ROOT_DIR}"/packaging/* "${destination}/packaging/"
@@ -63,14 +64,21 @@ assert_file "fresh admin launcher installed" "${fresh_root}/usr/local/sbin/gost-
 assert_file "complete package includes init" "${fresh_root}/usr/local/lib/gost-manager/monitoring/__init__.py"
 assert_file "fresh gateway launcher installed" "${fresh_root}/usr/local/sbin/gost-gateway"
 assert_file "fresh gateway runtime launcher installed" "${fresh_root}/usr/local/sbin/gost-gateway-runtime"
+assert_file "fresh NGINX Gateway launcher installed" "${fresh_root}/usr/local/sbin/gost-gateway-nginx"
 assert_file "fresh gateway package installed" "${fresh_root}/usr/local/lib/gost-manager/gateway/runtime_cli.py"
 assert_file "fresh gateway runner installed" "${fresh_root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh"
+assert_file "fresh NGINX Gateway runner installed" "${fresh_root}/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh"
+assert_file "fresh NGINX Gateway unit installed" "${fresh_root}/etc/systemd/system/gost-nginx-gateway.service"
 assert_dir "fresh gateway secret directory created" "${fresh_root}/etc/gost-manager/secrets"
 assert_dir "fresh gateway generated directory created" "${fresh_root}/etc/gost-manager/generated/gateway/exits"
 assert_dir "fresh gateway runtime backup directory created" "${fresh_root}/etc/gost-manager/backups/gateway-runtime"
+assert_dir "fresh NGINX Gateway generated directory created" "${fresh_root}/etc/gost-manager/generated/gateway/nginx"
+assert_dir "fresh NGINX Gateway backup directory created" "${fresh_root}/etc/gost-manager/backups/nginx-gateway"
 assert_absent "installer does not initialize gateway state" "${fresh_root}/etc/gost-manager/state.json"
 assert_absent "installer does not initialize node state" "${fresh_root}/etc/gost-manager/node.json"
 assert_absent "installer does not create runtime manifest" "${fresh_root}/etc/gost-manager/generated/gateway/runtime.json"
+assert_absent "installer does not generate nginx.conf" "${fresh_root}/etc/gost-manager/generated/gateway/nginx/nginx.conf"
+assert_absent "installer does not generate NGINX manifest" "${fresh_root}/etc/gost-manager/generated/gateway/nginx/runtime.json"
 assert_eq "gateway secret directory mode" "700" "$(mode_of "${fresh_root}/etc/gost-manager/secrets")"
 assert_eq "gateway runner mode" "755" "$(mode_of "${fresh_root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh")"
 assert_file "fresh default config installed" "${fresh_root}/etc/gost-manager/monitoring.env"
@@ -86,7 +94,10 @@ assert_contains "fresh collector enabled" "systemctl enable gost-monitor-collect
 assert_contains "fresh collector started" "systemctl start gost-monitor-collector.service" "${COMMAND_LOG}"
 assert_not_contains "fresh install never targets Iran traffic" "gost-iran-" "${COMMAND_LOG}"
 assert_not_contains "fresh install never targets Kharej traffic" "gost-kharej-" "${COMMAND_LOG}"
-assert_not_contains "fresh install never targets NGINX" "nginx" "${COMMAND_LOG}"
+for action in start stop restart reload enable disable; do
+  assert_not_contains "fresh install never ${action}s distro NGINX" "systemctl ${action} nginx.service" "${COMMAND_LOG}"
+  assert_not_contains "fresh install never ${action}s Gateway NGINX" "systemctl ${action} gost-nginx-gateway.service" "${COMMAND_LOG}"
+done
 assert_not_contains "fresh install starts no gateway Exit" "gost-gateway-exit-" "${COMMAND_LOG}"
 
 launcher_bin="${TEST_HOME}/launcher-bin"

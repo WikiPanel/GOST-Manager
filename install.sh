@@ -43,7 +43,9 @@ DATABASE_CREATED=0
 SERVICE_ENABLE_ATTEMPTED=0
 SERVICE_START_ATTEMPTED=0
 declare -a RUNTIME_MANIFEST_ENTRIES=()
+declare -a GATEWAY_MANIFEST_ENTRIES=()
 declare -a STAGED_MODULES=()
+declare -a STAGED_GATEWAY_MODULES=()
 declare -a CHANGED_DESTINATIONS=()
 declare -a BACKUP_PATHS=()
 declare -a BACKUP_CONTAINERS=()
@@ -134,7 +136,7 @@ package_for_command() {
     ss) printf 'iproute2\n' ;;
     cmp) printf 'diffutils\n' ;;
     grep) printf 'grep\n' ;;
-    install|cp|mv|rm|chmod|chown|sync|mktemp|stat) printf 'coreutils\n' ;;
+    install|cp|mv|rm|chmod|chown|sync|mktemp|stat|realpath) printf 'coreutils\n' ;;
     *) die "no package mapping for required command: $1" ;;
   esac
 }
@@ -151,7 +153,7 @@ command_available() {
 
 validate_dependencies() {
   local command_name package existing
-  local -a required=(bash python3 systemctl systemd-analyze ss grep install cp mv rm chmod chown sync cmp mktemp stat)
+  local -a required=(bash python3 systemctl systemd-analyze ss grep install cp mv rm chmod chown sync cmp mktemp stat realpath)
   local -a missing=()
   local -a packages=()
   for command_name in "${required[@]}"; do
@@ -219,8 +221,11 @@ validate_source_manifest() {
     "packaging/monitoring.env"
     "packaging/monitoring-runtime-manifest.txt"
     "lib/gost-run-gateway-exit.sh"
+    "lib/gost-run-nginx-gateway.sh"
     "packaging/gost-gateway"
     "packaging/gost-gateway-runtime"
+    "packaging/gost-gateway-nginx"
+    "packaging/gost-nginx-gateway.service"
     "packaging/gateway-runtime-manifest.txt"
   )
   for path in "${fixed[@]}"; do
@@ -266,7 +271,7 @@ validate_source_manifest() {
     GATEWAY_MANIFEST_ENTRIES+=("${entry}")
   done < "${gateway_manifest}"
   [[ "${#GATEWAY_MANIFEST_ENTRIES[@]}" -gt 1 ]] || die "gateway runtime manifest is incomplete."
-  for path in gateway/__init__.py gateway/cli.py gateway/runtime_cli.py gateway/runtime_apply.py gateway/secrets.py; do
+  for path in gateway/__init__.py gateway/cli.py gateway/runtime_cli.py gateway/runtime_apply.py gateway/secrets.py gateway/nginx_cli.py gateway/nginx_apply.py gateway/nginx_render.py gateway/nginx_manifest.py; do
     gateway_manifest_contains "${path}" || die "gateway runtime manifest omits required module: ${path}"
   done
 }
@@ -280,6 +285,7 @@ stage_sources() {
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-iran.sh" "${STAGE_DIR}/lib/gost-run-iran.sh"
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-kharej.sh" "${STAGE_DIR}/lib/gost-run-kharej.sh"
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-gateway-exit.sh" "${STAGE_DIR}/lib/gost-run-gateway-exit.sh"
+  "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-nginx-gateway.sh" "${STAGE_DIR}/lib/gost-run-nginx-gateway.sh"
   STAGED_MODULES=()
   for entry in "${RUNTIME_MANIFEST_ENTRIES[@]}"; do
     destination="${STAGE_DIR}/monitoring/${entry##*/}"
@@ -297,6 +303,8 @@ stage_sources() {
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor-collector" "${STAGE_DIR}/sbin/gost-monitor-collector"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-gateway" "${STAGE_DIR}/sbin/gost-gateway"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-gateway-runtime" "${STAGE_DIR}/sbin/gost-gateway-runtime"
+  "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-gateway-nginx" "${STAGE_DIR}/sbin/gost-gateway-nginx"
+  "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-nginx-gateway.service" "${STAGE_DIR}/gost-nginx-gateway.service"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor-collector.service" "${STAGE_DIR}/gost-monitor-collector.service"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/monitoring.env" "${STAGE_DIR}/monitoring.env"
 }
@@ -307,11 +315,13 @@ validate_staged_bash() {
     "${STAGE_DIR}/lib/gost-run-iran.sh" \
     "${STAGE_DIR}/lib/gost-run-kharej.sh" \
     "${STAGE_DIR}/lib/gost-run-gateway-exit.sh" \
+    "${STAGE_DIR}/lib/gost-run-nginx-gateway.sh" \
     "${STAGE_DIR}/sbin/gost-monitor" \
     "${STAGE_DIR}/sbin/gost-monitor-admin" \
     "${STAGE_DIR}/sbin/gost-monitor-collector" \
     "${STAGE_DIR}/sbin/gost-gateway" \
-    "${STAGE_DIR}/sbin/gost-gateway-runtime"
+    "${STAGE_DIR}/sbin/gost-gateway-runtime" \
+    "${STAGE_DIR}/sbin/gost-gateway-nginx"
 }
 
 validate_staged_python() {
@@ -415,6 +425,41 @@ validate_unit_content() {
         ;;
     esac
   fi
+
+  unit="${STAGE_DIR}/gost-nginx-gateway.service"
+  for forbidden in 'nginx.service' 'gost-gateway-exit-' 'gost-monitor-collector.service' 'PrivateNetwork=true' 'iptables' 'nft'; do
+    if grep -Fq "${forbidden}" "${unit}"; then
+      die "NGINX Gateway unit contains forbidden setting: ${forbidden}"
+    fi
+  done
+  for required in \
+    'ExecStartPre=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --test' \
+    'ExecStart=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --start' \
+    'ExecReload=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --reload' \
+    'ExecStop=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --quit' \
+    'LimitNOFILE=200000' 'RuntimeDirectory=gost-manager-nginx' \
+    'RuntimeDirectoryMode=0700' 'TasksMax=4096'; do
+    grep -Fq "${required}" "${unit}" || die "NGINX Gateway unit lacks required production setting: ${required}"
+  done
+}
+
+validate_nginx_unit_content() {
+  local unit forbidden required
+  unit="${STAGE_DIR}/gost-nginx-gateway.service"
+  for forbidden in 'nginx.service' 'gost-gateway-exit-' 'gost-monitor-collector.service' 'PrivateNetwork=true' 'iptables' 'nft'; do
+    if grep -Fq "${forbidden}" "${unit}"; then
+      die "NGINX Gateway unit contains forbidden setting: ${forbidden}"
+    fi
+  done
+  for required in \
+    'ExecStartPre=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --test' \
+    'ExecStart=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --start' \
+    'ExecReload=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --reload' \
+    'ExecStop=/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh --quit' \
+    'LimitNOFILE=200000' 'RuntimeDirectory=gost-manager-nginx' \
+    'RuntimeDirectoryMode=0700' 'TasksMax=4096'; do
+    grep -Fq "${required}" "${unit}" || die "NGINX Gateway unit lacks required production setting: ${required}"
+  done
 }
 
 record_service_state() {
@@ -618,8 +663,10 @@ install_files() {
   ensure_private_directory "$(path_for /etc/gost-manager/generated)" 700
   ensure_private_directory "$(path_for /etc/gost-manager/generated/gateway)" 700
   ensure_private_directory "$(path_for /etc/gost-manager/generated/gateway/exits)" 700
+  ensure_private_directory "$(path_for /etc/gost-manager/generated/gateway/nginx)" 700
   ensure_private_directory "$(path_for /etc/gost-manager/backups)" 700
   ensure_private_directory "$(path_for /etc/gost-manager/backups/gateway-runtime)" 700
+  ensure_private_directory "$(path_for /etc/gost-manager/backups/nginx-gateway)" 700
   ensure_shared_directory "$(path_for /etc/systemd/system)" 755
   ensure_private_directory "$(path_for /var/lib/gost-manager)" 700
   ensure_configured_db_parent
@@ -628,6 +675,7 @@ install_files() {
   install_managed_file "${STAGE_DIR}/lib/gost-run-iran.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-iran.sh)" 755
   install_managed_file "${STAGE_DIR}/lib/gost-run-kharej.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-kharej.sh)" 755
   install_managed_file "${STAGE_DIR}/lib/gost-run-gateway-exit.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-gateway-exit.sh)" 755
+  install_managed_file "${STAGE_DIR}/lib/gost-run-nginx-gateway.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-nginx-gateway.sh)" 755
   install_monitoring_package
   install_gateway_package
   install_managed_file "${STAGE_DIR}/sbin/gost-monitor" "$(path_for /usr/local/sbin/gost-monitor)" 755
@@ -635,6 +683,7 @@ install_files() {
   install_managed_file "${STAGE_DIR}/sbin/gost-monitor-collector" "$(path_for /usr/local/sbin/gost-monitor-collector)" 755
   install_managed_file "${STAGE_DIR}/sbin/gost-gateway" "$(path_for /usr/local/sbin/gost-gateway)" 755
   install_managed_file "${STAGE_DIR}/sbin/gost-gateway-runtime" "$(path_for /usr/local/sbin/gost-gateway-runtime)" 755
+  install_managed_file "${STAGE_DIR}/sbin/gost-gateway-nginx" "$(path_for /usr/local/sbin/gost-gateway-nginx)" 755
 
   config_path="$(path_for /etc/gost-manager/monitoring.env)"
   if [[ ! -e "${config_path}" ]]; then
@@ -649,6 +698,11 @@ install_files() {
   unit_path="$(path_for /etc/systemd/system/${MONITOR_SERVICE})"
   before_count="${#CHANGED_DESTINATIONS[@]}"
   install_managed_file "${STAGE_DIR}/gost-monitor-collector.service" "${unit_path}" 644
+  if [[ "${#CHANGED_DESTINATIONS[@]}" -gt "${before_count}" ]]; then
+    UNIT_CHANGED=1
+  fi
+  before_count="${#CHANGED_DESTINATIONS[@]}"
+  install_managed_file "${STAGE_DIR}/gost-nginx-gateway.service" "$(path_for /etc/systemd/system/gost-nginx-gateway.service)" 644
   if [[ "${#CHANGED_DESTINATIONS[@]}" -gt "${before_count}" ]]; then
     UNIT_CHANGED=1
   fi
@@ -923,6 +977,7 @@ main() {
   inject_failure python_validation
   validate_staged_config
   inject_failure config_validation
+  validate_nginx_unit_content
   validate_unit_content
   inject_failure unit_validation
   record_service_state
@@ -932,7 +987,7 @@ main() {
   activate_collector
   INSTALL_COMMITTED=1
   cleanup
-  info "GOST Manager and monitoring installed."
+  info "GOST Manager, Gateway tools, and monitoring installed."
   info "Monitoring database: ${CONFIGURED_DB_PRODUCTION}"
   info "Run: sudo gost-manager"
 }

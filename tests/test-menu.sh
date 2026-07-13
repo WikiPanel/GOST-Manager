@@ -73,7 +73,8 @@ for label in \
   assert_contains "legacy menu label ${label%%)*}" "${label}" "${menu_file}"
 done
 assert_contains "Monitoring appended as option 10" "10) Monitoring" "${menu_file}"
-assert_contains "Native placeholder appended as option 11" "11) Native GOST Gateway (Coming soon)" "${menu_file}"
+assert_contains "NGINX Gateway appended as option 11" "11) NGINX Gateway Mode" "${menu_file}"
+assert_contains "Native placeholder moved to option 12" "12) Native GOST Gateway (Coming soon)" "${menu_file}"
 
 : > "${COMMAND_LOG}"
 export STUB_MONITOR_EXIT=3
@@ -189,7 +190,27 @@ source "${dispatch_stubs}"
 (main_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n0' >/dev/null)
 assert_eq "legacy dispatch order unchanged" $'install\nkharej\niran\ndelete\nstatus\nlogs\nrestart\nlist\ncleanup' "$(sed -n '1,9p' "${DISPATCH_LOG}")"
 assert_contains "main option 10 dispatches Monitoring" '10) monitoring_menu ;;' "${ROOT_DIR}/gost-manager.sh"
-assert_contains "main option 11 dispatches Native placeholder" '11) native_gost_gateway_coming_soon ;;' "${ROOT_DIR}/gost-manager.sh"
+assert_contains "main option 11 dispatches NGINX Gateway" '11) nginx_gateway_menu ;;' "${ROOT_DIR}/gost-manager.sh"
+assert_contains "main option 12 dispatches Native placeholder" '12) native_gost_gateway_coming_soon ;;' "${ROOT_DIR}/gost-manager.sh"
+
+nginx_menu_file="${TEST_HOME}/nginx-menu.txt"
+GOST_MANAGER_TESTING=1 bash -c 'source "$1"; show_nginx_gateway_menu' _ "${ROOT_DIR}/gost-manager.sh" > "${nginx_menu_file}"
+for label in \
+  "1) Gateway overview" \
+  "2) Initialize Gateway state" \
+  "3) Gateway listener and Host settings" \
+  "4) Manage Exits" \
+  "5) Manage local Bindings and Secrets" \
+  "6) Manage Routes" \
+  "7) Local GOST Exit runtime" \
+  "8) NGINX plan" \
+  "9) Apply NGINX Gateway" \
+  "10) NGINX test/status" \
+  "11) NGINX service control" \
+  "12) NGINX dependency status/install" \
+  "0) Back"; do
+  assert_contains "NGINX Gateway submenu ${label}" "${label}" "${nginx_menu_file}"
+done
 
 lite_menu_file="${TEST_HOME}/monitoring-lite-menu.txt"
 show_monitoring_menu > "${lite_menu_file}"

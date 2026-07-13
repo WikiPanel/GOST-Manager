@@ -14,6 +14,9 @@ MONITOR_EXPORT_DIR="/root"
 MONITOR_BIN="/usr/local/sbin/gost-monitor"
 MONITOR_COLLECTOR_BIN="/usr/local/sbin/gost-monitor-collector"
 MONITOR_ADMIN_BIN="/usr/local/sbin/gost-monitor-admin"
+GATEWAY_BIN="/usr/local/sbin/gost-gateway"
+GATEWAY_RUNTIME_BIN="/usr/local/sbin/gost-gateway-runtime"
+GATEWAY_NGINX_BIN="/usr/local/sbin/gost-gateway-nginx"
 
 if [[ "${GOST_MANAGER_TESTING:-0}" == "1" ]]; then
   MONITOR_CONFIG="${GOST_MONITOR_CONFIG_TEST:-${MONITOR_CONFIG}}"
@@ -21,6 +24,9 @@ if [[ "${GOST_MANAGER_TESTING:-0}" == "1" ]]; then
   MONITOR_BIN="${GOST_MONITOR_BIN_TEST:-${MONITOR_BIN}}"
   MONITOR_COLLECTOR_BIN="${GOST_MONITOR_COLLECTOR_BIN_TEST:-${MONITOR_COLLECTOR_BIN}}"
   MONITOR_ADMIN_BIN="${GOST_MONITOR_ADMIN_BIN_TEST:-${MONITOR_ADMIN_BIN}}"
+  GATEWAY_BIN="${GOST_GATEWAY_BIN_TEST:-${GATEWAY_BIN}}"
+  GATEWAY_RUNTIME_BIN="${GOST_GATEWAY_RUNTIME_BIN_TEST:-${GATEWAY_RUNTIME_BIN}}"
+  GATEWAY_NGINX_BIN="${GOST_GATEWAY_NGINX_BIN_TEST:-${GATEWAY_NGINX_BIN}}"
 fi
 
 die() {
@@ -1460,6 +1466,423 @@ monitoring_menu() {
   done
 }
 
+gateway_command() {
+  local executable="$1"
+  shift
+  local -a arguments=("$@")
+  if ! "${executable}" "${arguments[@]}"; then
+    info "Gateway command failed; no follow-up action was run."
+  fi
+  return 0
+}
+
+gateway_overview() {
+  info "Desired state"
+  gateway_command "${GATEWAY_BIN}" show
+  info "Local GOST Exit runtime"
+  gateway_command "${GATEWAY_RUNTIME_BIN}" runtime status
+  info "NGINX plan"
+  gateway_command "${GATEWAY_NGINX_BIN}" plan
+  info "Dedicated NGINX service"
+  gateway_command "${GATEWAY_NGINX_BIN}" status
+}
+
+gateway_initialize() {
+  local gateway_id node_id listen_address listen_port status_port server_name
+  local -a arguments=()
+  gateway_id="$(prompt_required "Gateway ID")"
+  node_id="$(prompt_required "Node ID")"
+  listen_address="$(prompt_default "Public IPv4 listen address" "0.0.0.0")"
+  listen_port="$(prompt_default "Public port" "80")"
+  status_port="$(prompt_default "Loopback status port" "18000")"
+  server_name="$(prompt_required "Server name")"
+  arguments=(
+    init --gateway-id "${gateway_id}" --node-id "${node_id}"
+    --listen-address "${listen_address}" --listen-port "${listen_port}"
+    --status-port "${status_port}" --server-name "${server_name}"
+  )
+  while confirm "Add another server name?"; do
+    server_name="$(prompt_required "Server name")"
+    arguments+=(--server-name "${server_name}")
+  done
+  gateway_command "${GATEWAY_BIN}" "${arguments[@]}"
+}
+
+gateway_settings_menu() {
+  local choice value
+  local -a arguments=()
+  while true; do
+    cat <<'MENU'
+Gateway listener and Host settings
+==================================
+
+1) Show
+2) Enable Gateway
+3) Disable Gateway
+4) Change listen address
+5) Change public port
+6) Replace server names
+7) Change status port
+0) Back
+MENU
+    read -r -p "Choose a Gateway setting: " choice
+    case "${choice}" in
+      1) gateway_command "${GATEWAY_BIN}" gateway show ;;
+      2) gateway_command "${GATEWAY_BIN}" gateway set --enable ;;
+      3) gateway_command "${GATEWAY_BIN}" gateway set --disable ;;
+      4)
+        value="$(prompt_required "Public IPv4 listen address")"
+        gateway_command "${GATEWAY_BIN}" gateway set --listen-address "${value}"
+        ;;
+      5)
+        value="$(prompt_required "Public port")"
+        gateway_command "${GATEWAY_BIN}" gateway set --listen-port "${value}"
+        ;;
+      6)
+        arguments=(gateway set)
+        value="$(prompt_required "Server name")"
+        arguments+=(--server-name "${value}")
+        while confirm "Add another server name?"; do
+          value="$(prompt_required "Server name")"
+          arguments+=(--server-name "${value}")
+        done
+        gateway_command "${GATEWAY_BIN}" "${arguments[@]}"
+        ;;
+      7)
+        value="$(prompt_required "Loopback status port")"
+        gateway_command "${GATEWAY_BIN}" gateway set --status-port "${value}"
+        ;;
+      0) return 0 ;;
+      *) info "Invalid Gateway setting." ;;
+    esac
+    [[ "${choice}" == "1" || "${choice}" == "0" ]] || info "Run NGINX plan before apply."
+  done
+}
+
+gateway_exit_menu() {
+  local choice exit_id display_name host socks_port target_port
+  while true; do
+    cat <<'MENU'
+Manage Exits
+============
+
+1) List
+2) Add
+3) Edit endpoint
+4) Enable
+5) Disable
+6) Delete
+0) Back
+MENU
+    read -r -p "Choose an Exit action: " choice
+    case "${choice}" in
+      1) gateway_command "${GATEWAY_BIN}" exit list ;;
+      2)
+        exit_id="$(prompt_required "Exit ID")"
+        display_name="$(prompt_required "Display name")"
+        host="$(prompt_required "Kharej host")"
+        socks_port="$(prompt_required "SOCKS port")"
+        target_port="$(prompt_required "Target port")"
+        gateway_command "${GATEWAY_BIN}" exit add --id "${exit_id}" \
+          --display-name "${display_name}" --host "${host}" \
+          --socks-port "${socks_port}" --target-port "${target_port}"
+        ;;
+      3)
+        exit_id="$(prompt_required "Exit ID")"
+        host="$(prompt_required "Kharej host")"
+        socks_port="$(prompt_required "SOCKS port")"
+        target_port="$(prompt_required "Target port")"
+        gateway_command "${GATEWAY_BIN}" exit edit --id "${exit_id}" \
+          --host "${host}" --socks-port "${socks_port}" --target-port "${target_port}"
+        ;;
+      4|5)
+        exit_id="$(prompt_required "Exit ID")"
+        if [[ "${choice}" == "4" ]]; then
+          gateway_command "${GATEWAY_BIN}" exit edit --id "${exit_id}" --enable
+        else
+          gateway_command "${GATEWAY_BIN}" exit edit --id "${exit_id}" --disable
+        fi
+        ;;
+      6)
+        exit_id="$(prompt_required "Exit ID")"
+        confirm "Delete this Exit from desired state?" && \
+          gateway_command "${GATEWAY_BIN}" exit delete --id "${exit_id}"
+        ;;
+      0) return 0 ;;
+      *) info "Invalid Exit action." ;;
+    esac
+  done
+}
+
+gateway_binding_secret_menu() {
+  local choice exit_id listen_port secret_ref
+  while true; do
+    cat <<'MENU'
+Manage local Bindings and Secrets
+=================================
+
+1) List Bindings
+2) Set/enable Binding
+3) Disable Binding
+4) Remove Binding
+5) List Secret references
+6) Create/update Secret (hidden prompt)
+7) Validate Secret
+8) Delete unreferenced Secret
+0) Back
+MENU
+    read -r -p "Choose a Binding or Secret action: " choice
+    case "${choice}" in
+      1) gateway_command "${GATEWAY_BIN}" binding list ;;
+      2)
+        exit_id="$(prompt_required "Exit ID")"
+        listen_port="$(prompt_required "Loopback binding port")"
+        secret_ref="$(prompt_required "Secret reference")"
+        gateway_command "${GATEWAY_BIN}" binding set --exit-id "${exit_id}" \
+          --listen-port "${listen_port}" --secret-ref "${secret_ref}" --enable
+        ;;
+      3)
+        exit_id="$(prompt_required "Exit ID")"
+        listen_port="$(prompt_required "Loopback binding port")"
+        secret_ref="$(prompt_default "Secret reference (may be empty)" "unused")"
+        gateway_command "${GATEWAY_BIN}" binding set --exit-id "${exit_id}" \
+          --listen-port "${listen_port}" --secret-ref "${secret_ref}" --disable
+        ;;
+      4)
+        exit_id="$(prompt_required "Exit ID")"
+        gateway_command "${GATEWAY_BIN}" binding remove --exit-id "${exit_id}"
+        ;;
+      5) gateway_command "${GATEWAY_RUNTIME_BIN}" secret list ;;
+      6)
+        secret_ref="$(prompt_required "Secret reference")"
+        gateway_command "${GATEWAY_RUNTIME_BIN}" secret set --ref "${secret_ref}"
+        ;;
+      7)
+        secret_ref="$(prompt_required "Secret reference")"
+        gateway_command "${GATEWAY_RUNTIME_BIN}" secret validate --ref "${secret_ref}"
+        ;;
+      8)
+        secret_ref="$(prompt_required "Secret reference")"
+        confirm "Delete this unreferenced Secret?" && \
+          gateway_command "${GATEWAY_RUNTIME_BIN}" secret delete --ref "${secret_ref}" --yes
+        ;;
+      0) return 0 ;;
+      *) info "Invalid Binding or Secret action." ;;
+    esac
+  done
+}
+
+gateway_route_exit_arguments() {
+  local exit_id
+  GATEWAY_ROUTE_EXIT_ARGS=()
+  exit_id="$(prompt_required "Ordered Exit ID 1")"
+  GATEWAY_ROUTE_EXIT_ARGS+=(--exit-id "${exit_id}")
+  while confirm "Add another ordered Exit ID?"; do
+    exit_id="$(prompt_required "Next ordered Exit ID")"
+    GATEWAY_ROUTE_EXIT_ARGS+=(--exit-id "${exit_id}")
+  done
+}
+
+gateway_route_menu() {
+  local choice route_id display_name host path strategy
+  local -a GATEWAY_ROUTE_EXIT_ARGS=()
+  while true; do
+    cat <<'MENU'
+Manage Routes
+=============
+
+1) List
+2) Add
+3) Edit
+4) Enable
+5) Disable
+6) Delete
+0) Back
+MENU
+    read -r -p "Choose a Route action: " choice
+    case "${choice}" in
+      1) gateway_command "${GATEWAY_BIN}" route list ;;
+      2|3)
+        route_id="$(prompt_required "Route ID")"
+        display_name="$(prompt_required "Display name")"
+        host="$(prompt_required "Exact Host")"
+        path="$(prompt_required "Exact WebSocket Path")"
+        strategy="$(prompt_required "Strategy (active-active or active-passive)")"
+        gateway_route_exit_arguments
+        if [[ "${choice}" == "2" ]]; then
+          gateway_command "${GATEWAY_BIN}" route add --id "${route_id}" \
+            --display-name "${display_name}" --host "${host}" --path "${path}" \
+            --strategy "${strategy}" "${GATEWAY_ROUTE_EXIT_ARGS[@]}"
+        else
+          gateway_command "${GATEWAY_BIN}" route edit --id "${route_id}" \
+            --display-name "${display_name}" --host "${host}" --path "${path}" \
+            --strategy "${strategy}" "${GATEWAY_ROUTE_EXIT_ARGS[@]}"
+        fi
+        ;;
+      4|5)
+        route_id="$(prompt_required "Route ID")"
+        if [[ "${choice}" == "4" ]]; then
+          gateway_command "${GATEWAY_BIN}" route edit --id "${route_id}" --enable
+        else
+          gateway_command "${GATEWAY_BIN}" route edit --id "${route_id}" --disable
+        fi
+        ;;
+      6)
+        route_id="$(prompt_required "Route ID")"
+        confirm "Delete this Route?" && gateway_command "${GATEWAY_BIN}" route delete --id "${route_id}"
+        ;;
+      0) return 0 ;;
+      *) info "Invalid Route action." ;;
+    esac
+    if [[ "${choice}" =~ ^[2-6]$ ]] && confirm "Run read-only NGINX plan now?"; then
+      gateway_command "${GATEWAY_NGINX_BIN}" plan
+    fi
+  done
+}
+
+gateway_gost_runtime_menu() {
+  local choice exit_id
+  while true; do
+    cat <<'MENU'
+Local GOST Exit runtime
+=======================
+
+1) Plan
+2) Apply
+3) Status
+4) Selected Exit status
+5) Selected Exit start
+6) Selected Exit stop
+7) Selected Exit restart
+0) Back
+MENU
+    read -r -p "Choose a local runtime action: " choice
+    case "${choice}" in
+      1) gateway_command "${GATEWAY_RUNTIME_BIN}" runtime plan ;;
+      2) confirm "Apply local GOST Exit runtime?" && gateway_command "${GATEWAY_RUNTIME_BIN}" runtime apply --yes ;;
+      3) gateway_command "${GATEWAY_RUNTIME_BIN}" runtime status ;;
+      4|5|6|7)
+        exit_id="$(prompt_required "Exit ID")"
+        case "${choice}" in
+          4) gateway_command "${GATEWAY_RUNTIME_BIN}" service status --exit-id "${exit_id}" ;;
+          5) gateway_command "${GATEWAY_RUNTIME_BIN}" service start --exit-id "${exit_id}" ;;
+          6) confirm "Stop this Exit service?" && gateway_command "${GATEWAY_RUNTIME_BIN}" service stop --exit-id "${exit_id}" --yes ;;
+          7) confirm "Restart this Exit service and reconnect its sessions?" && gateway_command "${GATEWAY_RUNTIME_BIN}" service restart --exit-id "${exit_id}" --yes ;;
+        esac
+        ;;
+      0) return 0 ;;
+      *) info "Invalid local runtime action." ;;
+    esac
+  done
+}
+
+gateway_nginx_apply() {
+  gateway_command "${GATEWAY_NGINX_BIN}" plan
+  if confirm "Apply this NGINX Gateway plan?"; then
+    info "Existing WebSocket connections should remain on old workers until they close. New connections use the new configuration."
+    info "Stopping the Gateway disconnects active users."
+    gateway_command "${GATEWAY_NGINX_BIN}" apply --yes
+  fi
+}
+
+gateway_nginx_test_status_menu() {
+  local choice
+  while true; do
+    read -r -p "1) NGINX test  2) NGINX status  0) Back: " choice
+    case "${choice}" in
+      1) gateway_command "${GATEWAY_NGINX_BIN}" test ;;
+      2) gateway_command "${GATEWAY_NGINX_BIN}" status ;;
+      0) return 0 ;;
+      *) info "Invalid NGINX test/status action." ;;
+    esac
+  done
+}
+
+gateway_nginx_service_menu() {
+  local choice phrase
+  while true; do
+    read -r -p "1) Status 2) Start 3) Stop 4) Reload 5) Restart 0) Back: " choice
+    case "${choice}" in
+      1) gateway_command "${GATEWAY_NGINX_BIN}" service status ;;
+      2) gateway_command "${GATEWAY_NGINX_BIN}" service start ;;
+      3) confirm "Stop the dedicated NGINX Gateway?" && gateway_command "${GATEWAY_NGINX_BIN}" service stop --yes ;;
+      4) confirm "Gracefully reload the dedicated NGINX Gateway?" && gateway_command "${GATEWAY_NGINX_BIN}" service reload --yes ;;
+      5)
+        read -r -p "Type RESTART NGINX GATEWAY: " phrase
+        if [[ "${phrase}" == "RESTART NGINX GATEWAY" ]]; then
+          gateway_command "${GATEWAY_NGINX_BIN}" service restart --yes --acknowledge-disconnect
+        else
+          info "NGINX Gateway restart cancelled."
+        fi
+        ;;
+      0) return 0 ;;
+      *) info "Invalid NGINX service action." ;;
+    esac
+  done
+}
+
+gateway_nginx_dependency_menu() {
+  local choice
+  while true; do
+    read -r -p "1) Dependency status  2) Install Ubuntu nginx package  0) Back: " choice
+    case "${choice}" in
+      1) gateway_command "${GATEWAY_NGINX_BIN}" dependency status ;;
+      2)
+        info "This installs Ubuntu nginx but GOST Manager does not use or overwrite /etc/nginx."
+        confirm "Install the nginx package?" && gateway_command "${GATEWAY_NGINX_BIN}" dependency install --yes
+        ;;
+      0) return 0 ;;
+      *) info "Invalid dependency action." ;;
+    esac
+  done
+}
+
+show_nginx_gateway_menu() {
+  cat <<'MENU'
+NGINX Gateway Mode
+==================
+
+1) Gateway overview
+2) Initialize Gateway state
+3) Gateway listener and Host settings
+4) Manage Exits
+5) Manage local Bindings and Secrets
+6) Manage Routes
+7) Local GOST Exit runtime
+8) NGINX plan
+9) Apply NGINX Gateway
+10) NGINX test/status
+11) NGINX service control
+12) NGINX dependency status/install
+0) Back
+MENU
+}
+
+nginx_gateway_menu() {
+  local choice
+  while true; do
+    show_nginx_gateway_menu
+    read -r -p "Choose an NGINX Gateway option: " choice
+    case "${choice}" in
+      1) gateway_overview ;;
+      2) gateway_initialize ;;
+      3) gateway_settings_menu ;;
+      4) gateway_exit_menu ;;
+      5) gateway_binding_secret_menu ;;
+      6) gateway_route_menu ;;
+      7) gateway_gost_runtime_menu ;;
+      8) gateway_command "${GATEWAY_NGINX_BIN}" plan ;;
+      9) gateway_nginx_apply ;;
+      10) gateway_nginx_test_status_menu ;;
+      11) gateway_nginx_service_menu ;;
+      12) gateway_nginx_dependency_menu ;;
+      0) return 0 ;;
+      *) info "Invalid NGINX Gateway option." ;;
+    esac
+    printf '\n'
+  done
+}
+
 native_gost_gateway_coming_soon() {
   info "Native GOST Gateway: Coming soon."
 }
@@ -1479,7 +1902,8 @@ GOST Manager
 8) List active GOST services
 9) Clean old/broken GOST configs
 10) Monitoring
-11) Native GOST Gateway (Coming soon)
+11) NGINX Gateway Mode
+12) Native GOST Gateway (Coming soon)
 0) Exit
 MENU
 }
@@ -1500,7 +1924,8 @@ main_menu() {
       8) list_active_gost_services ;;
       9) clean_old_broken_configs ;;
       10) monitoring_menu ;;
-      11) native_gost_gateway_coming_soon ;;
+      11) nginx_gateway_menu ;;
+      12) native_gost_gateway_coming_soon ;;
       0) exit 0 ;;
       *) info "Invalid option." ;;
     esac

@@ -201,7 +201,7 @@ case "${action}" in
         rm -f "${STUB_STATE_DIR}/active"
       fi
     fi
-    if [[ "${unit}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ ]] && gateway_listed "${unit}"; then
+    if [[ ( "${unit}" =~ ^gost-gateway-exit-[a-z][a-z0-9-]{0,62}\.service$ || "${unit}" == "gost-nginx-gateway.service" ) ]] && gateway_listed "${unit}"; then
       touch "${STUB_STATE_DIR}/gateway-removed-${unit}"
     fi
     ;;

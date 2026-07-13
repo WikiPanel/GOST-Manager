@@ -48,8 +48,10 @@ create_fixture() {
     "${root}/etc/systemd/system" \
     "${root}/etc/gost-manager/secrets" \
     "${root}/etc/gost-manager/generated/gateway/exits" \
+    "${root}/etc/gost-manager/generated/gateway/nginx" \
     "${root}/etc/gost-manager/backups/gateway" \
     "${root}/etc/gost-manager/backups/gateway-runtime" \
+    "${root}/etc/gost-manager/backups/nginx-gateway" \
     "${root}/etc/gost" \
     "${root}/var/lib/gost-manager"
   printf 'manager\n' > "${root}/usr/local/sbin/gost-manager"
@@ -61,7 +63,9 @@ create_fixture() {
   cp -R "${ROOT_DIR}/gateway/." "${root}/usr/local/lib/gost-manager/gateway/"
   printf 'gateway-cli\n' > "${root}/usr/local/sbin/gost-gateway"
   printf 'gateway-runtime\n' > "${root}/usr/local/sbin/gost-gateway-runtime"
+  printf 'gateway-nginx\n' > "${root}/usr/local/sbin/gost-gateway-nginx"
   printf 'gateway-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-gateway-exit.sh"
+  printf 'nginx-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh"
   printf 'iran-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-iran.sh"
   printf 'kharej-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-kharej.sh"
   printf 'gost\n' > "${root}/usr/local/bin/gost"
@@ -132,6 +136,7 @@ run_plan() {
         traffic) REMOVE_TRAFFIC=1 ;;
         credentials) REMOVE_CREDENTIALS=1 ;;
         binary) REMOVE_GOST_BINARY=1 ;;
+        nginx-gateway) REMOVE_NGINX_GATEWAY=1 ;;
         gateway-runtime) REMOVE_GATEWAY_RUNTIME=1 ;;
         gateway-state) REMOVE_GATEWAY_STATE=1 ;;
         gateway-secrets) REMOVE_GATEWAY_SECRETS=1 ;;
@@ -154,6 +159,57 @@ printf 'n\nn\nn\nn\nn\nn\nn\nn\n' | \
   bash "${ROOT_DIR}/uninstall.sh" >/dev/null
 assert_eq "cancel everything changes nothing" "${cancel_before}" "$(tree_digest "${cancel_root}")"
 assert_eq "cancel everything calls no commands" "0" "$(wc -l < "${COMMAND_LOG}" | tr -d ' ')"
+
+nginx_gateway_root="${TEST_HOME}/nginx-gateway"
+create_fixture "${nginx_gateway_root}"
+mkdir -p "${nginx_gateway_root}/etc/nginx" "${nginx_gateway_root}/usr/sbin"
+printf 'unmanaged nginx\n' > "${nginx_gateway_root}/etc/nginx/nginx.conf"
+printf 'binary\n' > "${nginx_gateway_root}/usr/sbin/nginx"
+printf '[Unit]\nDescription=managed nginx gateway\n' > "${nginx_gateway_root}/etc/systemd/system/gost-nginx-gateway.service"
+printf 'managed config\n' > "${nginx_gateway_root}/etc/gost-manager/generated/gateway/nginx/nginx.conf"
+printf 'managed manifest\n' > "${nginx_gateway_root}/etc/gost-manager/generated/gateway/nginx/runtime.json"
+printf 'backup\n' > "${nginx_gateway_root}/etc/gost-manager/backups/nginx-gateway/snapshot"
+export STUB_GATEWAY_LOADED_SERVICES=gost-nginx-gateway.service
+export STUB_GATEWAY_ENABLED_SERVICES=gost-nginx-gateway.service
+export STUB_GATEWAY_ACTIVE_SERVICES=gost-nginx-gateway.service
+export STUB_GATEWAY_LIST_PREFIX=$'\342\227\217 '
+run_plan "${nginx_gateway_root}" nginx-gateway >/dev/null
+assert_absent "NGINX-only removal removes exact dedicated unit" "${nginx_gateway_root}/etc/systemd/system/gost-nginx-gateway.service"
+assert_absent "NGINX-only removal removes managed config" "${nginx_gateway_root}/etc/gost-manager/generated/gateway/nginx/nginx.conf"
+assert_absent "NGINX-only removal removes managed manifest" "${nginx_gateway_root}/etc/gost-manager/generated/gateway/nginx/runtime.json"
+assert_absent "NGINX-only removal removes managed backups" "${nginx_gateway_root}/etc/gost-manager/backups/nginx-gateway"
+assert_file "NGINX-only removal keeps package binary" "${nginx_gateway_root}/usr/sbin/nginx"
+assert_file "NGINX-only removal keeps /etc/nginx" "${nginx_gateway_root}/etc/nginx/nginx.conf"
+assert_file "NGINX-only removal keeps desired state" "${nginx_gateway_root}/etc/gost-manager/state.json"
+assert_file "NGINX-only removal keeps GOST Exit" "${nginx_gateway_root}/etc/systemd/system/gost-gateway-exit-ee-primary.service"
+assert_file "NGINX-only removal keeps monitoring" "${nginx_gateway_root}/etc/systemd/system/gost-monitor-collector.service"
+assert_not_contains "NGINX-only removal never targets distro service" "nginx.service" "${COMMAND_LOG}"
+unset STUB_GATEWAY_LOADED_SERVICES STUB_GATEWAY_ENABLED_SERVICES STUB_GATEWAY_ACTIVE_SERVICES STUB_GATEWAY_LIST_PREFIX
+
+nginx_failure_root="${TEST_HOME}/nginx-gateway-failure"
+create_fixture "${nginx_failure_root}"
+printf '[Unit]\nDescription=managed nginx gateway\n' > "${nginx_failure_root}/etc/systemd/system/gost-nginx-gateway.service"
+printf 'managed config\n' > "${nginx_failure_root}/etc/gost-manager/generated/gateway/nginx/nginx.conf"
+printf 'managed manifest\n' > "${nginx_failure_root}/etc/gost-manager/generated/gateway/nginx/runtime.json"
+printf 'backup\n' > "${nginx_failure_root}/etc/gost-manager/backups/nginx-gateway/snapshot"
+export STUB_GATEWAY_LOADED_SERVICES=gost-nginx-gateway.service
+export STUB_GATEWAY_ENABLED_SERVICES=gost-nginx-gateway.service
+export STUB_GATEWAY_ACTIVE_SERVICES=gost-nginx-gateway.service
+export STUB_FAIL_SYSTEMCTL_ACTION=disable
+export STUB_FAIL_SYSTEMCTL_UNIT=gost-nginx-gateway.service
+if run_plan "${nginx_failure_root}" nginx-gateway gateway-package >/dev/null 2>&1; then
+  fail "NGINX service removal failure returns non-zero"
+else
+  pass "NGINX service removal failure returns non-zero"
+fi
+assert_file "NGINX failure preserves unit" "${nginx_failure_root}/etc/systemd/system/gost-nginx-gateway.service"
+assert_file "NGINX failure preserves config" "${nginx_failure_root}/etc/gost-manager/generated/gateway/nginx/nginx.conf"
+assert_file "NGINX failure preserves manifest" "${nginx_failure_root}/etc/gost-manager/generated/gateway/nginx/runtime.json"
+assert_file "NGINX failure preserves backup" "${nginx_failure_root}/etc/gost-manager/backups/nginx-gateway/snapshot"
+assert_file "NGINX failure preserves runner" "${nginx_failure_root}/usr/local/lib/gost-manager/gost-run-nginx-gateway.sh"
+assert_file "NGINX failure preserves CLI" "${nginx_failure_root}/usr/local/sbin/gost-gateway-nginx"
+assert_file "NGINX failure preserves gateway package" "${nginx_failure_root}/usr/local/lib/gost-manager/gateway/__init__.py"
+unset STUB_GATEWAY_LOADED_SERVICES STUB_GATEWAY_ENABLED_SERVICES STUB_GATEWAY_ACTIVE_SERVICES STUB_FAIL_SYSTEMCTL_ACTION STUB_FAIL_SYSTEMCTL_UNIT
 
 gateway_runtime_root="${TEST_HOME}/gateway-runtime"
 create_fixture "${gateway_runtime_root}"
