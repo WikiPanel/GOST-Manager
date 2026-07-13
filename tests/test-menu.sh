@@ -77,6 +77,20 @@ assert_not_contains "main menu has no option 11" "11)" "${menu_file}"
 assert_not_contains "main menu has no option 12" "12)" "${menu_file}"
 assert_not_contains "Native Gateway placeholder removed" "Coming soon" "${menu_file}"
 
+profile_menu_file="${TEST_HOME}/profile-menu.txt"
+show_direct_profiles_menu > "${profile_menu_file}"
+for label in \
+  "1) List all profiles" \
+  "2) Show profile detail" \
+  "3) Edit a profile" \
+  "4) Clone a profile" \
+  "5) Restart selected profiles" \
+  "6) Restart all profiles" \
+  "0) Back"; do
+  assert_contains "Direct profile menu ${label%%)*}" "${label}" "${profile_menu_file}"
+done
+assert_not_contains "Direct profile menu has no Gateway action" "Gateway" "${profile_menu_file}"
+
 : > "${COMMAND_LOG}"
 export STUB_MONITOR_EXIT=3
 failure_output="${TEST_HOME}/failure.out"

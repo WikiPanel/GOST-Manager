@@ -4,7 +4,7 @@ GOST Manager is a menu-based Bash project for installing GOST v3 and managing nu
 
 Direct Mode is the only supported traffic mode in v0.2. The project installs the official `go-gost/gost` release artifact unchanged; GOST Manager is only an installer, configuration, and service wrapper and does not alter upstream protocol behavior. Multiple independent Iran and Kharej profiles are supported.
 
-NGINX Gateway and Native GOST Gateway are cancelled. There is no placeholder, hidden command, route runtime, or NGINX dependency. Issue #29 is reserved for improving multi-server Direct Mode profile management.
+NGINX Gateway and Native GOST Gateway are cancelled. There is no placeholder, hidden command, route runtime, controller, failover layer, or NGINX dependency. Direct Mode profile management supports safe create, inspect, edit, clone, restart, and delete operations without changing the independent-process traffic architecture.
 
 ## Supported OS
 
@@ -71,12 +71,13 @@ On the Kharej server, choose:
 Example inputs:
 
 ```text
-Tunnel number: 1
+Kharej profile number [1]:
+Profile label (optional): kharej-edge
 SOCKS listen port: 28420
 GOST username: maya
-GOST password: leave empty to generate
-Iran IP allowed: YOUR_IRAN_SERVER_IP
-Apply iptables firewall rule? yes
+GOST password: [hidden and confirmed]
+Allowed Iran IPv4/CIDRs: 198.51.100.10,198.51.100.11/32
+Apply profile-scoped iptables firewall rules? yes
 ```
 
 This creates:
@@ -99,11 +100,12 @@ On the Iran server, choose:
 Example inputs:
 
 ```text
-Tunnel number: 1
-Kharej IP: YOUR_KHAREJ_SERVER_IP
+Iran profile number [1]:
+Profile label (optional): iran-edge
+Kharej IP: 203.0.113.20
 Kharej SOCKS port: 28420
 GOST username: maya
-GOST password: value_from_kharej
+GOST password: [hidden matching value]
 Port mappings: 2052:2052
 ```
 
@@ -169,6 +171,25 @@ Select tunnel number:
 ```
 
 Each numbered tunnel is independent. Deleting `iran-2` does not affect `iran-1`; deleting `kharej-2` does not affect `kharej-1`.
+
+Option `8` first renders every discovered profile and then opens:
+
+```text
+Direct Mode profiles
+====================
+
+1) List all profiles
+2) Show profile detail
+3) Edit a profile
+4) Clone a profile
+5) Restart selected profiles
+6) Restart all profiles
+0) Back
+```
+
+Iran and Kharej use independent positive-number spaces. Creation and clone suggest the first gap found across both env and unit files, so an orphaned file is never overwritten. `PROFILE_LABEL` is optional display metadata; the stable identity, filename, and service remain `side-number`. Existing unlabeled profiles remain valid.
+
+Create, edit, and clone validate configured local ports across both sides and take one live `ss` snapshot before activating a new port. Edit preserves unknown well-formed env keys and existing credentials unless explicitly replaced, shows a redacted diff, and performs no write or restart for a no-op. Clone never changes its source. Selected restart accepts exact comma-separated IDs, deduplicates them, and never uses a wildcard service command.
 
 ## Local Monitoring
 
@@ -246,7 +267,7 @@ If installer service-state rollback cannot be verified, it retains collision-res
 
 ## Firewall Notes
 
-The Kharej SOCKS5 listener must not be public. Enable the optional firewall rule so only the Iran server IP can reach the SOCKS port.
+The Kharej SOCKS5 listener must not be public. Enable the optional firewall rule so only the configured Iran IPv4 sources can reach the SOCKS port. New profiles use `ALLOWED_IRAN_SOURCES` with up to 64 canonical IPv4 `/8` through `/32` networks; plain addresses become `/32`. Legacy `IRAN_IP` profiles remain valid and are not rewritten during listing or upgrade.
 
 The manager uses iptables comments:
 
@@ -255,14 +276,16 @@ gost-manager:kharej-<number>:allow
 gost-manager:kharej-<number>:drop
 ```
 
-These comments let deletion remove only the matching managed rules.
+Each canonical source receives one ACCEPT rule before the profile's final DROP rule. These comments let edit, rollback, and deletion mutate only the matching profile rules; unrelated rules and other profiles remain untouched.
 
 Warning: iptables rules are not persistent by default. They may be lost after reboot unless saved with `netfilter-persistent` or your server firewall system.
 
 ## Security Notes
 
 - Real passwords belong only in `/etc/gost/*.env`.
+- Password input is hidden and confirmed; list, detail, status, summaries, and failures never print credentials.
 - Env files are installed with permission `600`.
+- Env replacement uses a private same-directory temporary file and atomic replacement; unit files remain `0644`.
 - `/etc/gost` is installed with permission `700`.
 - Do not commit real passwords, production IPs, tokens, or private credentials.
 - The manager does not use `eval`.
@@ -270,7 +293,7 @@ Warning: iptables rules are not persistent by default. They may be lost after re
 
 ## Troubleshooting
 
-- If an Iran tunnel cannot be created because a port is busy, the manager prints the `ss -lntp` owner for each busy port and does not create files.
+- If a local port is configured by another profile or occupied live, the manager prints a bounded profile/PID ownership summary and does not create files. Unknown ownership is treated as a conflict.
 - If a systemd service fails, use menu option `5` for status and option `6` for logs.
 - If a tunnel was partially removed, use menu option `9` to find managed orphan env files, service files, failed services, and old backups.
 - If GOST install fails, verify outbound HTTPS access to `github.com` and `api.github.com`.

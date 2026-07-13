@@ -7,8 +7,20 @@
 - Removed the unreleased Gateway desired-state/runtime packages, launchers,
   runner, tests, installer/uninstaller integration, menu placeholder, and
   Gateway-only documentation.
-- Cancelled NGINX Gateway and Native GOST Gateway; Issue #29 is reserved for a
-  separate multi-server Direct Mode profile-management improvement.
+- Added independent multi-server Direct Mode profile management with numeric
+  gap allocation, optional labels, safe list/detail/edit/clone workflows,
+  exact selected/all restart actions, global configured/live port checks, and
+  profile-isolated rollback.
+- Added canonical `ALLOWED_IRAN_SOURCES` support while retaining legacy
+  `IRAN_IP`, ordered profile-scoped firewall rules, exact firewall rollback,
+  hidden confirmed password input, strict non-executable env parsing, and
+  atomic same-directory env/unit writes.
+- Extended schema-version-4 Monitoring Lite entity metadata with stable
+  profile number, optional label, and safe canonical allowed-source metadata;
+  existing history and unlabeled profiles remain compatible.
+- Cancelled NGINX Gateway and Native GOST Gateway; no controller, failover,
+  connection migration, shared traffic process, or GOST source change was
+  introduced.
 - Removed NGINX discovery, current entities, rendering, health rules, fixtures,
   and capacity assumptions from Monitoring Lite while preserving generic
   multi-process collection.

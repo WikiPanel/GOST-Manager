@@ -195,13 +195,16 @@ def render_snapshot_plain(
         prefix = ("tunnel", tunnel)
         metadata = entity_meta.get(tunnel, {})
         service = metadata.get("service", "unavailable") if isinstance(metadata, dict) else "unavailable"
+        label = metadata.get("profile_label", tunnel) if isinstance(metadata, dict) else tunnel
+        source_count = metadata.get("allowed_source_count", 0) if isinstance(metadata, dict) else 0
         lines.append(
-            f"{tunnel}: {result['status']} service={service} "
+            f"{tunnel}: {result['status']} label={label} service={service} "
             f"listeners={_value(metrics.get(prefix + ('observed_listener_count',)))}/"
             f"{_value(metrics.get(prefix + ('configured_listener_count',)))} "
             f"ownership={_value(metrics.get(prefix + ('listener_ownership_exact',)))} "
             f"remote={_value(metrics.get(prefix + ('remote_endpoint',)))} "
             f"remote_sockets={_value(metrics.get(prefix + ('established_remote_sockets',)))} "
+            f"allowed_sources={source_count} "
             f"cpu={_value(metrics.get(prefix + ('process_cpu_percent',)))} "
             f"rss={_value(metrics.get(prefix + ('process_rss_bytes',)))} "
             f"fds={_value(metrics.get(prefix + ('process_open_fds',)))} "
@@ -340,12 +343,15 @@ def render_live_plain(
             if isinstance(metadata, dict)
             else "unavailable"
         )
+        label = metadata.get("profile_label", tunnel) if isinstance(metadata, dict) else tunnel
+        source_count = metadata.get("allowed_source_count", 0) if isinstance(metadata, dict) else 0
         lines.append(
-            f"{tunnel}: service={service} "
+            f"{tunnel}: label={label} service={service} "
             f"ownership={_value(metrics.get(prefix + ('listener_ownership_exact',)))} "
             f"listeners={_value(metrics.get(prefix + ('observed_listener_count',)))}/"
             f"{_value(metrics.get(prefix + ('configured_listener_count',)))} "
             f"remote_established={_value(metrics.get(prefix + ('established_remote_sockets',)))} "
+            f"allowed_sources={source_count} "
             f"cpu={_value(metrics.get(prefix + ('process_cpu_percent',)))} "
             f"rss={_value(metrics.get(prefix + ('process_rss_bytes',)))} "
             f"fds={_value(metrics.get(prefix + ('process_open_fds',)))} "

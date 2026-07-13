@@ -4,8 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - feat/monitoring-integration
-      - feat/direct-mode-scope-reset
+      - feat/direct-mode-multi-server
 
 permissions:
   contents: read

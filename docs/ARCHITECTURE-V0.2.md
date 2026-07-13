@@ -16,8 +16,9 @@ The supported product consists of:
 - optional local Monitoring Lite;
 - safe, component-aware uninstall.
 
-Issue #29 is reserved for improving multi-server Direct Mode profile
-management. It is not part of this architecture reset.
+Multi-server management is implemented as operations on independent Direct
+Mode profiles. It does not add a shared process, controller, synchronization,
+failover, or connection-migration layer.
 
 ## Traffic path
 
@@ -73,6 +74,18 @@ GOST protocol behavior is not changed by this project.
 Options 1 through 10 retain their established labels and behavior. There is no
 option 11, option 12, or native-gateway placeholder.
 
+Option 8 renders all profiles and opens a profile submenu for list, detail,
+edit, clone, restart-selected, and restart-all. Identity is the immutable pair
+`side + positive integer`; optional `PROFILE_LABEL` metadata never changes the
+env path, unit, process, or connectivity. Iran and Kharej have independent
+number spaces and the allocator treats either an env or unit as occupied.
+
+Every profile remains one official GOST process. Local listener ports are
+unique across both sides. Candidate changes are validated against configured
+profiles and one live socket snapshot. Env files are parsed as strict data,
+never sourced, and are atomically replaced from private same-directory files.
+Passwords are hidden and retained unless explicitly replaced.
+
 ## Monitoring boundary
 
 Monitoring Lite is local, optional, and outside the traffic path. It observes:
@@ -124,6 +137,11 @@ the official GOST binary.
 - Surviving Direct Mode units preserve both runners, /etc/gost, and the GOST
   binary.
 - Unmanaged systemd units, firewall rules, and host services remain untouched.
+- Create and clone rollback only the new identity. Edit restores exact prior
+  env bytes, mode, profile-scoped firewall rules, and service state on failure.
+- Delete preserves env, unit, and firewall whenever exact stop/disable fails.
+- Kharej firewall rules use one ACCEPT per canonical allowed source followed
+  by one exact profile DROP; rollback preserves rule order and other profiles.
 
 ## Security
 

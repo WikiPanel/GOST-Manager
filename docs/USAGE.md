@@ -50,7 +50,11 @@ The service starts a SOCKS5 listener:
 0.0.0.0:<TUNNEL_PORT>
 ```
 
-Enable the firewall option unless another firewall already limits the port to the Iran server IP.
+The manager suggests the first free Kharej number, accepts an optional safe
+label, requires a hidden confirmed password, and accepts one to 64 comma-
+separated IPv4/CIDR sources. New candidates store canonical sources in
+`ALLOWED_IRAN_SOURCES`; legacy `IRAN_IP` remains supported. Enable the
+profile-scoped firewall unless another firewall already limits the port.
 
 ## 3) Create Iran tunnel
 
@@ -74,19 +78,26 @@ Examples:
 80:80,8080:8080,8880:8880
 ```
 
-`Port mappings` is required. Before writing files, the manager rejects empty mappings, invalid formats, non-numeric ports, ports outside `1..65535`, duplicate Iran listen ports, and busy listen ports.
+`Port mappings` is required. The first free Iran number is suggested and an
+optional label may be supplied. Before writing files, the manager rejects
+empty mappings, invalid formats, non-numeric ports, ports outside `1..65535`,
+duplicate Iran listen ports, cross-profile configured conflicts, and busy live
+listeners. Password input is hidden and confirmed.
 
-If a listen port is busy, the manager prints the owning process from `ss -lntp` and aborts without writing env or service files.
+If a listen port is busy, the manager prints a bounded ownership summary from
+one `ss -H -lntp` snapshot and aborts without writing env or service files.
 
 ## 4) Delete tunnel
 
 Shows a numbered list of existing managed tunnels, including broken or orphaned service/env pairs. Select one item from the list; you do not type `iran` or `kharej` manually.
 
-After confirmation, the manager stops and disables only the selected numbered service, removes its env and service file, reloads systemd, and removes matching Kharej firewall rules by comment.
+After confirmation, the manager stops and disables only the selected numbered service. A stop/disable failure preserves its env, unit, and firewall. Firewall rules are removed only after a successful stop; exact files are then removed and systemd is reloaded only when the unit changed.
 
 ## 5) Show status
 
-Shows the same numbered tunnel selector, then runs `systemctl status` for the selected tunnel and prints related listening ports from `ss` when possible.
+Shows the same numbered tunnel selector, then prints only limited non-command
+properties from `systemctl show` and the selected profile's listeners from one
+bounded socket snapshot. Raw command lines and credentials are not displayed.
 
 ## 6) Show logs
 
@@ -94,11 +105,24 @@ Shows the numbered tunnel selector, then runs `journalctl -u <service> -n 100 --
 
 ## 7) Restart tunnel
 
-Shows the numbered tunnel selector, restarts the selected service, and prints a short status view.
+Shows the numbered tunnel selector, restarts the selected service, and prints
+the same credential-safe status properties.
 
 ## 8) List active GOST services
 
-Shows systemd units matching `gost-*` and summarizes managed env files in `/etc/gost`.
+Shows one numeric, deterministic row per Iran then Kharej profile, including
+label fallback, exact service state, local ports, safe endpoint/source count,
+firewall state, env/unit presence, and established socket count. Socket count
+is `unknown`, never an invented zero, when ownership cannot be proven. One
+bounded socket snapshot serves the complete list.
+
+It then opens the Direct Mode profile submenu with list, detail, edit, clone,
+restart-selected, and restart-all actions. Profile identity is immutable.
+Edit preserves credentials and unknown well-formed env keys, uses a redacted
+diff and rollback, and reports `restart required` when restart is declined.
+Clone creates a new same-side number and never changes its source. Restart
+selection accepts exact IDs such as `iran-1,iran-3,kharej-2`; wildcard service
+commands are never used.
 
 ## 9) Clean old/broken GOST configs
 

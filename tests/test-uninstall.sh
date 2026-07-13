@@ -57,6 +57,7 @@ create_fixture() {
   printf '[Unit]\nDescription=managed\n' > "${root}/etc/systemd/system/gost-iran-1.service"
   printf '[Unit]\nDescription=unmanaged\n' > "${root}/etc/systemd/system/custom-gost.service"
   printf 'MAPPINGS=2052:2052\nPASSWORD=uninstall-secret-canary\n' > "${root}/etc/gost/iran-1.env"
+  printf 'TUNNEL_PORT=28420\nALLOWED_IRAN_SOURCES=198.51.100.10/32,198.51.100.11/32\nPROFILE_LABEL=uninstall-kharej\nPASSWORD=uninstall-kharej-canary\n' > "${root}/etc/gost/kharej-2.env"
   cp "${ROOT_DIR}/packaging/monitoring.env" "${root}/etc/gost-manager/monitoring.env"
   PYTHONPATH="${ROOT_DIR}" python3 -m monitoring.admin_cli --policy generic \
     migrate --db "${root}/var/lib/gost-manager/metrics.sqlite3" >/dev/null
@@ -147,6 +148,7 @@ assert_file "monitor-only retains history" "${monitor_root}/var/lib/gost-manager
 assert_file "monitor-only retains config" "${monitor_root}/etc/gost-manager/monitoring.env"
 assert_file "monitor-only retains traffic unit" "${monitor_root}/etc/systemd/system/gost-iran-1.service"
 assert_file "monitor-only retains credentials" "${monitor_root}/etc/gost/iran-1.env"
+assert_file "monitor-only retains labelled multi-source profile" "${monitor_root}/etc/gost/kharej-2.env"
 assert_not_contains "monitor-only never stops traffic" "gost-iran-1.service" "${COMMAND_LOG}"
 
 history_root="${TEST_HOME}/history"

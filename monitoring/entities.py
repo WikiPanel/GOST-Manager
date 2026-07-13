@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
-import shlex
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -12,25 +12,24 @@ from monitoring.models import Clock, Event, Tunnel
 DEFAULT_ENV_DIR = "/etc/gost"
 ENV_RE = re.compile(r"^(iran|kharej)-([1-9][0-9]*)\.env$")
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+PROFILE_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,63}$")
 
 
 def parse_env_text(text: str) -> dict[str, str]:
+    if "\x00" in text or "\r" in text:
+        raise ValueError("env contains an invalid control character")
     values: dict[str, str] = {}
     for lineno, raw in enumerate(text.splitlines(), 1):
-        line = raw.strip()
+        line = raw
         if not line or line.startswith("#"):
             continue
-        if "=" not in line:
-            raise ValueError(f"line {lineno}: missing '='")
-        key, raw_value = line.split("=", 1)
-        key = key.strip()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+        if not match:
             raise ValueError(f"line {lineno}: invalid key")
-        try:
-            parts = shlex.split(raw_value, posix=True)
-        except ValueError as exc:
-            raise ValueError(f"line {lineno}: malformed value") from exc
-        values[key] = parts[0] if parts else ""
+        key, value = match.groups()
+        if key in values:
+            raise ValueError(f"line {lineno}: duplicate key")
+        values[key] = value
     return values
 
 
@@ -83,6 +82,45 @@ def safe_remote_endpoint(values: dict[str, str]) -> str | None:
     return f"{host}:{parse_port(port)}"
 
 
+def safe_profile_label(values: dict[str, str]) -> str | None:
+    label = values.get("PROFILE_LABEL", "")
+    if not label:
+        return None
+    if not PROFILE_LABEL_RE.fullmatch(label):
+        raise ValueError("invalid profile label")
+    return label
+
+
+def canonical_allowed_sources(values: dict[str, str]) -> tuple[str, ...]:
+    legacy = values.get("IRAN_IP", "")
+    modern = values.get("ALLOWED_IRAN_SOURCES", "")
+    if legacy and modern:
+        raise ValueError("multiple source styles")
+    raw = modern or legacy
+    if not raw:
+        return ()
+    if any(character.isspace() for character in raw):
+        raise ValueError("ambiguous source whitespace")
+    parts = raw.split(",")
+    if len(parts) > 64 or any(not part for part in parts):
+        raise ValueError("invalid source count")
+    networks: set[ipaddress.IPv4Network] = set()
+    for part in parts:
+        try:
+            network = ipaddress.ip_network(part, strict=False)
+        except ValueError as exc:
+            raise ValueError("invalid Iran source") from exc
+        if not isinstance(network, ipaddress.IPv4Network) or network.prefixlen < 8:
+            raise ValueError("unsafe Iran source")
+        networks.add(network)
+    return tuple(
+        str(network)
+        for network in sorted(
+            networks, key=lambda item: (int(item.network_address), item.prefixlen)
+        )
+    )
+
+
 def tunnel_from_env(
     path: str | Path,
     read_text: Callable[[Path], str] | None = None,
@@ -105,7 +143,9 @@ def tunnel_from_env(
             tuple(listen for listen, _target in mappings),
             tuple(target for _listen, target in mappings),
             safe_remote_endpoint(values),
+            safe_profile_label(values),
         )
+    allowed_sources = canonical_allowed_sources(values)
     return Tunnel(
         side,
         number,
@@ -113,6 +153,9 @@ def tunnel_from_env(
         str(env_path),
         (parse_port(values.get("TUNNEL_PORT", "")),),
         (),
+        None,
+        safe_profile_label(values),
+        allowed_sources,
     )
 
 
@@ -131,7 +174,13 @@ def discover_tunnels(
     tunnels: list[Tunnel] = []
     events: list[Event] = []
     now = int(clock.wall())
-    for path in sorted(candidates):
+    def profile_order(path: Path) -> tuple[int, int, str]:
+        match = ENV_RE.match(path.name)
+        if not match:
+            return (2, 0, path.name)
+        return (0 if match.group(1) == "iran" else 1, int(match.group(2)), path.name)
+
+    for path in sorted(candidates, key=profile_order):
         if not ENV_RE.match(path.name):
             continue
         try:

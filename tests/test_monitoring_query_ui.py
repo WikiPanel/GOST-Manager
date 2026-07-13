@@ -101,7 +101,11 @@ def representative_snapshot():
                 "entity_type": "tunnel",
                 "entity_id": "iran-1",
                 "display_name": "iran-1",
-                "metadata": {"service": "gost-iran-1.service"},
+                "metadata": {
+                    "service": "gost-iran-1.service",
+                    "profile_label": "iran-edge",
+                    "allowed_source_count": 0,
+                },
                 "updated_at": NOW,
             }
         ],

@@ -563,14 +563,23 @@ def insert_event(conn: sqlite3.Connection, event: Event) -> None:
 
 
 def upsert_tunnel(conn: sqlite3.Connection, tunnel: Tunnel, now: int) -> None:
-    metadata: dict[str, object] = {"service": tunnel.service_name}
+    metadata: dict[str, object] = {
+        "service": tunnel.service_name,
+        "side": tunnel.side,
+        "profile_number": tunnel.number,
+        "allowed_source_count": len(tunnel.allowed_sources),
+    }
     if tunnel.remote_endpoint:
         metadata["remote_endpoint"] = tunnel.remote_endpoint
+    if tunnel.profile_label:
+        metadata["profile_label"] = tunnel.profile_label
+    if tunnel.allowed_sources:
+        metadata["allowed_sources"] = list(tunnel.allowed_sources)
     entity_pk = ensure_entity(
         conn,
         "tunnel",
         tunnel.tunnel_id,
-        tunnel.service_name,
+        tunnel.profile_label or tunnel.tunnel_id,
         metadata,
         now,
     )

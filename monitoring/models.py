@@ -19,6 +19,8 @@ class Tunnel:
     listen_ports: tuple[int, ...]
     target_ports: tuple[int, ...]
     remote_endpoint: str | None = None
+    profile_label: str | None = None
+    allowed_sources: tuple[str, ...] = ()
 
     @property
     def tunnel_id(self) -> str:

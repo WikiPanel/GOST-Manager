@@ -3,9 +3,10 @@
 ## Product boundary
 
 Work in this repository targets official upstream GOST Direct Mode and local
-Monitoring Lite. NGINX Gateway and Native GOST Gateway are cancelled. Issue
-#29 is reserved for a separate multi-server Direct Mode profile-management
-change.
+Monitoring Lite. NGINX Gateway and Native GOST Gateway are cancelled.
+Multi-server management means independent numbered Direct Mode profiles only;
+it must not introduce a controller, shared process, failover, or connection
+migration.
 
 ## Roles
 
@@ -49,6 +50,8 @@ metrics, events, or Git history.
 7. Monitoring quality labels and units are accurate.
 8. No vendored or modified GOST source/artifact exists.
 9. Documentation includes operator validation and rollback.
+10. Profile operations prove exact-service isolation, credential redaction,
+    global/local live-port safety, and profile-scoped firewall rollback.
 
 ## Server acceptance
 

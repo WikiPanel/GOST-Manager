@@ -16,12 +16,23 @@ MONITOR_COLLECTOR_BIN="/usr/local/sbin/gost-monitor-collector"
 MONITOR_ADMIN_BIN="/usr/local/sbin/gost-monitor-admin"
 
 if [[ "${GOST_MANAGER_TESTING:-0}" == "1" ]]; then
+  GOST_BIN="${GOST_BIN_TEST:-${GOST_BIN}}"
+  LIB_DIR="${GOST_LIB_DIR_TEST:-${LIB_DIR}}"
+  RUNNER_IRAN="${GOST_RUNNER_IRAN_TEST:-${LIB_DIR}/gost-run-iran.sh}"
+  RUNNER_KHAREJ="${GOST_RUNNER_KHAREJ_TEST:-${LIB_DIR}/gost-run-kharej.sh}"
+  GOST_ETC_DIR="${GOST_ETC_DIR_TEST:-${GOST_ETC_DIR}}"
+  SYSTEMD_DIR="${GOST_SYSTEMD_DIR_TEST:-${SYSTEMD_DIR}}"
   MONITOR_CONFIG="${GOST_MONITOR_CONFIG_TEST:-${MONITOR_CONFIG}}"
   MONITOR_EXPORT_DIR="${GOST_MONITOR_EXPORT_DIR_TEST:-${MONITOR_EXPORT_DIR}}"
   MONITOR_BIN="${GOST_MONITOR_BIN_TEST:-${MONITOR_BIN}}"
   MONITOR_COLLECTOR_BIN="${GOST_MONITOR_COLLECTOR_BIN_TEST:-${MONITOR_COLLECTOR_BIN}}"
   MONITOR_ADMIN_BIN="${GOST_MONITOR_ADMIN_BIN_TEST:-${MONITOR_ADMIN_BIN}}"
 fi
+
+MAX_PROFILE_NUMBER=10000
+PROFILE_ENV_KEYS=()
+PROFILE_ENV_VALUES=()
+PROFILE_ENV_PRESERVED_LINES=()
 
 die() {
   printf 'Error: %s\n' "$*" >&2
@@ -216,7 +227,7 @@ parse_tunnel_service_name() {
 parse_tunnel_env_name() {
   local env_file="$1"
   local base
-  base="$(basename "${env_file}")"
+  base="${env_file##*/}"
   if [[ "${base}" =~ ^(iran|kharej)-([1-9][0-9]*)\.env$ ]]; then
     printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
     return 0
@@ -228,6 +239,323 @@ env_get() {
   local key="$1"
   local file="$2"
   awk -F= -v key="${key}" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "${file}" 2>/dev/null || true
+}
+
+profile_id_parts() {
+  local profile_id="$1"
+  if [[ "${profile_id}" =~ ^(iran|kharej)-([1-9][0-9]*)$ ]]; then
+    printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+validate_profile_label() {
+  local value="$1"
+  [[ -z "${value}" || "${value}" =~ ^[A-Za-z0-9][A-Za-z0-9._~-]{0,63}$ ]]
+}
+
+validate_profile_label_or_die() {
+  validate_profile_label "$1" || die "profile label must use 1-64 safe letters, numbers, dot, underscore, tilde, or hyphen."
+}
+
+profile_key_is_known() {
+  local side="$1"
+  local key="$2"
+  case "${side}:${key}" in
+    iran:GOST_USER|iran:GOST_PASS|iran:KHAREJ_IP|iran:TUNNEL_PORT|iran:MAPPINGS|iran:PROFILE_LABEL) return 0 ;;
+    kharej:GOST_USER|kharej:GOST_PASS|kharej:TUNNEL_PORT|kharej:IRAN_IP|kharej:ALLOWED_IRAN_SOURCES|kharej:FIREWALL_ENABLED|kharej:PROFILE_LABEL) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+profile_env_reset() {
+  PROFILE_ENV_KEYS=()
+  PROFILE_ENV_VALUES=()
+  PROFILE_ENV_PRESERVED_LINES=()
+}
+
+profile_env_value() {
+  local wanted="$1"
+  local index
+  for ((index = 0; index < ${#PROFILE_ENV_KEYS[@]}; index++)); do
+    if [[ "${PROFILE_ENV_KEYS[${index}]}" == "${wanted}" ]]; then
+      printf '%s\n' "${PROFILE_ENV_VALUES[${index}]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+profile_env_has_key() {
+  profile_env_value "$1" >/dev/null 2>&1
+}
+
+profile_env_set() {
+  local key="$1"
+  local value="$2"
+  local index
+  for ((index = 0; index < ${#PROFILE_ENV_KEYS[@]}; index++)); do
+    if [[ "${PROFILE_ENV_KEYS[${index}]}" == "${key}" ]]; then
+      PROFILE_ENV_VALUES[index]="${value}"
+      return 0
+    fi
+  done
+  PROFILE_ENV_KEYS+=("${key}")
+  PROFILE_ENV_VALUES+=("${value}")
+}
+
+profile_env_unset() {
+  local wanted="$1"
+  local keys=()
+  local values=()
+  local index
+  for ((index = 0; index < ${#PROFILE_ENV_KEYS[@]}; index++)); do
+    if [[ "${PROFILE_ENV_KEYS[${index}]}" != "${wanted}" ]]; then
+      keys+=("${PROFILE_ENV_KEYS[${index}]}")
+      values+=("${PROFILE_ENV_VALUES[${index}]}")
+    fi
+  done
+  PROFILE_ENV_KEYS=("${keys[@]}")
+  PROFILE_ENV_VALUES=("${values[@]}")
+}
+
+profile_env_load() {
+  local file="$1"
+  local side="$2"
+  local skip_binary_check="${3:-0}"
+  local line key value index
+
+  validate_side "${side}" || return 1
+  [[ -f "${file}" && ! -L "${file}" ]] || return 1
+  if [[ "${skip_binary_check}" != "1" ]]; then
+    python3 -c 'import pathlib,sys; data=pathlib.Path(sys.argv[1]).read_bytes(); sys.exit(1 if len(data) > 131072 or b"\0" in data or b"\r" in data else 0)' "${file}" || return 1
+  fi
+
+  profile_env_reset
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ -z "${line}" || "${line}" == \#* ]]; then
+      continue
+    fi
+    if [[ ! "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      profile_env_reset
+      return 1
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+      profile_env_reset
+      return 1
+    fi
+    if profile_key_is_known "${side}" "${key}"; then
+      for ((index = 0; index < ${#PROFILE_ENV_KEYS[@]}; index++)); do
+        if [[ "${PROFILE_ENV_KEYS[${index}]}" == "${key}" ]]; then
+          profile_env_reset
+          return 1
+        fi
+      done
+      PROFILE_ENV_KEYS+=("${key}")
+      PROFILE_ENV_VALUES+=("${value}")
+    else
+      PROFILE_ENV_PRESERVED_LINES+=("${line}")
+    fi
+  done < "${file}"
+}
+
+canonicalize_allowed_sources() {
+  local value="$1"
+  python3 -c '
+import ipaddress
+import sys
+
+raw = sys.argv[1]
+if not raw or any(char.isspace() for char in raw):
+    raise SystemExit(1)
+parts = raw.split(",")
+if len(parts) > 64 or any(not part for part in parts):
+    raise SystemExit(1)
+networks = set()
+for part in parts:
+    try:
+        network = ipaddress.ip_network(part, strict=False)
+    except ValueError:
+        raise SystemExit(1)
+    if network.version != 4 or network.prefixlen < 8:
+        raise SystemExit(1)
+    networks.add(network)
+ordered = sorted(networks, key=lambda item: (int(item.network_address), item.prefixlen))
+print(",".join(str(item) for item in ordered))
+' "${value}"
+}
+
+is_valid_ipv4_address() {
+  local value="$1"
+  local octet
+  local octets=()
+  [[ "${value}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS='.' read -r -a octets <<< "${value}"
+  [[ "${#octets[@]}" -eq 4 ]] || return 1
+  for octet in "${octets[@]}"; do
+    [[ "${octet}" == "0" || "${octet}" != 0* ]] || return 1
+    ((10#${octet} <= 255)) || return 1
+  done
+}
+
+validate_allowed_sources_syntax() {
+  local value="$1"
+  local item address prefix
+  local items=()
+  [[ -n "${value}" && "${value}" != *[[:space:]]* ]] || return 1
+  IFS=',' read -r -a items <<< "${value}"
+  [[ "${#items[@]}" -ge 1 && "${#items[@]}" -le 64 ]] || return 1
+  for item in "${items[@]}"; do
+    [[ -n "${item}" ]] || return 1
+    address="${item%%/*}"
+    if [[ "${item}" == */* ]]; then
+      prefix="${item#*/}"
+      [[ "${prefix}" =~ ^[0-9]+$ && "${prefix}" -ge 8 && "${prefix}" -le 32 ]] || return 1
+      [[ "${item}" != */*/* ]] || return 1
+    fi
+    is_valid_ipv4_address "${address}" || return 1
+  done
+}
+
+profile_sources_from_loaded() {
+  local legacy sources
+  legacy="$(profile_env_value IRAN_IP || true)"
+  sources="$(profile_env_value ALLOWED_IRAN_SOURCES || true)"
+  if [[ -n "${legacy}" && -n "${sources}" ]]; then
+    return 1
+  fi
+  if [[ -n "${sources}" ]]; then
+    canonicalize_allowed_sources "${sources}"
+    return $?
+  fi
+  [[ -n "${legacy}" ]] || return 1
+  canonicalize_allowed_sources "${legacy}"
+}
+
+validate_loaded_profile() {
+  local side="$1"
+  local label user password port mappings host firewall sources
+  user="$(profile_env_value GOST_USER || true)"
+  password="$(profile_env_value GOST_PASS || true)"
+  port="$(profile_env_value TUNNEL_PORT || true)"
+  label="$(profile_env_value PROFILE_LABEL || true)"
+
+  validate_token_or_die "GOST username" "${user}"
+  validate_token_or_die "GOST password" "${password}"
+  validate_profile_label_or_die "${label}"
+  validate_port_or_die "${port}"
+
+  if [[ "${side}" == "iran" ]]; then
+    host="$(profile_env_value KHAREJ_IP || true)"
+    mappings="$(profile_env_value MAPPINGS || true)"
+    validate_host_or_die "Kharej IP" "${host}"
+    validate_mappings "${mappings}" || return 1
+    return 0
+  fi
+
+  sources="$(profile_sources_from_loaded)" || die "Kharej profile must contain exactly one valid Iran source field."
+  [[ -n "${sources}" ]] || die "at least one Iran source is required."
+  firewall="$(profile_env_value FIREWALL_ENABLED || true)"
+  [[ "${firewall}" == "0" || "${firewall}" == "1" ]] || die "FIREWALL_ENABLED must be 0 or 1."
+}
+
+loaded_profile_is_valid() {
+  local side="$1"
+  local user password port label host mappings firewall sources
+  user="$(profile_env_value GOST_USER || true)"
+  password="$(profile_env_value GOST_PASS || true)"
+  port="$(profile_env_value TUNNEL_PORT || true)"
+  label="$(profile_env_value PROFILE_LABEL || true)"
+  [[ "${user}" =~ ^[A-Za-z0-9._~-]+$ && "${password}" =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
+  is_valid_port "${port}" || return 1
+  validate_profile_label "${label}" || return 1
+  if [[ "${side}" == "iran" ]]; then
+    host="$(profile_env_value KHAREJ_IP || true)"
+    mappings="$(profile_env_value MAPPINGS || true)"
+    [[ "${host}" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    validate_mappings "${mappings}" 1
+    return $?
+  fi
+  local legacy_sources allowed_sources
+  legacy_sources="$(profile_env_value IRAN_IP || true)"
+  allowed_sources="$(profile_env_value ALLOWED_IRAN_SOURCES || true)"
+  [[ -z "${legacy_sources}" || -z "${allowed_sources}" ]] || return 1
+  sources="${allowed_sources:-${legacy_sources}}"
+  validate_allowed_sources_syntax "${sources}" || return 1
+  firewall="$(profile_env_value FIREWALL_ENABLED || true)"
+  [[ "${firewall}" == "0" || "${firewall}" == "1" ]]
+}
+
+profile_identity_exists() {
+  local side="$1"
+  local number="$2"
+  local env_file="${GOST_ETC_DIR}/${side}-${number}.env"
+  local unit_file="${SYSTEMD_DIR}/gost-${side}-${number}.service"
+  [[ -e "${env_file}" || -L "${env_file}" || -e "${unit_file}" || -L "${unit_file}" ]]
+}
+
+find_invalid_profile_env_files() {
+  local profiles="$1"
+  local output="$2"
+  python3 -c '
+import pathlib
+import sys
+
+invalid = []
+for raw in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    parts = raw.split("|", 4)
+    if len(parts) != 5:
+        continue
+    path = pathlib.Path(parts[4])
+    if not path.is_file() or path.is_symlink():
+        continue
+    try:
+        data = path.read_bytes()
+    except OSError:
+        invalid.append(str(path))
+        continue
+    if len(data) > 131072 or b"\0" in data or b"\r" in data:
+        invalid.append(str(path))
+pathlib.Path(sys.argv[2]).write_text("\n".join(invalid) + ("\n" if invalid else ""))
+' "${profiles}" "${output}"
+}
+
+next_free_profile_number() {
+  local side="$1"
+  local number
+  validate_side "${side}" || return 1
+  for ((number = 1; number <= MAX_PROFILE_NUMBER; number++)); do
+    if ! profile_identity_exists "${side}" "${number}"; then
+      printf '%s\n' "${number}"
+      return 0
+    fi
+  done
+  printf 'Error: no free %s profile number below the safe limit %s.\n' "${side}" "${MAX_PROFILE_NUMBER}" >&2
+  return 1
+}
+
+profile_local_ports_from_loaded() {
+  local side="$1"
+  local mappings pair ports port
+  local pairs=()
+  if [[ "${side}" == "kharej" ]]; then
+    port="$(profile_env_value TUNNEL_PORT || true)"
+    is_valid_port "${port}" || return 1
+    printf '%s\n' "${port}"
+    return 0
+  fi
+  mappings="$(profile_env_value MAPPINGS || true)"
+  validate_mappings "${mappings}" 1 || return 1
+  IFS=',' read -r -a pairs <<< "${mappings}"
+  ports=""
+  for pair in "${pairs[@]}"; do
+    port="${pair%%:*}"
+    ports="${ports}${ports:+,}${port}"
+  done
+  printf '%s\n' "${ports}"
 }
 
 package_for_command() {
@@ -294,26 +622,93 @@ backup_existing_file() {
   fi
 }
 
-confirm_overwrite_file() {
+validate_managed_destination() {
   local path="$1"
-  if [[ -e "${path}" ]]; then
-    confirm "File exists: ${path}. Overwrite it?" || die "aborted by user."
+  local kind="$2"
+  local directory base
+  directory="$(dirname "${path}")"
+  base="$(basename "${path}")"
+  case "${kind}" in
+    env)
+      [[ "${directory}" == "${GOST_ETC_DIR}" && "${base}" =~ ^(iran|kharej)-[1-9][0-9]*\.env$ ]] || return 1
+      ;;
+    unit)
+      [[ "${directory}" == "${SYSTEMD_DIR}" && "${base}" =~ ^gost-(iran|kharej)-[1-9][0-9]*\.service$ ]] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  [[ ! -L "${directory}" && -d "${directory}" ]] || return 1
+  [[ ! -L "${path}" ]] || return 1
+  if [[ -e "${path}" && ! -f "${path}" ]]; then
+    return 1
   fi
+}
+
+fsync_file_or_directory() {
+  local path="$1"
+  python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' "${path}" >/dev/null 2>&1 || true
+}
+
+set_production_owner() {
+  local path="$1"
+  if [[ "${GOST_MANAGER_TESTING:-0}" != "1" ]]; then
+    chown root:root "${path}"
+  fi
+}
+
+profile_env_write_lines() {
+  local side="$1"
+  local output="$2"
+  local key value line
+  local order=()
+  if [[ "${side}" == "iran" ]]; then
+    order=(GOST_USER GOST_PASS KHAREJ_IP TUNNEL_PORT MAPPINGS PROFILE_LABEL)
+  else
+    order=(GOST_USER GOST_PASS TUNNEL_PORT IRAN_IP ALLOWED_IRAN_SOURCES FIREWALL_ENABLED PROFILE_LABEL)
+  fi
+  : > "${output}"
+  for key in "${order[@]}"; do
+    if profile_env_has_key "${key}"; then
+      value="$(profile_env_value "${key}")"
+      printf '%s=%s\n' "${key}" "${value}" >> "${output}"
+    fi
+  done
+  for line in "${PROFILE_ENV_PRESERVED_LINES[@]-}"; do
+    [[ -n "${line}" ]] || continue
+    printf '%s\n' "${line}" >> "${output}"
+  done
+}
+
+write_loaded_profile_env() {
+  local path="$1"
+  local side="$2"
+  local directory base tmp
+  directory="$(dirname "${path}")"
+  base="$(basename "${path}")"
+  validate_managed_destination "${path}" env || return 1
+  tmp="$(mktemp "${directory}/.${base}.tmp.XXXXXX")" || return 1
+  chmod 600 "${tmp}" || { rm -f "${tmp}"; return 1; }
+  set_production_owner "${tmp}" || { rm -f "${tmp}"; return 1; }
+  profile_env_write_lines "${side}" "${tmp}" || { rm -f "${tmp}"; return 1; }
+  chmod 600 "${tmp}" || { rm -f "${tmp}"; return 1; }
+  fsync_file_or_directory "${tmp}"
+  mv -f "${tmp}" "${path}" || { rm -f "${tmp}"; return 1; }
+  fsync_file_or_directory "${directory}"
 }
 
 write_secure_env_file() {
   local path="$1"
+  local identity side
   shift
-  local tmp
-  tmp="$(mktemp)"
-  chmod 600 "${tmp}"
+  identity="$(parse_tunnel_env_name "${path}")" || return 1
+  side="${identity%% *}"
+  profile_env_reset
   while [[ "$#" -gt 0 ]]; do
-    printf '%s=%s\n' "$1" "$2" >> "${tmp}"
+    [[ "$#" -ge 2 ]] || return 1
+    profile_env_set "$1" "$2"
     shift 2
   done
-  backup_existing_file "${path}"
-  install -m 600 -o root -g root "${tmp}" "${path}"
-  rm -f "${tmp}"
+  write_loaded_profile_env "${path}" "${side}"
 }
 
 write_service_file() {
@@ -322,7 +717,13 @@ write_service_file() {
   local env_file="$3"
   local runner="$4"
   local tmp
-  tmp="$(mktemp)"
+  local directory base
+  directory="$(dirname "${path}")"
+  base="$(basename "${path}")"
+  validate_managed_destination "${path}" unit || return 1
+  tmp="$(mktemp "${directory}/.${base}.tmp.XXXXXX")" || return 1
+  chmod 644 "${tmp}" || { rm -f "${tmp}"; return 1; }
+  set_production_owner "${tmp}" || { rm -f "${tmp}"; return 1; }
   cat > "${tmp}" <<SERVICE_EOF
 [Unit]
 Description=${description}
@@ -340,9 +741,40 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 SERVICE_EOF
-  backup_existing_file "${path}"
-  install -m 644 -o root -g root "${tmp}" "${path}"
-  rm -f "${tmp}"
+  chmod 644 "${tmp}" || { rm -f "${tmp}"; return 1; }
+  fsync_file_or_directory "${tmp}"
+  mv -f "${tmp}" "${path}" || { rm -f "${tmp}"; return 1; }
+  fsync_file_or_directory "${directory}"
+}
+
+snapshot_managed_file() {
+  local path="$1"
+  local directory base snapshot
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  directory="$(dirname "${path}")"
+  base="$(basename "${path}")"
+  snapshot="$(mktemp "${directory}/.${base}.rollback.XXXXXX")" || return 1
+  chmod 600 "${snapshot}" || { rm -f "${snapshot}"; return 1; }
+  cp -p "${path}" "${snapshot}" || { rm -f "${snapshot}"; return 1; }
+  printf '%s\n' "${snapshot}"
+}
+
+restore_managed_snapshot() {
+  local snapshot="$1"
+  local destination="$2"
+  local kind="$3"
+  local directory base tmp
+  [[ -f "${snapshot}" && ! -L "${snapshot}" ]] || return 1
+  validate_managed_destination "${destination}" "${kind}" || return 1
+  directory="$(dirname "${destination}")"
+  base="$(basename "${destination}")"
+  tmp="$(mktemp "${directory}/.${base}.restore.XXXXXX")" || return 1
+  cp -p "${snapshot}" "${tmp}" || { rm -f "${tmp}"; return 1; }
+  set_production_owner "${tmp}" || { rm -f "${tmp}"; return 1; }
+  fsync_file_or_directory "${tmp}"
+  mv -f "${tmp}" "${destination}" || { rm -f "${tmp}"; return 1; }
+  fsync_file_or_directory "${directory}"
+  cmp -s "${snapshot}" "${destination}"
 }
 
 install_or_update_gost() {
@@ -493,199 +925,567 @@ verify_sha256_or_die() {
   info "SHA256 verified."
 }
 
-generate_password() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 18
-    return 0
+prompt_secret_confirmed() {
+  local prompt="$1"
+  local allow_blank="${2:-0}"
+  local first second
+  while true; do
+    read -r -s -p "${prompt}: " first
+    printf '\n' >&2
+    if [[ -z "${first}" && "${allow_blank}" == "1" ]]; then
+      printf '\n'
+      return 0
+    fi
+    [[ -n "${first}" ]] || { info "Value is required." >&2; continue; }
+    read -r -s -p "Confirm password: " second
+    printf '\n' >&2
+    if [[ "${first}" == "${second}" ]]; then
+      printf '%s\n' "${first}"
+      return 0
+    fi
+    info "Passwords did not match; try again." >&2
+  done
+}
+
+snapshot_kharej_firewall_rules() {
+  local number="$1"
+  local output="$2"
+  local allow_comment="gost-manager:kharej-${number}:allow"
+  local drop_comment="gost-manager:kharej-${number}:drop"
+  local line position=0 all_rules
+  : > "${output}"
+  command -v iptables >/dev/null 2>&1 || return 0
+  all_rules="$(mktemp)"
+  if ! iptables -S INPUT > "${all_rules}" 2>/dev/null; then
+    rm -f "${all_rules}"
+    return 1
   fi
-  od -An -N18 -tx1 /dev/urandom | tr -d ' \n'
-  printf '\n'
+  while IFS= read -r line; do
+    [[ "${line}" == "-A INPUT "* ]] || continue
+    position=$((position + 1))
+    if [[ "${line}" == *"--comment ${allow_comment}"* || "${line}" == *"--comment \"${allow_comment}\""* || "${line}" == *"--comment ${drop_comment}"* || "${line}" == *"--comment \"${drop_comment}\""* ]]; then
+      printf '%s|%s\n' "${position}" "${line}" >> "${output}"
+    fi
+  done < "${all_rules}"
+  rm -f "${all_rules}"
+}
+
+mutate_kharej_firewall_rules() {
+  local number="$1"
+  local port="$2"
+  local sources="$3"
+  local enabled="$4"
+  local restore_file="${5:-}"
+
+  command -v iptables >/dev/null 2>&1 || { printf 'iptables is unavailable; firewall was not changed.\n' >&2; return 1; }
+  command -v python3 >/dev/null 2>&1 || { printf 'python3 is unavailable; firewall was not changed.\n' >&2; return 1; }
+  python3 - "${number}" "${port}" "${sources}" "${enabled}" "${restore_file}" <<'PY'
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+number, port, sources_raw, enabled, restore_path = sys.argv[1:]
+allow = f"gost-manager:kharej-{number}:allow"
+drop = f"gost-manager:kharej-{number}:drop"
+
+
+def run(args):
+    return subprocess.run(["iptables", *args], text=True, capture_output=True, check=False)
+
+
+def rules():
+    result = run(["-S", "INPUT"])
+    if result.returncode:
+        raise RuntimeError("cannot inspect INPUT rules")
+    return [shlex.split(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def comment(args):
+    try:
+        return args[args.index("--comment") + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def managed(items):
+    return [item for item in items if comment(item) in {allow, drop}]
+
+
+def managed_positions(items):
+    input_rules = [item for item in items if item[:2] == ["-A", "INPUT"]]
+    return [(index, item) for index, item in enumerate(input_rules, 1) if comment(item) in {allow, drop}]
+
+
+def value_after(args, option, default=""):
+    try:
+        return args[args.index(option) + 1]
+    except (ValueError, IndexError):
+        return default
+
+
+def signatures(items):
+    return [
+        (
+            comment(item),
+            value_after(item, "-s"),
+            value_after(item, "--dport"),
+            value_after(item, "-j"),
+        )
+        for item in items
+    ]
+
+
+def positioned_signatures(items):
+    return [(position, signatures([item])[0]) for position, item in items]
+
+
+def clear():
+    for item in managed(rules()):
+        if not item or item[0] != "-A":
+            raise RuntimeError("unexpected rule shape")
+        candidate = ["-D", *item[1:]]
+        if run(candidate).returncode:
+            raise RuntimeError("failed to delete managed rule")
+
+
+def append(items):
+    for item in items:
+        if not item or item[0] != "-A" or comment(item) not in {allow, drop}:
+            raise RuntimeError("invalid saved managed rule")
+        if run(item).returncode:
+            raise RuntimeError("failed to restore managed rule")
+
+
+def insert_at_positions(positioned):
+    for position, item in sorted(positioned):
+        if len(item) < 3 or item[0] != "-A" or item[1] != "INPUT" or comment(item) not in {allow, drop}:
+            raise RuntimeError("invalid positioned managed rule")
+        candidate = ["-I", "INPUT", str(position), *item[2:]]
+        if run(candidate).returncode:
+            raise RuntimeError("failed to restore managed rule position")
+
+
+before_all = rules()
+before = managed_positions(before_all)
+try:
+    clear()
+    if restore_path:
+        desired_positioned = []
+        for line in Path(restore_path).read_text().splitlines():
+            if not line.strip() or "|" not in line:
+                continue
+            raw_position, raw_rule = line.split("|", 1)
+            desired_positioned.append((int(raw_position), shlex.split(raw_rule)))
+        insert_at_positions(desired_positioned)
+        desired = [item for _position, item in desired_positioned]
+    elif enabled == "1":
+        source_items = [item for item in sources_raw.split(",") if item]
+        drop_args = ["-I", "INPUT", "1", "-p", "tcp", "--dport", port, "-m", "comment", "--comment", drop, "-j", "DROP"]
+        if run(drop_args).returncode:
+            raise RuntimeError("failed to add managed drop")
+        for source in reversed(source_items):
+            allow_args = ["-I", "INPUT", "1", "-p", "tcp", "-s", source, "--dport", port, "-m", "comment", "--comment", allow, "-j", "ACCEPT"]
+            if run(allow_args).returncode:
+                raise RuntimeError("failed to add managed allow")
+        desired = [
+            ["-A", "INPUT", "-p", "tcp", "-s", source, "--dport", port, "-m", "comment", "--comment", allow, "-j", "ACCEPT"]
+            for source in source_items
+        ] + [["-A", "INPUT", "-p", "tcp", "--dport", port, "-m", "comment", "--comment", drop, "-j", "DROP"]]
+    else:
+        desired = []
+    current_all = rules()
+    if signatures(managed(current_all)) != signatures(desired):
+        raise RuntimeError("managed firewall verification failed")
+    if restore_path and positioned_signatures(managed_positions(current_all)) != positioned_signatures(desired_positioned):
+        raise RuntimeError("managed firewall position verification failed")
+except Exception:
+    try:
+        clear()
+        insert_at_positions(before)
+        if positioned_signatures(managed_positions(rules())) != positioned_signatures(before):
+            raise RuntimeError("rollback verification failed")
+    except Exception:
+        pass
+    raise SystemExit(1)
+PY
 }
 
 add_kharej_firewall_rules() {
   local number="$1"
-  local iran_ip="$2"
+  local sources="$2"
   local port="$3"
-  local allow_comment="gost-manager:kharej-${number}:allow"
-  local drop_comment="gost-manager:kharej-${number}:drop"
-
-  ensure_commands iptables
-
-  if ! iptables -C INPUT -p tcp -s "${iran_ip}" --dport "${port}" -m comment --comment "${allow_comment}" -j ACCEPT >/dev/null 2>&1; then
-    iptables -I INPUT 1 -p tcp -s "${iran_ip}" --dport "${port}" -m comment --comment "${allow_comment}" -j ACCEPT
-  fi
-  if ! iptables -C INPUT -p tcp --dport "${port}" -m comment --comment "${drop_comment}" -j DROP >/dev/null 2>&1; then
-    iptables -I INPUT 2 -p tcp --dport "${port}" -m comment --comment "${drop_comment}" -j DROP
-  fi
-
+  mutate_kharej_firewall_rules "${number}" "${port}" "${sources}" 1 || return 1
   cat <<'WARN'
 Warning: iptables rules are not persistent by default.
 They may be lost after reboot unless saved with netfilter-persistent or your server firewall system.
 WARN
 }
 
-delete_iptables_rule_loop() {
-  local args=("$@")
-  while iptables "${args[@]}" >/dev/null 2>&1; do
-    :
-  done
-}
-
-delete_iptables_rules_by_comment() {
-  local comment="$1"
-  if ! command -v iptables >/dev/null 2>&1; then
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "${comment}" <<'PY' || true
-import shlex
-import subprocess
-import sys
-
-comment = sys.argv[1]
-for _ in range(50):
-    result = subprocess.run(["iptables", "-S", "INPUT"], text=True, capture_output=True, check=False)
-    line = None
-    for candidate in result.stdout.splitlines():
-        if "--comment" in candidate and comment in candidate:
-            line = candidate
-            break
-    if not line:
-        break
-    args = shlex.split(line)
-    if not args or args[0] != "-A":
-        break
-    args[0] = "-D"
-    subprocess.run(["iptables"] + args, check=False)
-PY
-  fi
+restore_kharej_firewall_rules() {
+  local number="$1"
+  local snapshot="$2"
+  mutate_kharej_firewall_rules "${number}" 1 "" 0 "${snapshot}"
 }
 
 delete_kharej_firewall_rules() {
   local number="$1"
-  local env_file="$2"
-  local iran_ip port
-  local allow_comment="gost-manager:kharej-${number}:allow"
-  local drop_comment="gost-manager:kharej-${number}:drop"
-
-  if ! command -v iptables >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if [[ -f "${env_file}" ]]; then
-    iran_ip="$(env_get IRAN_IP "${env_file}")"
-    port="$(env_get TUNNEL_PORT "${env_file}")"
-    if [[ -n "${iran_ip}" && -n "${port}" ]]; then
-      delete_iptables_rule_loop -D INPUT -p tcp -s "${iran_ip}" --dport "${port}" -m comment --comment "${allow_comment}" -j ACCEPT
-      delete_iptables_rule_loop -D INPUT -p tcp --dport "${port}" -m comment --comment "${drop_comment}" -j DROP
-    fi
-  fi
-
-  delete_iptables_rules_by_comment "${allow_comment}"
-  delete_iptables_rules_by_comment "${drop_comment}"
+  command -v iptables >/dev/null 2>&1 || return 0
+  mutate_kharej_firewall_rules "${number}" 1 "" 0
 }
 
-port_busy_detail() {
-  local port="$1"
-  local detail
-  if ! command -v ss >/dev/null 2>&1; then
+configured_port_inventory() {
+  local output="$1"
+  local profiles invalid_files invalid_list side number _service _unit env_file ports port
+  local port_items=()
+  profiles="$(mktemp)"
+  invalid_files="$(mktemp)"
+  discover_existing_tunnels "${profiles}"
+  find_invalid_profile_env_files "${profiles}" "${invalid_files}"
+  invalid_list="|"
+  while IFS= read -r env_file; do invalid_list="${invalid_list}${env_file}|"; done < "${invalid_files}"
+  : > "${output}"
+  while IFS='|' read -r side number _service _unit env_file; do
+    [[ -n "${side}" ]] || continue
+    if [[ ! -f "${env_file}" || -L "${env_file}" || "${invalid_list}" == *"|${env_file}|"* ]] || ! profile_env_load "${env_file}" "${side}" 1; then
+      printf 'incomplete|%s-%s\n' "${side}" "${number}" >> "${output}"
+      continue
+    fi
+    ports="$(profile_local_ports_from_loaded "${side}" || true)"
+    if [[ -z "${ports}" ]]; then
+      printf 'incomplete|%s-%s\n' "${side}" "${number}" >> "${output}"
+      continue
+    fi
+    IFS=',' read -r -a port_items <<< "${ports}"
+    for port in "${port_items[@]}"; do
+      printf '%s|%s-%s\n' "${port}" "${side}" "${number}" >> "${output}"
+    done
+  done < "${profiles}"
+  rm -f "${profiles}" "${invalid_files}"
+  sort -t '|' -k1,1n -k2,2 "${output}" -o "${output}"
+}
+
+validate_configured_ports() {
+  local candidate_id="$1"
+  local ports="$2"
+  local inventory port owner candidate conflict_owner=""
+  local candidates=()
+  inventory="$(mktemp)"
+  configured_port_inventory "${inventory}"
+  IFS=',' read -r -a candidates <<< "${ports}"
+  for candidate in "${candidates[@]}"; do
+    while IFS='|' read -r port owner; do
+      [[ "${port}" == "${candidate}" ]] || continue
+      if [[ "${owner}" != "${candidate_id}" ]]; then
+        conflict_owner="${owner}"
+        break
+      fi
+    done < "${inventory}"
+    [[ -z "${conflict_owner}" ]] || break
+  done
+  if [[ -n "${conflict_owner}" ]]; then
+    printf 'Configured local port %s conflicts with %s. No files were changed.\n' "${candidate}" "${conflict_owner}" >&2
+    rm -f "${inventory}"
     return 1
   fi
-  detail="$(ss -H -lntp "sport = :${port}" 2>/dev/null || true)"
-  if [[ -z "${detail}" ]]; then
-    detail="$(ss -lntp 2>/dev/null | awk -v port=":${port}" '$0 ~ port {print}' || true)"
+  rm -f "${inventory}"
+}
+
+take_bounded_ss_snapshot() {
+  local output="$1"
+  shift
+  command -v ss >/dev/null 2>&1 || return 1
+  python3 - "${output}" "$@" <<'PY'
+import pathlib
+import subprocess
+import sys
+
+output = pathlib.Path(sys.argv[1])
+try:
+    result = subprocess.run(
+        ["ss", *sys.argv[2:]],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+        check=False,
+    )
+except (OSError, subprocess.TimeoutExpired):
+    raise SystemExit(1)
+if result.returncode or len(result.stdout) > 4 * 1024 * 1024 or result.stdout.count(b"\n") > 100000:
+    raise SystemExit(1)
+output.write_bytes(result.stdout)
+PY
+}
+
+take_listen_snapshot() {
+  local output="$1"
+  take_bounded_ss_snapshot "${output}" -H -lntp
+}
+
+take_connection_snapshot() {
+  local output="$1"
+  take_bounded_ss_snapshot "${output}" -H -tanp
+}
+
+csv_contains() {
+  local csv="$1"
+  local wanted="$2"
+  [[ ",${csv}," == *",${wanted},"* ]]
+}
+
+ss_line_local_port() {
+  local line="$1"
+  local state _recvq _sendq local_address _peer_address _remainder port
+  read -r state _recvq _sendq local_address _peer_address _remainder <<< "${line}"
+  [[ "${state}" == "LISTEN" ]] || return 1
+  port="${local_address##*:}"
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${port}"
+}
+
+validate_live_ports_snapshot() {
+  local snapshot="$1"
+  local ports="$2"
+  local selected_id="${3:-}"
+  local unchanged_ports="${4:-}"
+  local selected_parts side number selected_pid line line_port candidate owner
+  local candidates=()
+  selected_pid=""
+  if [[ -n "${selected_id}" ]]; then
+    selected_parts="$(profile_id_parts "${selected_id}")" || return 1
+    side="${selected_parts%% *}"
+    number="${selected_parts#* }"
+    selected_pid="$(systemctl show -p MainPID --value "$(service_name "${side}" "${number}")" 2>/dev/null || true)"
   fi
-  if [[ -n "${detail}" ]]; then
-    printf '%s\n' "${detail}"
-    return 0
+  IFS=',' read -r -a candidates <<< "${ports}"
+  for candidate in "${candidates[@]}"; do
+    while IFS= read -r line; do
+      line_port="$(ss_line_local_port "${line}" || true)"
+      [[ "${line_port}" == "${candidate}" ]] || continue
+      if [[ -n "${selected_id}" ]] && csv_contains "${unchanged_ports}" "${candidate}" && [[ "${selected_pid}" =~ ^[1-9][0-9]*$ ]] && [[ "${line}" == *"pid=${selected_pid},"* ]]; then
+        continue
+      fi
+      owner="unknown ownership"
+      if [[ "${line}" =~ pid=([1-9][0-9]*), ]]; then
+        owner="pid=${BASH_REMATCH[1]}"
+      fi
+      printf 'Live local port %s is occupied (%s). No files were changed.\n' "${candidate}" "${owner}" >&2
+      return 1
+    done < "${snapshot}"
+  done
+}
+
+validate_profile_ports_before_write() {
+  local candidate_id="$1"
+  local ports="$2"
+  local selected_id="${3:-}"
+  local unchanged_ports="${4:-}"
+  local snapshot candidate_copy identity side result
+  identity="$(profile_id_parts "${candidate_id}")" || return 1
+  side="${identity%% *}"
+  candidate_copy="$(mktemp)"
+  chmod 600 "${candidate_copy}"
+  profile_env_write_lines "${side}" "${candidate_copy}" || { rm -f "${candidate_copy}"; return 1; }
+  if ! validate_configured_ports "${candidate_id}" "${ports}"; then
+    profile_env_load "${candidate_copy}" "${side}" || true
+    rm -f "${candidate_copy}"
+    return 1
   fi
+  profile_env_load "${candidate_copy}" "${side}" || { rm -f "${candidate_copy}"; return 1; }
+  rm -f "${candidate_copy}"
+  snapshot="$(mktemp)"
+  if ! take_listen_snapshot "${snapshot}"; then
+    rm -f "${snapshot}"
+    printf 'Cannot verify live local ports; ownership is unavailable. No files were changed.\n' >&2
+    return 1
+  fi
+  validate_live_ports_snapshot "${snapshot}" "${ports}" "${selected_id}" "${unchanged_ports}"
+  result=$?
+  rm -f "${snapshot}"
+  return "${result}"
+}
+
+verify_profile_listeners() {
+  local service="$1"
+  local ports="$2"
+  local pid snapshot _attempt line line_port expected found all_found
+  local expected_ports=()
+  pid="$(systemctl show -p MainPID --value "${service}" 2>/dev/null || true)"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 0
+  IFS=',' read -r -a expected_ports <<< "${ports}"
+  snapshot="$(mktemp)"
+  for _attempt in 1 2 3 4 5; do
+    if take_listen_snapshot "${snapshot}"; then
+      all_found=1
+      for expected in "${expected_ports[@]}"; do
+        found=0
+        while IFS= read -r line; do
+          line_port="$(ss_line_local_port "${line}" || true)"
+          if [[ "${line_port}" == "${expected}" && "${line}" == *"pid=${pid},"* ]]; then
+            found=1
+            break
+          fi
+        done < "${snapshot}"
+        [[ "${found}" -eq 1 ]] || all_found=0
+      done
+      if [[ "${all_found}" -eq 1 ]]; then
+        rm -f "${snapshot}"
+        return 0
+      fi
+    fi
+    if [[ "${GOST_MANAGER_TESTING:-0}" != "1" ]]; then sleep 1; fi
+  done
+  rm -f "${snapshot}"
   return 1
 }
 
 check_mapping_ports_free_or_die() {
   local mappings="$1"
-  local IFS=','
+  local ports pair
   local pairs=()
-  local pair listen busy_output detail
-  read -r -a pairs <<< "${mappings}"
-
-  ensure_commands ss
-
-  busy_output=""
+  IFS=',' read -r -a pairs <<< "${mappings}"
+  ports=""
   for pair in "${pairs[@]}"; do
-    listen="${pair%%:*}"
-    detail="$(port_busy_detail "${listen}" || true)"
-    if [[ -n "${detail}" ]]; then
-      busy_output="${busy_output}"$'\n'"Port ${listen}:"$'\n'"${detail}"$'\n'
-    fi
+    ports="${ports}${ports:+,}${pair%%:*}"
   done
+  validate_profile_ports_before_write "iran-0" "${ports}" || exit 1
+}
 
-  if [[ -n "${busy_output}" ]]; then
-    printf 'Cannot create Iran tunnel. These listen ports are already in use:\n%s\nNo files were changed.\n' "${busy_output}" >&2
-    exit 1
+ensure_profile_directories() {
+  if [[ ! -e "${GOST_ETC_DIR}" ]]; then
+    mkdir -p "${GOST_ETC_DIR}"
+  fi
+  [[ -d "${GOST_ETC_DIR}" && ! -L "${GOST_ETC_DIR}" ]] || die "unsafe GOST env directory."
+  [[ -d "${SYSTEMD_DIR}" && ! -L "${SYSTEMD_DIR}" ]] || die "unsafe systemd directory."
+  chmod 700 "${GOST_ETC_DIR}"
+  set_production_owner "${GOST_ETC_DIR}"
+}
+
+install_new_profile_from_loaded() {
+  local side="$1"
+  local number="$2"
+  local start_profile="${3:-1}"
+  local profile_id="${side}-${number}"
+  local env_file svc_file service runner ports sources firewall snapshot failure
+
+  validate_side "${side}" || return 1
+  validate_tunnel_number_or_die "${number}"
+  profile_identity_exists "${side}" "${number}" && { printf 'Profile %s already exists; creation never overwrites it.\n' "${profile_id}" >&2; return 1; }
+  validate_loaded_profile "${side}"
+  if [[ "${side}" == "kharej" && "$(profile_env_value FIREWALL_ENABLED)" == "1" ]] && ! command -v iptables >/dev/null 2>&1; then
+    printf 'iptables is required before creating a firewall-enabled Kharej profile.\n' >&2
+    return 1
+  fi
+  ports="$(profile_local_ports_from_loaded "${side}")" || return 1
+  validate_profile_ports_before_write "${profile_id}" "${ports}" || return 1
+
+  ensure_profile_directories
+  env_file="$(env_path "${side}" "${number}")"
+  svc_file="$(service_path "${side}" "${number}")"
+  service="$(service_name "${side}" "${number}")"
+  if [[ "${side}" == "iran" ]]; then
+    runner="${RUNNER_IRAN}"
+  else
+    runner="${RUNNER_KHAREJ}"
+  fi
+
+  snapshot="$(mktemp)"
+  chmod 600 "${snapshot}"
+  if [[ "${side}" == "kharej" ]]; then
+    snapshot_kharej_firewall_rules "${number}" "${snapshot}" || { rm -f "${snapshot}"; return 1; }
+  fi
+
+  failure=0
+  write_loaded_profile_env "${env_file}" "${side}" || failure=1
+  if [[ "${failure}" -eq 0 ]]; then
+    write_service_file "${svc_file}" "GOST ${side} Direct profile ${number}" "${env_file}" "${runner}" || failure=1
+  fi
+  if [[ "${failure}" -eq 0 && "${side}" == "kharej" ]]; then
+    firewall="$(profile_env_value FIREWALL_ENABLED)"
+    sources="$(profile_sources_from_loaded)"
+    if [[ "${firewall}" == "1" ]]; then
+      add_kharej_firewall_rules "${number}" "${sources}" "${ports}" || failure=1
+    fi
+  fi
+  if [[ "${failure}" -eq 0 ]]; then
+    systemctl daemon-reload || failure=1
+  fi
+  if [[ "${failure}" -eq 0 && "${start_profile}" == "1" ]]; then
+    systemctl enable --now "${service}" || failure=1
+    if [[ "${failure}" -eq 0 ]]; then
+      systemctl is-active --quiet "${service}" || failure=1
+    fi
+    if [[ "${failure}" -eq 0 ]]; then
+      verify_profile_listeners "${service}" "${ports}" || failure=1
+    fi
+  fi
+
+  if [[ "${failure}" -ne 0 ]]; then
+    systemctl disable --now "${service}" >/dev/null 2>&1 || true
+    if [[ "${side}" == "kharej" ]]; then
+      restore_kharej_firewall_rules "${number}" "${snapshot}" || true
+    fi
+    rm -f "${svc_file}" "${env_file}"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    rm -f "${snapshot}"
+    printf 'Profile %s creation failed; only its new files and managed firewall rules were rolled back.\n' "${profile_id}" >&2
+    return 1
+  fi
+
+  rm -f "${snapshot}"
+  info "Profile ${profile_id} created successfully."
+  info "Service: ${service}"
+  info "Env: ${env_file}"
+  info "Local ports: ${ports}"
+  if [[ "${start_profile}" != "1" ]]; then
+    info "Profile created without starting its service."
   fi
 }
 
 create_kharej_tunnel() {
   require_root
-  ensure_commands systemctl
+  ensure_commands systemctl ss python3
 
-  local number port user password iran_ip firewall_answer firewall_enabled env_file svc_file service
-  number="$(prompt_required "Tunnel number, e.g. 1")"
+  local suggested number label port user password sources firewall_enabled
+  suggested="$(next_free_profile_number kharej)" || die "cannot allocate a Kharej profile number."
+  number="$(prompt_default "Kharej profile number" "${suggested}")"
   validate_tunnel_number_or_die "${number}"
+  profile_identity_exists kharej "${number}" && die "profile kharej-${number} already exists. Use Edit instead."
+  label="$(prompt_default "Profile label (optional)" "")"
+  validate_profile_label_or_die "${label}"
   port="$(prompt_default "SOCKS listen port" "28420")"
   validate_port_or_die "${port}"
   user="$(prompt_default "GOST username" "maya")"
   validate_token_or_die "GOST username" "${user}"
-  read -r -p "GOST password (leave empty to generate random): " password
-  if [[ -z "${password}" ]]; then
-    password="$(generate_password)"
-  fi
+  password="$(prompt_secret_confirmed "GOST password")"
   validate_token_or_die "GOST password" "${password}"
-  iran_ip="$(prompt_required "Iran IP allowed, e.g. 88.218.18.13")"
-  validate_iptables_source_or_die "${iran_ip}"
-  read -r -p "Apply iptables firewall rule? [y/N]: " firewall_answer
-  case "${firewall_answer}" in
-    y|Y|yes|YES|Yes) firewall_enabled=1 ;;
-    *) firewall_enabled=0 ;;
-  esac
-
-  mkdir -p "${GOST_ETC_DIR}"
-  chmod 700 "${GOST_ETC_DIR}"
-
-  env_file="$(env_path kharej "${number}")"
-  svc_file="$(service_path kharej "${number}")"
-  service="$(service_name kharej "${number}")"
-  confirm_overwrite_file "${env_file}"
-  confirm_overwrite_file "${svc_file}"
-
-  write_secure_env_file "${env_file}" \
-    GOST_USER "${user}" \
-    GOST_PASS "${password}" \
-    TUNNEL_PORT "${port}" \
-    IRAN_IP "${iran_ip}" \
-    FIREWALL_ENABLED "${firewall_enabled}"
-
-  write_service_file "${svc_file}" "GOST Kharej Tunnel ${number}" "${env_file}" "${RUNNER_KHAREJ}"
-
-  if [[ "${firewall_enabled}" == "1" ]]; then
-    add_kharej_firewall_rules "${number}" "${iran_ip}" "${port}"
+  sources="$(prompt_required "Allowed Iran IPv4/CIDRs, comma-separated (for example 198.51.100.10)")"
+  sources="$(canonicalize_allowed_sources "${sources}")" || die "allowed sources must be 1-64 canonical IPv4 networks from /8 through /32."
+  if confirm "Apply profile-scoped iptables firewall rules?"; then
+    firewall_enabled=1
+    ensure_commands iptables
+  else
+    firewall_enabled=0
   fi
 
-  systemctl daemon-reload
-  systemctl enable --now "${service}"
+  profile_env_reset
+  profile_env_set GOST_USER "${user}"
+  profile_env_set GOST_PASS "${password}"
+  profile_env_set TUNNEL_PORT "${port}"
+  profile_env_set ALLOWED_IRAN_SOURCES "${sources}"
+  profile_env_set FIREWALL_ENABLED "${firewall_enabled}"
+  [[ -z "${label}" ]] || profile_env_set PROFILE_LABEL "${label}"
 
   cat <<EOF_OUT
-Kharej tunnel created successfully.
-
-Service: ${service}
-Env: ${env_file}
-SOCKS: 0.0.0.0:${port}
-GOST_USER=${user}
-GOST_PASS=${password}
-Allowed Iran IP: ${iran_ip}
+New Direct Mode profile: kharej-${number}
+Label: ${label:-kharej-${number}}
+Local SOCKS port: ${port}
+Allowed-source count: $(printf '%s' "${sources}" | awk -F, '{print NF}')
 Firewall: $(if [[ "${firewall_enabled}" == "1" ]]; then printf 'enabled'; else printf 'disabled'; fi)
+Credentials: configured (redacted)
 EOF_OUT
+  confirm "Create and start this exact profile?" || die "creation aborted."
+  install_new_profile_from_loaded kharej "${number}" 1
 }
 
 print_iran_success() {
@@ -729,46 +1529,45 @@ EOF_OUT
 
 create_iran_tunnel() {
   require_root
-  ensure_commands systemctl ss
+  ensure_commands systemctl ss python3
 
-  local number kharej_ip socks_port user password mappings env_file svc_file service
-  number="$(prompt_required "Tunnel number, e.g. 1")"
+  local suggested number label kharej_ip socks_port user password mappings
+  suggested="$(next_free_profile_number iran)" || die "cannot allocate an Iran profile number."
+  number="$(prompt_default "Iran profile number" "${suggested}")"
   validate_tunnel_number_or_die "${number}"
-  kharej_ip="$(prompt_required "Kharej IP, e.g. 37.252.4.65")"
+  profile_identity_exists iran "${number}" && die "profile iran-${number} already exists. Use Edit instead."
+  label="$(prompt_default "Profile label (optional)" "")"
+  validate_profile_label_or_die "${label}"
+  kharej_ip="$(prompt_required "Kharej IP, for example 203.0.113.20")"
   validate_host_or_die "Kharej IP" "${kharej_ip}"
   socks_port="$(prompt_default "Kharej SOCKS port" "28420")"
   validate_port_or_die "${socks_port}"
   user="$(prompt_default "GOST username" "maya")"
   validate_token_or_die "GOST username" "${user}"
-  password="$(prompt_required "GOST password from Kharej side")"
+  password="$(prompt_secret_confirmed "Matching GOST password from Kharej")"
   validate_token_or_die "GOST password" "${password}"
   info "Port mappings format: 2052:2052 or 80:80,8080:8080,8880:8880"
   mappings="$(prompt_required "Port mappings")"
   validate_mappings "${mappings}" || exit 1
-  check_mapping_ports_free_or_die "${mappings}"
 
-  mkdir -p "${GOST_ETC_DIR}"
-  chmod 700 "${GOST_ETC_DIR}"
+  profile_env_reset
+  profile_env_set GOST_USER "${user}"
+  profile_env_set GOST_PASS "${password}"
+  profile_env_set KHAREJ_IP "${kharej_ip}"
+  profile_env_set TUNNEL_PORT "${socks_port}"
+  profile_env_set MAPPINGS "${mappings}"
+  [[ -z "${label}" ]] || profile_env_set PROFILE_LABEL "${label}"
 
-  env_file="$(env_path iran "${number}")"
-  svc_file="$(service_path iran "${number}")"
-  service="$(service_name iran "${number}")"
-  confirm_overwrite_file "${env_file}"
-  confirm_overwrite_file "${svc_file}"
-
-  write_secure_env_file "${env_file}" \
-    GOST_USER "${user}" \
-    GOST_PASS "${password}" \
-    KHAREJ_IP "${kharej_ip}" \
-    TUNNEL_PORT "${socks_port}" \
-    MAPPINGS "${mappings}"
-
-  write_service_file "${svc_file}" "GOST Iran Tunnel ${number}" "${env_file}" "${RUNNER_IRAN}"
-
-  systemctl daemon-reload
-  systemctl enable --now "${service}"
-
-  print_iran_success "${number}" "${env_file}" "${kharej_ip}" "${socks_port}" "${mappings}"
+  cat <<EOF_OUT
+New Direct Mode profile: iran-${number}
+Label: ${label:-iran-${number}}
+Remote SOCKS endpoint: ${kharej_ip}:${socks_port}
+Mappings: ${mappings}
+Credentials: configured (redacted)
+EOF_OUT
+  confirm "Create and start this exact profile?" || die "creation aborted."
+  install_new_profile_from_loaded iran "${number}" 1
+  print_iran_success "${number}" "$(env_path iran "${number}")" "${kharej_ip}" "${socks_port}" "${mappings}"
 }
 
 discover_existing_tunnels() {
@@ -779,25 +1578,25 @@ discover_existing_tunnels() {
   : > "${tmp_file}"
 
   for service_file in "${SYSTEMD_DIR}"/gost-iran-*.service "${SYSTEMD_DIR}"/gost-kharej-*.service; do
-    [[ -e "${service_file}" ]] || continue
-    base="$(basename "${service_file}")"
+    [[ -e "${service_file}" || -L "${service_file}" ]] || continue
+    base="${service_file##*/}"
     identity="$(parse_tunnel_service_name "${base}" || true)"
     [[ -n "${identity}" ]] || continue
     side="${identity%% *}"
     number="${identity#* }"
-    service="$(service_name "${side}" "${number}")"
-    env_file="$(env_path "${side}" "${number}")"
+    service="gost-${side}-${number}.service"
+    env_file="${GOST_ETC_DIR}/${side}-${number}.env"
     printf '%s|%s|%s|%s|%s\n' "${side}" "${number}" "${service}" "${service_file}" "${env_file}" >> "${tmp_file}"
   done
 
   for env_file in "${GOST_ETC_DIR}"/iran-*.env "${GOST_ETC_DIR}"/kharej-*.env; do
-    [[ -e "${env_file}" ]] || continue
+    [[ -e "${env_file}" || -L "${env_file}" ]] || continue
     identity="$(parse_tunnel_env_name "${env_file}" || true)"
     [[ -n "${identity}" ]] || continue
     side="${identity%% *}"
     number="${identity#* }"
-    service="$(service_name "${side}" "${number}")"
-    service_file="$(service_path "${side}" "${number}")"
+    service="gost-${side}-${number}.service"
+    service_file="${SYSTEMD_DIR}/${service}"
     printf '%s|%s|%s|%s|%s\n' "${side}" "${number}" "${service}" "${service_file}" "${env_file}" >> "${tmp_file}"
   done
 
@@ -864,68 +1663,167 @@ select_existing_tunnel() {
   SELECTED_TUNNEL_ENV_FILE="${selected#*|}"
 }
 
+restore_exact_service_state() {
+  local service="$1"
+  local active_state="$2"
+  local enabled_state="$3"
+  local failed=0
+  case "${enabled_state}" in
+    enabled) systemctl enable "${service}" >/dev/null 2>&1 || failed=1 ;;
+    disabled) systemctl disable "${service}" >/dev/null 2>&1 || failed=1 ;;
+  esac
+  case "${active_state}" in
+    active) systemctl start "${service}" >/dev/null 2>&1 || failed=1 ;;
+    inactive) systemctl stop "${service}" >/dev/null 2>&1 || failed=1 ;;
+  esac
+  [[ "${failed}" -eq 0 ]]
+}
+
 delete_tunnel() {
   require_root
   ensure_commands systemctl
 
-  local side number service svc_file env_file
+  local side number service svc_file env_file profile_id label state firewall env_snapshot unit_snapshot firewall_snapshot old_active old_enabled failed
   select_existing_tunnel
   side="${SELECTED_TUNNEL_SIDE}"
   number="${SELECTED_TUNNEL_NUMBER}"
   service="${SELECTED_TUNNEL_SERVICE}"
   svc_file="${SELECTED_TUNNEL_SERVICE_FILE}"
   env_file="${SELECTED_TUNNEL_ENV_FILE}"
+  profile_id="${side}-${number}"
+  label="${profile_id}"
+  firewall="not applicable"
+  if [[ -f "${env_file}" && ! -L "${env_file}" ]] && profile_env_load "${env_file}" "${side}"; then
+    label="$(profile_env_value PROFILE_LABEL || true)"
+    label="${label:-${profile_id}}"
+    if [[ "${side}" == "kharej" ]]; then
+      firewall="$(profile_env_value FIREWALL_ENABLED || true)"
+      firewall="${firewall:-unknown}"
+    fi
+  fi
+  state="$(service_status_summary "${service}")"
+  cat <<EOF_OUT
+Delete profile: ${profile_id}
+Label: ${label}
+Service: ${service} (${state})
+Env: ${env_file}
+Unit: ${svc_file}
+Firewall: ${firewall}
+EOF_OUT
+  confirm "Stop, disable, and delete only ${profile_id}?" || die "delete aborted."
 
-  confirm "Delete ${service} and its managed files?" || die "delete aborted."
-
-  if [[ "${side}" == "kharej" ]]; then
-    delete_kharej_firewall_rules "${number}" "${env_file}"
+  if [[ "${side}" == "kharej" && "${firewall}" == "1" ]] && ! command -v iptables >/dev/null 2>&1; then
+    printf 'iptables is unavailable; service, env, unit, and firewall were preserved.\n' >&2
+    return 1
   fi
 
-  systemctl disable --now "${service}" || true
-  rm -f "${svc_file}"
-  rm -f "${env_file}"
-  systemctl daemon-reload
-  systemctl reset-failed
-  info "Deleted ${service} and ${env_file}."
+  validate_managed_destination "${env_file}" env || { [[ ! -e "${env_file}" && ! -L "${env_file}" ]] || die "unsafe env destination; nothing was deleted."; }
+  validate_managed_destination "${svc_file}" unit || { [[ ! -e "${svc_file}" && ! -L "${svc_file}" ]] || die "unsafe unit destination; nothing was deleted."; }
+  env_snapshot=""
+  unit_snapshot=""
+  if [[ -f "${env_file}" ]] && ! env_snapshot="$(snapshot_managed_file "${env_file}")"; then
+    printf 'Could not snapshot the selected env; nothing was changed.\n' >&2
+    return 1
+  fi
+  if [[ -f "${svc_file}" ]] && ! unit_snapshot="$(snapshot_managed_file "${svc_file}")"; then
+    rm -f "${env_snapshot}"
+    printf 'Could not snapshot the selected unit; nothing was changed.\n' >&2
+    return 1
+  fi
+  firewall_snapshot="$(mktemp)"
+  chmod 600 "${firewall_snapshot}"
+  if [[ "${side}" == "kharej" ]] && ! snapshot_kharej_firewall_rules "${number}" "${firewall_snapshot}"; then
+    rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}"
+    printf 'Could not snapshot the selected firewall rules; nothing was changed.\n' >&2
+    return 1
+  fi
+  old_active="$(systemctl is-active "${service}" 2>/dev/null || true)"
+  old_enabled="$(systemctl is-enabled "${service}" 2>/dev/null || true)"
+  if ! systemctl disable --now "${service}"; then
+    restore_exact_service_state "${service}" "${old_active}" "${old_enabled}" || true
+    rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}"
+    printf 'Could not stop/disable %s; env, unit, and firewall were preserved.\n' "${service}" >&2
+    return 1
+  fi
+
+  if [[ "${side}" == "kharej" ]]; then
+    if ! delete_kharej_firewall_rules "${number}"; then
+      failed=0
+      restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || failed=1
+      restore_exact_service_state "${service}" "${old_active}" "${old_enabled}" || failed=1
+      rm -f "${env_snapshot}" "${unit_snapshot}"
+      if [[ "${failed}" -eq 0 ]]; then
+        rm -f "${firewall_snapshot}"
+        printf 'Firewall removal failed; the profile and service state were restored.\n' >&2
+      else
+        printf 'Firewall removal failed and restoration could not be proven. Retained firewall snapshot: %s\n' "${firewall_snapshot}" >&2
+      fi
+      return 1
+    fi
+  fi
+
+  failed=0
+  [[ ! -e "${env_file}" ]] || rm -f "${env_file}" || failed=1
+  [[ ! -e "${svc_file}" ]] || rm -f "${svc_file}" || failed=1
+  if [[ "${failed}" -eq 0 && -n "${unit_snapshot}" ]]; then
+    systemctl daemon-reload || failed=1
+  fi
+  if [[ "${failed}" -ne 0 ]]; then
+    [[ -z "${env_snapshot}" ]] || restore_managed_snapshot "${env_snapshot}" "${env_file}" env || failed=2
+    [[ -z "${unit_snapshot}" ]] || restore_managed_snapshot "${unit_snapshot}" "${svc_file}" unit || failed=2
+    if [[ "${side}" == "kharej" ]]; then
+      restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || failed=2
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || failed=2
+    restore_exact_service_state "${service}" "${old_active}" "${old_enabled}" || failed=2
+    if [[ "${failed}" -eq 2 ]]; then
+      if [[ "${side}" == "iran" ]]; then
+        rm -f "${firewall_snapshot}"
+        firewall_snapshot=""
+      fi
+      printf 'Deletion failed and automatic restoration could not be proven. Recovery snapshots: %s %s %s\n' "${env_snapshot:-none}" "${unit_snapshot:-none}" "${firewall_snapshot:-none}" >&2
+    else
+      rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}"
+      printf 'Deletion failed; the selected profile was restored.\n' >&2
+    fi
+    return 1
+  fi
+
+  rm -f "${env_snapshot}" "${unit_snapshot}" "${firewall_snapshot}"
+  info "Deleted only ${profile_id}."
 }
 
 show_related_listen_ports() {
   local side="$1"
   local env_file="$2"
-  local mappings port pair listen
-  local pairs=()
+  local service="$3"
+  local ports snapshot
 
   if ! command -v ss >/dev/null 2>&1; then
-    info "ss is not available; cannot show listen ports."
+    info "unknown (ss is unavailable)"
     return 0
   fi
-
-  if [[ ! -f "${env_file}" ]]; then
-    ss -lntp 2>/dev/null | grep gost || true
+  if [[ ! -f "${env_file}" || -L "${env_file}" ]] || ! profile_env_load "${env_file}" "${side}" || ! loaded_profile_is_valid "${side}"; then
+    info "unknown (profile env is missing or malformed)"
     return 0
   fi
-
-  if [[ "${side}" == "iran" ]]; then
-    mappings="$(env_get MAPPINGS "${env_file}")"
-    if [[ -z "${mappings}" ]]; then
-      ss -lntp 2>/dev/null | grep gost || true
-      return 0
-    fi
-    IFS=',' read -r -a pairs <<< "${mappings}"
-    for pair in "${pairs[@]}"; do
-      listen="${pair%%:*}"
-      ss -lntp "sport = :${listen}" 2>/dev/null || true
-    done
+  ports="$(profile_local_ports_from_loaded "${side}" || true)"
+  [[ -n "${ports}" ]] || { info "unknown (configured ports are invalid)"; return 0; }
+  snapshot="$(mktemp)"
+  if ! take_listen_snapshot "${snapshot}"; then
+    rm -f "${snapshot}"
+    info "unknown (socket ownership is unavailable)"
     return 0
   fi
+  observed_listener_summary "${snapshot}" "${service}" 1 "${ports}"
+  rm -f "${snapshot}"
+}
 
-  port="$(env_get TUNNEL_PORT "${env_file}")"
-  if [[ -n "${port}" ]]; then
-    ss -lntp "sport = :${port}" 2>/dev/null || true
-  else
-    ss -lntp 2>/dev/null | grep gost || true
-  fi
+show_safe_service_status() {
+  local service="$1"
+  printf 'Safe service status for %s:\n' "${service}"
+  systemctl show "${service}" --no-pager \
+    --property=Id,LoadState,ActiveState,SubState,UnitFileState,NRestarts,MainPID || true
 }
 
 show_status() {
@@ -934,16 +1832,36 @@ show_status() {
   side="${SELECTED_TUNNEL_SIDE}"
   service="${SELECTED_TUNNEL_SERVICE}"
   env_file="${SELECTED_TUNNEL_ENV_FILE}"
-  systemctl status "${service}" --no-pager || true
+  show_safe_service_status "${service}"
   printf '\nRelated listen ports:\n'
-  show_related_listen_ports "${side}" "${env_file}"
+  show_related_listen_ports "${side}" "${env_file}" "${service}"
 }
 
 show_logs() {
-  local service
+  local side service env_file user password line journal_output
   select_existing_tunnel
+  side="${SELECTED_TUNNEL_SIDE}"
   service="${SELECTED_TUNNEL_SERVICE}"
-  journalctl -u "${service}" -n 100 --no-pager
+  env_file="${SELECTED_TUNNEL_ENV_FILE}"
+  if [[ ! -f "${env_file}" || -L "${env_file}" ]] || ! profile_env_load "${env_file}" "${side}" || ! loaded_profile_is_valid "${side}"; then
+    printf 'Cannot safely redact logs for %s because its env is missing or malformed.\n' "${service}" >&2
+    return 1
+  fi
+  user="$(profile_env_value GOST_USER || true)"
+  password="$(profile_env_value GOST_PASS || true)"
+  [[ -n "${user}" && -n "${password}" ]] || { printf 'Cannot safely redact logs for %s.\n' "${service}" >&2; return 1; }
+  journal_output="$(mktemp)"
+  chmod 600 "${journal_output}"
+  if ! journalctl -u "${service}" -n 100 --no-pager > "${journal_output}"; then
+    rm -f "${journal_output}"
+    return 1
+  fi
+  while IFS= read -r line; do
+    line="${line//${user}/[redacted-user]}"
+    line="${line//${password}/[redacted-password]}"
+    printf '%s\n' "${line}"
+  done < "${journal_output}"
+  rm -f "${journal_output}"
 }
 
 restart_tunnel() {
@@ -954,7 +1872,7 @@ restart_tunnel() {
   select_existing_tunnel
   service="${SELECTED_TUNNEL_SERVICE}"
   systemctl restart "${service}"
-  systemctl status "${service}" --no-pager --lines=20 || true
+  show_safe_service_status "${service}"
 }
 
 summarize_iran_env() {
@@ -1012,33 +1930,515 @@ service_status_summary() {
   fi
 }
 
-list_active_gost_services() {
-  local file base number found=0
+established_socket_count() {
+  local snapshot="$1"
+  local service="$2"
+  local authoritative="$3"
+  local pid line count=0
+  [[ "${authoritative}" == "1" ]] || { printf 'unknown\n'; return 0; }
+  pid="$(systemctl show -p MainPID --value "${service}" 2>/dev/null || true)"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || { printf 'unknown\n'; return 0; }
+  while IFS= read -r line; do
+    if [[ "${line}" == ESTAB* && "${line}" == *"pid=${pid},"* ]]; then
+      count=$((count + 1))
+    fi
+  done < "${snapshot}"
+  printf '%s\n' "${count}"
+}
 
-  systemctl list-units --type=service --all 'gost-*' || true
-  printf '\n%-24s %-16s %s\n' "SERVICE" "STATUS" "DETAILS"
-
-  for file in "${GOST_ETC_DIR}"/iran-*.env; do
-    [[ -e "${file}" ]] || continue
-    found=1
-    base="$(basename "${file}")"
-    number="${base#iran-}"
-    number="${number%.env}"
-    summarize_iran_env "${file}" "${number}"
-  done
-
-  for file in "${GOST_ETC_DIR}"/kharej-*.env; do
-    [[ -e "${file}" ]] || continue
-    found=1
-    base="$(basename "${file}")"
-    number="${base#kharej-}"
-    number="${number%.env}"
-    summarize_kharej_env "${file}" "${number}"
-  done
-
-  if [[ "${found}" -eq 0 ]]; then
-    info "No managed GOST tunnels found."
+observed_listener_summary() {
+  local snapshot="$1"
+  local service="$2"
+  local authoritative="$3"
+  local ports="$4"
+  local pid line line_port result port
+  [[ "${authoritative}" == "1" ]] || { printf 'unknown\n'; return 0; }
+  pid="$(systemctl show -p MainPID --value "${service}" 2>/dev/null || true)"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || { printf 'unknown\n'; return 0; }
+  result=""
+  while IFS= read -r line; do
+    [[ "${line}" == LISTEN* && "${line}" == *"pid=${pid},"* ]] || continue
+    line_port="$(ss_line_local_port "${line}" || true)"
+    [[ -n "${line_port}" ]] || continue
+    if csv_contains "${ports}" "${line_port}" && ! csv_contains "${result}" "${line_port}"; then
+      result="${result}${result:+,}${line_port}"
+    fi
+  done < "${snapshot}"
+  if [[ -n "${result}" ]]; then
+    printf '%s\n' "${result}"
+  else
+    printf 'none\n'
   fi
+}
+
+profile_source_count() {
+  local sources="$1"
+  local items=()
+  [[ -n "${sources}" ]] || { printf '0\n'; return 0; }
+  IFS=',' read -r -a items <<< "${sources}"
+  printf '%s\n' "${#items[@]}"
+}
+
+list_profiles() {
+  local profiles sockets invalid_files invalid_list socket_authoritative side number service unit env_file profile_id status label ports remote firewall sources source_count established env_state unit_state
+  profiles="$(mktemp)"
+  sockets="$(mktemp)"
+  invalid_files="$(mktemp)"
+  discover_existing_tunnels "${profiles}"
+  find_invalid_profile_env_files "${profiles}" "${invalid_files}"
+  invalid_list="|"
+  while IFS= read -r env_file; do invalid_list="${invalid_list}${env_file}|"; done < "${invalid_files}"
+  if take_connection_snapshot "${sockets}"; then
+    socket_authoritative=1
+  else
+    socket_authoritative=0
+    : > "${sockets}"
+  fi
+
+  printf '%-12s %-8s %-18s %-24s %-16s %-13s %-24s %-9s %-7s %-7s %-7s\n' \
+    "PROFILE" "SIDE" "LABEL" "SERVICE" "STATE" "LOCAL PORTS" "REMOTE/SOURCES" "FIREWALL" "ESTAB" "ENV" "UNIT"
+  if [[ ! -s "${profiles}" ]]; then
+    info "No managed Direct Mode profiles found."
+    rm -f "${profiles}" "${sockets}" "${invalid_files}"
+    return 0
+  fi
+
+  while IFS='|' read -r side number service unit env_file; do
+    profile_id="${side}-${number}"
+    env_state="missing"
+    unit_state="missing"
+    status="unit-missing"
+    if [[ -e "${unit}" || -L "${unit}" ]]; then
+      unit_state="present"
+      status="$(service_status_summary "${service}")"
+    fi
+    label="${profile_id}"
+    ports="incomplete"
+    remote="incomplete"
+    firewall="n/a"
+    if [[ -f "${env_file}" && ! -L "${env_file}" && "${invalid_list}" != *"|${env_file}|"* ]] && profile_env_load "${env_file}" "${side}" 1 && loaded_profile_is_valid "${side}"; then
+      env_state="present"
+      label="$(profile_env_value PROFILE_LABEL || true)"
+      label="${label:-${profile_id}}"
+      ports="$(profile_local_ports_from_loaded "${side}" || true)"
+      ports="${ports:-incomplete}"
+      if [[ "${side}" == "iran" ]]; then
+        remote="$(profile_env_value KHAREJ_IP || true):$(profile_env_value TUNNEL_PORT || true)"
+      else
+        sources="$(profile_env_value ALLOWED_IRAN_SOURCES || true)"
+        sources="${sources:-$(profile_env_value IRAN_IP || true)}"
+        source_count="$(profile_source_count "${sources}")"
+        remote="sources=${source_count}"
+        firewall="$(profile_env_value FIREWALL_ENABLED || true)"
+        firewall="${firewall:-unknown}"
+      fi
+    elif [[ -e "${env_file}" || -L "${env_file}" ]]; then
+      env_state="invalid"
+    fi
+    established="unknown"
+    if [[ "${unit_state}" == "present" ]]; then
+      established="$(established_socket_count "${sockets}" "${service}" "${socket_authoritative}")"
+    fi
+    printf '%-12s %-8s %-18s %-24s %-16s %-13s %-24s %-9s %-7s %-7s %-7s\n' \
+      "${profile_id}" "${side}" "${label}" "${service}" "${status}" "${ports}" "${remote}" "${firewall}" "${established}" "${env_state}" "${unit_state}"
+  done < "${profiles}"
+  rm -f "${profiles}" "${sockets}" "${invalid_files}"
+}
+
+show_selected_profile_detail() {
+  local side="$1"
+  local number="$2"
+  local service env_file unit profile_id status label ports sockets socket_authoritative established listeners remote mappings sources firewall
+  service="$(service_name "${side}" "${number}")"
+  env_file="$(env_path "${side}" "${number}")"
+  unit="$(service_path "${side}" "${number}")"
+  profile_id="${side}-${number}"
+  [[ -f "${env_file}" && ! -L "${env_file}" ]] || { printf 'Profile %s has a missing or unsafe env file.\n' "${profile_id}" >&2; return 1; }
+  profile_env_load "${env_file}" "${side}" || { printf 'Profile %s has a malformed env file.\n' "${profile_id}" >&2; return 1; }
+  validate_loaded_profile "${side}"
+  label="$(profile_env_value PROFILE_LABEL || true)"
+  label="${label:-${profile_id}}"
+  ports="$(profile_local_ports_from_loaded "${side}")"
+  status="$(service_status_summary "${service}")"
+  sockets="$(mktemp)"
+  if take_connection_snapshot "${sockets}"; then socket_authoritative=1; else socket_authoritative=0; : > "${sockets}"; fi
+  established="$(established_socket_count "${sockets}" "${service}" "${socket_authoritative}")"
+  listeners="$(observed_listener_summary "${sockets}" "${service}" "${socket_authoritative}" "${ports}")"
+  rm -f "${sockets}"
+  cat <<EOF_OUT
+Profile ID: ${profile_id}
+Label: ${label}
+Side: ${side}
+Env: ${env_file}
+Unit: ${unit}
+Service: ${service}
+State: ${status}
+Configured local ports: ${ports}
+Observed listeners: ${listeners}
+Established sockets: ${established}
+EOF_OUT
+  if [[ "${side}" == "iran" ]]; then
+    remote="$(profile_env_value KHAREJ_IP):$(profile_env_value TUNNEL_PORT)"
+    mappings="$(profile_env_value MAPPINGS)"
+    info "Remote SOCKS endpoint: ${remote}"
+    info "Target mappings: ${mappings}"
+  else
+    sources="$(profile_sources_from_loaded)"
+    firewall="$(profile_env_value FIREWALL_ENABLED)"
+    info "Allowed Iran sources: ${sources}"
+    info "Allowed-source count: $(profile_source_count "${sources}")"
+    info "Firewall: ${firewall}"
+  fi
+  if [[ -x "${MONITOR_BIN}" ]]; then
+    printf '\nLast Monitoring Lite observation:\n'
+    "${MONITOR_BIN}" tunnel "${profile_id}" --window 10m || info "Monitoring observation unavailable."
+  else
+    info "Last Monitoring Lite observation: unavailable"
+  fi
+}
+
+show_profile_detail() {
+  select_existing_tunnel
+  show_selected_profile_detail "${SELECTED_TUNNEL_SIDE}" "${SELECTED_TUNNEL_NUMBER}"
+}
+
+edit_profile() {
+  require_root
+  ensure_commands systemctl ss python3
+  local side number service env_file profile_id old_label old_user old_password label user password
+  local old_host old_port old_mappings host port mappings old_sources sources old_source_style old_firewall firewall
+  local old_ports new_ports changed=0 firewall_changed=0 env_snapshot firewall_snapshot old_active restart_answer restore_failed
+
+  select_existing_tunnel
+  side="${SELECTED_TUNNEL_SIDE}"
+  number="${SELECTED_TUNNEL_NUMBER}"
+  service="${SELECTED_TUNNEL_SERVICE}"
+  env_file="${SELECTED_TUNNEL_ENV_FILE}"
+  profile_id="${side}-${number}"
+  [[ -f "${env_file}" && ! -L "${env_file}" ]] || die "selected profile has a missing or unsafe env file."
+  profile_env_load "${env_file}" "${side}" || die "selected profile env is malformed; no values were displayed or changed."
+  validate_loaded_profile "${side}"
+
+  old_label="$(profile_env_value PROFILE_LABEL || true)"
+  old_user="$(profile_env_value GOST_USER)"
+  old_password="$(profile_env_value GOST_PASS)"
+  old_ports="$(profile_local_ports_from_loaded "${side}")"
+
+  label="$(prompt_default "Profile label (empty removes it)" "${old_label}")"
+  validate_profile_label_or_die "${label}"
+  read -r -p "New GOST username (blank retains current): " user
+  user="${user:-${old_user}}"
+  validate_token_or_die "GOST username" "${user}"
+  password="$(prompt_secret_confirmed "New GOST password (blank retains current)" 1)"
+  password="${password:-${old_password}}"
+  validate_token_or_die "GOST password" "${password}"
+
+  [[ "${label}" == "${old_label}" ]] || changed=1
+  [[ "${user}" == "${old_user}" ]] || changed=1
+  [[ "${password}" == "${old_password}" ]] || changed=1
+  profile_env_set GOST_USER "${user}"
+  profile_env_set GOST_PASS "${password}"
+  if [[ -n "${label}" ]]; then profile_env_set PROFILE_LABEL "${label}"; else profile_env_unset PROFILE_LABEL; fi
+
+  if [[ "${side}" == "iran" ]]; then
+    old_host="$(profile_env_value KHAREJ_IP)"
+    old_port="$(profile_env_value TUNNEL_PORT)"
+    old_mappings="$(profile_env_value MAPPINGS)"
+    host="$(prompt_default "Kharej host" "${old_host}")"
+    port="$(prompt_default "Kharej SOCKS port" "${old_port}")"
+    mappings="$(prompt_default "Port mappings" "${old_mappings}")"
+    [[ "${host}" == "${old_host}" ]] || changed=1
+    [[ "${port}" == "${old_port}" ]] || changed=1
+    [[ "${mappings}" == "${old_mappings}" ]] || changed=1
+    profile_env_set KHAREJ_IP "${host}"
+    profile_env_set TUNNEL_PORT "${port}"
+    profile_env_set MAPPINGS "${mappings}"
+  else
+    old_port="$(profile_env_value TUNNEL_PORT)"
+    old_sources="$(profile_sources_from_loaded)"
+    if profile_env_has_key ALLOWED_IRAN_SOURCES; then old_source_style="ALLOWED_IRAN_SOURCES"; else old_source_style="IRAN_IP"; fi
+    old_firewall="$(profile_env_value FIREWALL_ENABLED)"
+    port="$(prompt_default "SOCKS listen port" "${old_port}")"
+    sources="$(prompt_default "Allowed Iran IPv4/CIDRs" "${old_sources}")"
+    sources="$(canonicalize_allowed_sources "${sources}")" || die "invalid allowed-source list."
+    firewall="$(prompt_default "Firewall enabled (0 or 1)" "${old_firewall}")"
+    if [[ "${sources}" != "${old_sources}" ]]; then
+      profile_env_unset IRAN_IP
+      profile_env_unset ALLOWED_IRAN_SOURCES
+      profile_env_set ALLOWED_IRAN_SOURCES "${sources}"
+      changed=1
+      firewall_changed=1
+    elif [[ "${old_source_style}" == "IRAN_IP" ]]; then
+      :
+    fi
+    [[ "${port}" == "${old_port}" ]] || { changed=1; firewall_changed=1; }
+    [[ "${firewall}" == "${old_firewall}" ]] || { changed=1; firewall_changed=1; }
+    profile_env_set TUNNEL_PORT "${port}"
+    profile_env_set FIREWALL_ENABLED "${firewall}"
+  fi
+
+  if [[ "${changed}" -eq 0 ]]; then
+    info "No changes detected; no file, backup, firewall rule, or service was touched."
+    return 0
+  fi
+
+  validate_loaded_profile "${side}"
+  new_ports="$(profile_local_ports_from_loaded "${side}")"
+  validate_profile_ports_before_write "${profile_id}" "${new_ports}" "${profile_id}" "${old_ports}" || return 1
+  if [[ "${side}" == "kharej" ]]; then
+    if [[ "${firewall_changed}" -eq 1 && ( "${old_firewall}" == "1" || "${firewall}" == "1" ) ]]; then
+      ensure_commands iptables
+    fi
+  fi
+  cat <<EOF_OUT
+Redacted edit for ${profile_id}
+Label: ${old_label:-${profile_id}} -> ${label:-${profile_id}}
+Local ports: ${old_ports} -> ${new_ports}
+Credentials: $(if [[ "${user}" == "${old_user}" && "${password}" == "${old_password}" ]]; then printf 'unchanged'; else printf 'changed (redacted)'; fi)
+Connectivity fields: validated
+EOF_OUT
+  confirm "Save this exact profile change?" || { info "Edit cancelled; no files were changed."; return 0; }
+
+  env_snapshot="$(snapshot_managed_file "${env_file}")" || return 1
+  firewall_snapshot="$(mktemp)"
+  chmod 600 "${firewall_snapshot}"
+  if [[ "${side}" == "kharej" ]]; then
+    snapshot_kharej_firewall_rules "${number}" "${firewall_snapshot}" || { rm -f "${env_snapshot}" "${firewall_snapshot}"; return 1; }
+  fi
+  old_active="$(systemctl is-active "${service}" 2>/dev/null || true)"
+  if ! write_loaded_profile_env "${env_file}" "${side}"; then
+    rm -f "${env_snapshot}" "${firewall_snapshot}"
+    return 1
+  fi
+  if [[ "${side}" == "kharej" && "${firewall_changed}" -eq 1 ]]; then
+    if [[ "${firewall}" == "1" ]]; then
+      if ! add_kharej_firewall_rules "${number}" "${sources}" "${port}"; then restart_answer=failure; else restart_answer=ok; fi
+    else
+      if ! delete_kharej_firewall_rules "${number}"; then restart_answer=failure; else restart_answer=ok; fi
+    fi
+    if [[ "${restart_answer}" == "failure" ]]; then
+      restore_failed=0
+      restore_managed_snapshot "${env_snapshot}" "${env_file}" env || restore_failed=1
+      restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || restore_failed=1
+      if [[ "${restore_failed}" -eq 0 ]] && cmp -s "${env_snapshot}" "${env_file}"; then
+        rm -f "${env_snapshot}" "${firewall_snapshot}"
+        printf 'Edit failed while applying firewall changes; the prior profile was restored.\n' >&2
+      else
+        rm -f "${firewall_snapshot}"
+        printf 'Firewall edit and automatic restoration could not be proven. Retained recovery snapshot: %s\n' "${env_snapshot}" >&2
+      fi
+      return 1
+    fi
+  fi
+
+  if ! confirm "Restart only ${service} now?"; then
+    rm -f "${env_snapshot}" "${firewall_snapshot}"
+    info "Saved ${profile_id}; restart required for the running process to load it."
+    return 0
+  fi
+  if systemctl restart "${service}" && systemctl is-active --quiet "${service}" && verify_profile_listeners "${service}" "${new_ports}"; then
+    rm -f "${env_snapshot}" "${firewall_snapshot}"
+    info "Saved and restarted only ${profile_id}."
+    return 0
+  fi
+
+  restore_failed=0
+  restore_managed_snapshot "${env_snapshot}" "${env_file}" env || restore_failed=1
+  if [[ "${side}" == "kharej" ]]; then
+    restore_kharej_firewall_rules "${number}" "${firewall_snapshot}" || restore_failed=1
+  fi
+  if [[ "${old_active}" == "active" ]]; then
+    systemctl restart "${service}" >/dev/null 2>&1 || restore_failed=1
+  else
+    systemctl stop "${service}" >/dev/null 2>&1 || restore_failed=1
+  fi
+  if [[ "${restore_failed}" -eq 0 ]] && cmp -s "${env_snapshot}" "${env_file}"; then
+    rm -f "${env_snapshot}" "${firewall_snapshot}"
+    printf 'Restart verification failed; the prior env, firewall, and service state were restored.\n' >&2
+  else
+    printf 'Restart and automatic restoration could not be proven. Retained recovery snapshot: %s\n' "${env_snapshot}" >&2
+    rm -f "${firewall_snapshot}"
+  fi
+  return 1
+}
+
+clone_profile() {
+  require_root
+  ensure_commands systemctl ss python3
+  local source_side source_number source_id suggested number label user password start_profile
+  local host port mappings sources firewall
+  select_existing_tunnel
+  source_side="${SELECTED_TUNNEL_SIDE}"
+  source_number="${SELECTED_TUNNEL_NUMBER}"
+  source_id="${source_side}-${source_number}"
+  profile_env_load "${SELECTED_TUNNEL_ENV_FILE}" "${source_side}" || die "source profile env is malformed."
+  validate_loaded_profile "${source_side}"
+  user="$(profile_env_value GOST_USER)"
+  password="$(profile_env_value GOST_PASS)"
+  if ! confirm "Reuse the source credentials without displaying them?"; then
+    user="$(prompt_required "New GOST username")"
+    password="$(prompt_secret_confirmed "New GOST password")"
+  fi
+  validate_token_or_die "GOST username" "${user}"
+  validate_token_or_die "GOST password" "${password}"
+  suggested="$(next_free_profile_number "${source_side}")"
+  number="$(prompt_default "New ${source_side} profile number" "${suggested}")"
+  validate_tunnel_number_or_die "${number}"
+  profile_identity_exists "${source_side}" "${number}" && die "profile ${source_side}-${number} already exists."
+  label="$(prompt_default "New profile label (optional)" "")"
+  validate_profile_label_or_die "${label}"
+
+  if [[ "${source_side}" == "iran" ]]; then
+    host="$(prompt_default "Kharej host" "$(profile_env_value KHAREJ_IP)")"
+    port="$(prompt_default "Kharej SOCKS port" "$(profile_env_value TUNNEL_PORT)")"
+    mappings="$(prompt_default "New unique local mappings" "$(profile_env_value MAPPINGS)")"
+    profile_env_reset
+    profile_env_set GOST_USER "${user}"
+    profile_env_set GOST_PASS "${password}"
+    profile_env_set KHAREJ_IP "${host}"
+    profile_env_set TUNNEL_PORT "${port}"
+    profile_env_set MAPPINGS "${mappings}"
+  else
+    sources="$(profile_sources_from_loaded)"
+    firewall="$(profile_env_value FIREWALL_ENABLED)"
+    port="$(prompt_default "New unique SOCKS listen port" "$(profile_env_value TUNNEL_PORT)")"
+    sources="$(prompt_default "Allowed Iran IPv4/CIDRs" "${sources}")"
+    sources="$(canonicalize_allowed_sources "${sources}")" || die "invalid allowed-source list."
+    firewall="$(prompt_default "Firewall enabled (0 or 1)" "${firewall}")"
+    if [[ "${firewall}" == "1" ]]; then
+      if confirm "Apply firewall rules to the cloned profile?"; then
+        ensure_commands iptables
+      else
+        firewall=0
+      fi
+    fi
+    profile_env_reset
+    profile_env_set GOST_USER "${user}"
+    profile_env_set GOST_PASS "${password}"
+    profile_env_set TUNNEL_PORT "${port}"
+    profile_env_set ALLOWED_IRAN_SOURCES "${sources}"
+    profile_env_set FIREWALL_ENABLED "${firewall}"
+  fi
+  [[ -z "${label}" ]] || profile_env_set PROFILE_LABEL "${label}"
+  validate_loaded_profile "${source_side}"
+  cat <<EOF_OUT
+Clone source: ${source_id}
+New profile: ${source_side}-${number}
+Label: ${label:-${source_side}-${number}}
+Local ports: $(profile_local_ports_from_loaded "${source_side}")
+Credentials: configured (redacted)
+EOF_OUT
+  confirm "Create this clone?" || { info "Clone cancelled; source unchanged."; return 0; }
+  if confirm "Start the cloned service now?"; then start_profile=1; else start_profile=0; fi
+  install_new_profile_from_loaded "${source_side}" "${number}" "${start_profile}" || return 1
+  info "Source ${source_id} was not changed."
+}
+
+restart_profile_selection() {
+  local selection="$1"
+  local strong="${2:-0}"
+  local profiles side number service item identity seen failures=0
+  local requested=()
+  local selected=()
+  profiles="$(mktemp)"
+  discover_existing_tunnels "${profiles}"
+  if [[ "${selection}" == "all" ]]; then
+    while IFS='|' read -r side number service _unit _env; do
+      [[ -n "${side}" ]] && requested+=("${side}-${number}")
+    done < "${profiles}"
+  else
+    [[ "${selection}" != *[[:space:]]* && "${selection}" != ,* && "${selection}" != *, && "${selection}" != *,,* ]] || { rm -f "${profiles}"; printf 'Invalid profile selection.\n' >&2; return 1; }
+    IFS=',' read -r -a requested <<< "${selection}"
+  fi
+  if [[ "${#requested[@]}" -eq 0 ]]; then
+    rm -f "${profiles}"
+    printf 'No managed profiles are available to restart.\n' >&2
+    return 1
+  fi
+  seen="|"
+  for item in "${requested[@]}"; do
+    identity="$(profile_id_parts "${item}")" || { rm -f "${profiles}"; printf 'Invalid profile ID: %s\n' "${item}" >&2; return 1; }
+    side="${identity%% *}"
+    number="${identity#* }"
+    profile_identity_exists "${side}" "${number}" || { rm -f "${profiles}"; printf 'Unknown profile ID: %s\n' "${item}" >&2; return 1; }
+    if [[ "${seen}" != *"|${item}|"* ]]; then
+      selected+=("${item}")
+      seen="${seen}${item}|"
+    fi
+  done
+  rm -f "${profiles}"
+  [[ "${#selected[@]}" -gt 0 ]] || { printf 'No profiles selected.\n' >&2; return 1; }
+  info "Selected exact services:"
+  for item in "${selected[@]}"; do
+    identity="$(profile_id_parts "${item}")"
+    info "  $(service_name "${identity%% *}" "${identity#* }")"
+  done
+  if [[ "${strong}" == "1" ]]; then
+    confirm "Restart ALL listed Direct Mode profiles?" || { info "Restart cancelled."; return 0; }
+  else
+    confirm "Restart only the listed profiles?" || { info "Restart cancelled."; return 0; }
+  fi
+  ensure_commands systemctl
+  for item in "${selected[@]}"; do
+    identity="$(profile_id_parts "${item}")"
+    service="$(service_name "${identity%% *}" "${identity#* }")"
+    if systemctl restart "${service}"; then
+      info "Restarted ${item}."
+    else
+      printf 'Failed to restart %s.\n' "${item}" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  [[ "${failures}" -eq 0 ]]
+}
+
+restart_selected_profiles() {
+  local selection
+  read -r -p "Profile IDs (comma-separated) or all: " selection
+  restart_profile_selection "${selection}" 0
+}
+
+restart_all_profiles() {
+  restart_profile_selection all 1
+}
+
+show_direct_profiles_menu() {
+  cat <<'MENU'
+Direct Mode profiles
+====================
+
+1) List all profiles
+2) Show profile detail
+3) Edit a profile
+4) Clone a profile
+5) Restart selected profiles
+6) Restart all profiles
+0) Back
+MENU
+}
+
+direct_profiles_menu() {
+  local choice
+  list_profiles
+  while true; do
+    printf '\n'
+    show_direct_profiles_menu
+    read -r -p "Choose a profile action: " choice
+    case "${choice}" in
+      1) list_profiles ;;
+      2) show_profile_detail ;;
+      3) edit_profile ;;
+      4) clone_profile ;;
+      5) restart_selected_profiles ;;
+      6) restart_all_profiles ;;
+      0) return 0 ;;
+      *) info "Invalid profile option." ;;
+    esac
+  done
+}
+
+list_active_gost_services() {
+  direct_profiles_menu
 }
 
 collect_cleanup_candidates() {

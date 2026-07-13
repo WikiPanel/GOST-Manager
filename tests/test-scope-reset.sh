@@ -41,6 +41,9 @@ assert_contains "official upstream release URL allow-list retained" \
   "https://github.com/go-gost/gost/releases/download/" \
   "${ROOT_DIR}/gost-manager.sh"
 
+wildcard_traffic_commands="$(grep -E 'systemctl[[:space:]].*gost-(iran|kharej)-\*' "${ROOT_DIR}/gost-manager.sh" || true)"
+assert_eq "profile lifecycle uses no wildcard systemctl target" "" "${wildcard_traffic_commands}"
+
 assert_eq "Iran Direct runner byte checksum unchanged" \
   "618b167f3057b67a6f89bb46b1971e5acd6865f57d991566482981965bb53549" \
   "$(sha256_file "${ROOT_DIR}/lib/gost-run-iran.sh")"
