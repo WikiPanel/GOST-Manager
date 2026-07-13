@@ -28,6 +28,7 @@ GOST Manager
 8) List active GOST services
 9) Clean old/broken GOST configs
 10) Monitoring
+11) Server Stability
 0) Exit
 ```
 
@@ -143,3 +144,12 @@ Opens local optional Monitoring Lite with live, 10-minute, 30-minute, and
 1-hour views for the host, network, TCP connections, Direct Mode GOST services,
 tunnels, and collector. Monitoring has no traffic-path dependency and cannot
 change a tunnel service.
+
+## 11) Server Stability
+
+Runs the complete host-stability check, applies the managed sysctl profile,
+and verifies its live values. Exact existing numbered GOST services receive a
+separate `stability.conf` drop-in with the recommended file, task, OOM, and
+restart limits. The wizard runs `daemon-reload` only when a drop-in changes;
+it never restarts a service or reads an env file. The final report lists any
+services whose new limits require a later operator-scheduled restart.

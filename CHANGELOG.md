@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added an idempotent Server Stability wizard that verifies bounded sysctl
+  tuning and installs exact per-profile systemd resource-limit drop-ins
+  without restarting GOST or changing Direct Mode configuration.
 - Simplified v0.2 to official upstream GOST Direct Mode and optional local
   Monitoring Lite.
 - Removed the unreleased Gateway desired-state/runtime packages, launchers,

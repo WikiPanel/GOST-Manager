@@ -45,6 +45,7 @@ Run supported Bash suites:
     bash tests/test-systemd-linux.sh
     bash tests/test-profiles.sh
     bash tests/test-firewall-multi-source.sh
+    bash tests/test-stability.sh
 
 Run the complete gate:
 
@@ -90,6 +91,9 @@ must prove:
 - multi-source firewall ordering and rollback preserve unrelated rules;
 - 50 Iran plus 50 Kharej discovery, inventory, list rendering, and monitoring
   discovery each remain under the documented three-second bound.
+- Server Stability discovers only exact numbered GOST units, performs no
+  service restart, preserves env/unit bytes, and is idempotent after its first
+  successful run.
 
 ## Release
 

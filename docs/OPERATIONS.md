@@ -125,6 +125,24 @@ password retains the secret, a no-op writes nothing, and declining restart
 prints `restart required`. Clone requires new conflict-free local ports and
 never changes the source profile.
 
+## Server Stability
+
+Choose `11) Server Stability` to inspect and apply the bounded host stability
+profile. The wizard shows the current and recommended kernel values, manages
+`/etc/sysctl.d/99-gost-stability.conf`, applies kernel changes with
+`sysctl --system`, and verifies every key.
+
+For every exact numbered Iran/Kharej unit it manages only the separate
+`stability.conf` drop-in. It does not change the original unit or env file and
+does not restart GOST. Review the final `Restart required` list and schedule a
+normal service restart during an approved maintenance window if the new
+process limits must take effect immediately.
+
+Running the wizard again is safe. When all live values and managed files are
+already correct, it performs no file replacement, sysctl apply, or daemon
+reload. If it reports a symlink or unmanaged-file conflict, inspect that exact
+path manually; the wizard will not overwrite it.
+
 ## Recovery If Service Fails
 
 1. Use menu option `5) Show status` and select the tunnel from the numbered list.

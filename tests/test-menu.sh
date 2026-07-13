@@ -73,7 +73,7 @@ for label in \
   assert_contains "legacy menu label ${label%%)*}" "${label}" "${menu_file}"
 done
 assert_contains "Monitoring appended as option 10" "10) Monitoring" "${menu_file}"
-assert_not_contains "main menu has no option 11" "11)" "${menu_file}"
+assert_contains "Server Stability appended as option 11" "11) Server Stability" "${menu_file}"
 assert_not_contains "main menu has no option 12" "12)" "${menu_file}"
 assert_not_contains "Native Gateway placeholder removed" "Coming soon" "${menu_file}"
 
@@ -184,16 +184,26 @@ monitoring_service_action() { printf 'service-%s\n' "$1" >> "${DISPATCH_LOG}"; }
 monitor_one_shot() { printf 'diagnostic\n' >> "${DISPATCH_LOG}"; }
 monitor_maintenance() { printf 'maintenance\n' >> "${DISPATCH_LOG}"; }
 monitor_purge_history() { printf 'purge\n' >> "${DISPATCH_LOG}"; }
+server_stability_wizard() { printf 'stability\n' >> "${DISPATCH_LOG}"; }
 STUB
 # shellcheck source=/dev/null
 source "${dispatch_stubs}"
 (
   monitoring_menu() { printf 'monitoring\n' >> "${DISPATCH_LOG}"; }
-  main_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n0' >/dev/null
+  main_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n0' >/dev/null
 )
-assert_eq "main dispatch order 1 through 10 exact" $'install\nkharej\niran\ndelete\nstatus\nlogs\nrestart\nlist\ncleanup\nmonitoring' "$(sed -n '1,10p' "${DISPATCH_LOG}")"
+assert_eq "main dispatch order 1 through 11 exact" $'install\nkharej\niran\ndelete\nstatus\nlogs\nrestart\nlist\ncleanup\nmonitoring\nstability' "$(sed -n '1,11p' "${DISPATCH_LOG}")"
 assert_contains "main option 10 dispatches Monitoring" '10) monitoring_menu ;;' "${ROOT_DIR}/gost-manager.sh"
+assert_contains "main option 11 dispatches Server Stability" '11) server_stability_wizard ;;' "${ROOT_DIR}/gost-manager.sh"
 assert_not_contains "main dispatch has no Native option" 'native_gost_gateway_coming_soon' "${ROOT_DIR}/gost-manager.sh"
+
+: > "${DISPATCH_LOG}"
+stability_return_output="${TEST_HOME}/stability-return.out"
+(
+  main_menu <<< $'11\n0'
+) > "${stability_return_output}"
+assert_eq "Server Stability returns to the main menu" "2" "$(grep -c '^GOST Manager$' "${stability_return_output}")"
+assert_contains "Server Stability dispatch completes before return" "stability" "${DISPATCH_LOG}"
 
 lite_menu_file="${TEST_HOME}/monitoring-lite-menu.txt"
 show_monitoring_menu > "${lite_menu_file}"
