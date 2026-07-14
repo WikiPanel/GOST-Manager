@@ -418,6 +418,7 @@ apply_plan() {
   fi
   if [[ "${REMOVE_MANAGER}" == "1" ]]; then
     remove_file "$(path_for /usr/local/sbin/gost-manager)" || return 1
+    remove_file "$(path_for /usr/local/lib/gost-manager/VERSION)" || return 1
   fi
   if [[ "${REMOVE_MONITOR_SERVICE}" == "1" ]]; then
     remove_monitor_service || return 1

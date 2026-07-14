@@ -199,6 +199,7 @@ validate_source_manifest() {
   local path entry existing
   local manifest="${SOURCE_ROOT}/packaging/monitoring-runtime-manifest.txt"
   local -a fixed=(
+    "VERSION"
     "gost-manager.sh"
     "lib/gost-run-iran.sh"
     "lib/gost-run-kharej.sh"
@@ -212,6 +213,9 @@ validate_source_manifest() {
   for path in "${fixed[@]}"; do
     [[ -f "${SOURCE_ROOT}/${path}" && ! -L "${SOURCE_ROOT}/${path}" ]] || die "required source file is missing or unsafe: ${path}"
   done
+  local version
+  version="$(< "${SOURCE_ROOT}/VERSION")"
+  [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION must contain a semantic version such as 2.0.0."
   [[ -f "${manifest}" && ! -L "${manifest}" ]] || die "runtime manifest must be a regular non-symlink file."
   RUNTIME_MANIFEST_ENTRIES=()
   while IFS= read -r entry || [[ -n "${entry}" ]]; do
@@ -241,6 +245,7 @@ stage_sources() {
   STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gost-manager-install.XXXXXX")"
   "${CHMOD_BIN}" 700 "${STAGE_DIR}"
   "${INSTALL_BIN}" -d -m 755 "${STAGE_DIR}/lib" "${STAGE_DIR}/monitoring" "${STAGE_DIR}/sbin"
+  "${CP_BIN}" "${SOURCE_ROOT}/VERSION" "${STAGE_DIR}/VERSION"
   "${CP_BIN}" "${SOURCE_ROOT}/gost-manager.sh" "${STAGE_DIR}/gost-manager"
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-iran.sh" "${STAGE_DIR}/lib/gost-run-iran.sh"
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-kharej.sh" "${STAGE_DIR}/lib/gost-run-kharej.sh"
@@ -541,6 +546,7 @@ install_files() {
   ensure_configured_db_parent
 
   install_managed_file "${STAGE_DIR}/gost-manager" "$(path_for /usr/local/sbin/gost-manager)" 755
+  install_managed_file "${STAGE_DIR}/VERSION" "$(path_for /usr/local/lib/gost-manager/VERSION)" 644
   install_managed_file "${STAGE_DIR}/lib/gost-run-iran.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-iran.sh)" 755
   install_managed_file "${STAGE_DIR}/lib/gost-run-kharej.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-kharej.sh)" 755
   install_monitoring_package
@@ -844,7 +850,7 @@ main() {
   activate_collector
   INSTALL_COMMITTED=1
   cleanup
-  info "GOST Manager and monitoring installed."
+  info "GOST Manager v$(< "${SOURCE_ROOT}/VERSION") and monitoring installed."
   info "Monitoring database: ${CONFIGURED_DB_PRODUCTION}"
   info "Run: sudo gost-manager"
 }

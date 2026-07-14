@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+MANAGER_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GOST_BIN="/usr/local/bin/gost"
 LIB_DIR="/usr/local/lib/gost-manager"
 RUNNER_IRAN="${LIB_DIR}/gost-run-iran.sh"
@@ -80,6 +81,34 @@ die() {
 
 info() {
   printf '%s\n' "$*"
+}
+
+manager_version() {
+  local candidate value
+  local -a candidates=()
+  if [[ "${GOST_MANAGER_TESTING:-0}" == "1" && -n "${GOST_MANAGER_VERSION_FILE_TEST:-}" ]]; then
+    candidates+=("${GOST_MANAGER_VERSION_FILE_TEST}")
+  else
+    candidates+=("${MANAGER_SCRIPT_DIR}/VERSION" "${LIB_DIR}/VERSION")
+  fi
+  for candidate in "${candidates[@]}"; do
+    [[ -f "${candidate}" && ! -L "${candidate}" ]] || continue
+    value="$(< "${candidate}")"
+    if [[ "${value}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s\n' "${value}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+manager_banner() {
+  local version
+  if version="$(manager_version)"; then
+    printf 'GOST Manager v%s\n' "${version}"
+  else
+    printf 'GOST Manager version unknown\n'
+  fi
 }
 
 require_root() {
@@ -3854,9 +3883,9 @@ monitoring_menu() {
 }
 
 show_menu() {
+  manager_banner
   cat <<'MENU'
-GOST Manager
-============
+====================
 
 1) Install / Update GOST
 2) Create Kharej tunnel
@@ -3897,6 +3926,16 @@ main_menu() {
   done
 }
 
+run_manager() {
+  if [[ "${1:-}" == "--version" ]]; then
+    [[ "$#" -eq 1 ]] || die "--version does not accept additional arguments."
+    manager_banner
+    return 0
+  fi
+  [[ "$#" -eq 0 ]] || die "unknown manager option: $1"
+  main_menu
+}
+
 if [[ "${GOST_MANAGER_TESTING:-0}" != "1" ]]; then
-  main_menu "$@"
+  run_manager "$@"
 fi

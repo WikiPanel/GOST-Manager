@@ -37,6 +37,7 @@ run_installer() {
 create_source_fixture() {
   local destination="$1"
   mkdir -p "${destination}/lib" "${destination}/packaging"
+  cp "${ROOT_DIR}/VERSION" "${destination}/VERSION"
   cp "${ROOT_DIR}/gost-manager.sh" "${destination}/gost-manager.sh"
   cp "${ROOT_DIR}/lib/gost-run-iran.sh" "${ROOT_DIR}/lib/gost-run-kharej.sh" \
     "${destination}/lib/"
@@ -56,6 +57,9 @@ fresh_root="${TEST_HOME}/fresh"
 mkdir -p "${fresh_root}"
 run_installer "${fresh_root}" >/dev/null
 assert_file "fresh manager installed" "${fresh_root}/usr/local/sbin/gost-manager"
+assert_file "fresh VERSION installed" "${fresh_root}/usr/local/lib/gost-manager/VERSION"
+assert_eq "fresh VERSION content" "2.0.0" "$(< "${fresh_root}/usr/local/lib/gost-manager/VERSION")"
+assert_eq "installed manager version output" "GOST Manager v2.0.0" "$(GOST_MANAGER_TESTING=1 GOST_MANAGER_VERSION_FILE_TEST="${fresh_root}/usr/local/lib/gost-manager/VERSION" bash -c 'source "$1"; manager_banner' _ "${fresh_root}/usr/local/sbin/gost-manager")"
 assert_file "fresh query launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor"
 assert_file "fresh collector launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor-collector"
 assert_file "fresh admin launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor-admin"
@@ -413,6 +417,45 @@ else
   pass "symlinked managed destination rejected"
 fi
 assert_eq "symlink target unchanged" "outside-safe" "$(tr -d '\n' < "${outside}")"
+
+missing_version_source="${TEST_HOME}/source-missing-version"
+create_source_fixture "${missing_version_source}"
+rm -f "${missing_version_source}/VERSION"
+missing_version_root="${TEST_HOME}/missing-version-root"
+mkdir -p "${missing_version_root}"
+missing_version_before="$(tree_digest "${missing_version_root}")"
+if GOST_MANAGER_SOURCE_ROOT_TEST="${missing_version_source}" run_installer "${missing_version_root}" >/dev/null 2>&1; then
+  fail "missing source VERSION is rejected"
+else
+  pass "missing source VERSION is rejected"
+fi
+assert_eq "missing source VERSION causes no mutation" "${missing_version_before}" "$(tree_digest "${missing_version_root}")"
+
+invalid_version_source="${TEST_HOME}/source-invalid-version"
+create_source_fixture "${invalid_version_source}"
+printf 'v2.0.0-beta\n' > "${invalid_version_source}/VERSION"
+invalid_version_root="${TEST_HOME}/invalid-version-root"
+mkdir -p "${invalid_version_root}"
+if GOST_MANAGER_SOURCE_ROOT_TEST="${invalid_version_source}" run_installer "${invalid_version_root}" > "${TEST_HOME}/invalid-version.out" 2>&1; then
+  fail "malformed source VERSION is rejected"
+else
+  pass "malformed source VERSION is rejected"
+fi
+assert_contains "malformed source VERSION has a bounded error" "VERSION must contain a semantic version" "${TEST_HOME}/invalid-version.out"
+
+symlink_version_source="${TEST_HOME}/source-symlink-version"
+create_source_fixture "${symlink_version_source}"
+printf '2.0.0\n' > "${TEST_HOME}/external-version"
+rm -f "${symlink_version_source}/VERSION"
+ln -s "${TEST_HOME}/external-version" "${symlink_version_source}/VERSION"
+symlink_version_root="${TEST_HOME}/symlink-version-root"
+mkdir -p "${symlink_version_root}"
+if GOST_MANAGER_SOURCE_ROOT_TEST="${symlink_version_source}" run_installer "${symlink_version_root}" >/dev/null 2>&1; then
+  fail "symlinked source VERSION is rejected"
+else
+  pass "symlinked source VERSION is rejected"
+fi
+assert_absent "symlinked source VERSION installs nothing" "${symlink_version_root}/usr/local/sbin/gost-manager"
 
 manifest_missing_source="${TEST_HOME}/source-missing"
 create_source_fixture "${manifest_missing_source}"

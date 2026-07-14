@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 2.0.0 - 2026-07-14
+
+- Declared the first stable major release of the official upstream GOST
+  Direct Mode manager.
+- Added the public checksum-verified `setup.sh` flow for latest and pinned
+  GitHub Releases, with safe archive validation and rollback-safe source
+  replacement at `/opt/GOST-Manager`.
+- Added explicit `VERSION` installation, `gost-manager --version`, and a
+  versioned interactive menu header.
+- Added deterministic tag-to-release automation with exact VERSION/tag/notes
+  validation, complete local gates, two verified assets, and validation-only
+  manual runs by default.
 - Classified hosts with neither conntrack sysctl file as an unsupported
   optional monitoring capability, preserving historical error counters while
   stopping repeated errors and showing the state explicitly in snapshots.

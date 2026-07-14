@@ -15,8 +15,8 @@ sudo bash gost-manager.sh
 ## Menu
 
 ```text
-GOST Manager
-============
+GOST Manager v2.0.0
+====================
 
 1) Install / Update GOST
 2) Create Kharej tunnel

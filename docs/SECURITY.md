@@ -1,5 +1,20 @@
 # Security
 
+## Release Installation Trust
+
+The public `setup.sh` entrypoint downloads only HTTPS assets from official
+`WikiPanel/GOST-Manager` GitHub Releases. It saves both the release archive and
+its SHA256 record to a private temporary directory, validates the checksum
+record, verifies the archive with `sha256sum`, rejects unsafe archive members,
+and only then runs the release's local `install.sh`. It does not stream an
+unverified archive into a shell or tar process. Pinned versions never fall
+back silently to latest.
+
+The verified source copy at `/opt/GOST-Manager` is replaceable application
+content. Tunnel credentials, operator monitoring configuration, monitoring
+history, Direct Mode units/drop-ins, and stability configuration remain in
+their separate preserved paths.
+
 ## Env Permissions
 
 Tunnel secrets are stored in:
