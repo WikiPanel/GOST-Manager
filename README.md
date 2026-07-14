@@ -2,7 +2,7 @@
 
 GOST Manager is a menu-based Bash project for installing GOST v3 and managing numbered Iran/Kharej Direct Mode tunnels with systemd on Ubuntu servers.
 
-Direct Mode is the only supported traffic mode in v0.2. The project installs the official `go-gost/gost` release artifact unchanged; GOST Manager is only an installer, configuration, and service wrapper and does not alter upstream protocol behavior. Multiple independent Iran and Kharej profiles are supported.
+Direct Mode is the only supported traffic mode in GOST Manager v2.0.0. The project installs the official `go-gost/gost` release artifact unchanged; GOST Manager is only an installer, configuration, and service wrapper and does not alter upstream protocol behavior. Multiple independent Iran and Kharej profiles are supported.
 
 NGINX Gateway and Native GOST Gateway are cancelled. There is no placeholder, hidden command, route runtime, controller, failover layer, or NGINX dependency. Direct Mode profile management supports safe create, inspect, edit, clone, restart, and delete operations without changing the independent-process traffic architecture.
 
@@ -18,16 +18,55 @@ NGINX Gateway and Native GOST Gateway are cancelled. There is no placeholder, hi
 
 ## Installation
 
-Clone the repository on the server and run:
+Run the public setup command from a root shell. It selects the latest stable
+GitHub Release, verifies its SHA256 checksum, validates the archive, runs the
+local transactional installer, and keeps the verified source at
+`/opt/GOST-Manager`:
 
 ```bash
-sudo bash install.sh
-sudo gost-manager
+bash <(curl -fsSL https://raw.githubusercontent.com/WikiPanel/GOST-Manager/main/setup.sh)
 ```
 
-The installer copies:
+This default is equivalent to selecting `GOST_MANAGER_VERSION=latest`.
+
+Pin an exact release with either `v2.0.0` or `2.0.0`:
+
+```bash
+GOST_MANAGER_VERSION=v2.0.0 \
+bash <(curl -fsSL https://raw.githubusercontent.com/WikiPanel/GOST-Manager/main/setup.sh)
+```
+
+Upgrade safely by rerunning the latest setup command. Same-version setup is
+idempotent. Check or launch the installed manager with:
+
+```bash
+gost-manager --version
+gost-manager
+```
+
+`setup.sh` is the small online release selector, downloader, checksum verifier,
+archive validator, and `/opt/GOST-Manager` updater. `install.sh` is the local
+transactional installer inside the verified release; it does not download the
+GOST Manager application. The raw setup script is therefore not the complete
+payload: release contents are saved to disk and checksum-verified before any
+downloaded script is executed. Release assets and checksums come from the
+official `WikiPanel/GOST-Manager` GitHub Releases page over HTTPS.
+
+Manual Git installation remains available as a fallback:
+
+```bash
+apt-get update
+apt-get install -y git ca-certificates curl
+git clone --depth 1 https://github.com/WikiPanel/GOST-Manager.git /opt/GOST-Manager
+cd /opt/GOST-Manager
+bash install.sh --install-dependencies
+gost-manager
+```
+
+The local installer copies:
 
 - `gost-manager.sh` to `/usr/local/sbin/gost-manager`
+- `VERSION` to `/usr/local/lib/gost-manager/VERSION`
 - `lib/gost-run-iran.sh` to `/usr/local/lib/gost-manager/gost-run-iran.sh`
 - `lib/gost-run-kharej.sh` to `/usr/local/lib/gost-manager/gost-run-kharej.sh`
 - the complete monitoring package to `/usr/local/lib/gost-manager/monitoring`
@@ -36,13 +75,20 @@ The installer copies:
 - `/etc/systemd/system/gost-monitor-collector.service`
 - monitoring history to `/var/lib/gost-manager/metrics.sqlite3`
 
-The monitoring collector is enabled and started on a fresh install. Upgrades preserve a valid operator-modified monitoring config, monitoring history, and the collector's enabled/active state. Existing `/etc/gost/iran-*.env`, `/etc/gost/kharej-*.env`, tunnel units, and traffic service state are not changed.
+The monitoring collector is enabled and started on a fresh install. Upgrades
+preserve a valid operator-modified monitoring config, monitoring history, and
+the collector's enabled/active state. They preserve `/etc/gost/`,
+`/etc/gost-manager/`, `/var/lib/gost-manager/`, numbered Iran/Kharej units and
+drop-ins under `/etc/systemd/system/`, and
+`/etc/sysctl.d/99-gost-stability.conf`. Existing traffic service PIDs,
+restart counts, enabled state, and active state are not intentionally changed.
 
 The installer copies only modules listed in `packaging/monitoring-runtime-manifest.txt`. Existing shared `/usr/local/sbin` and `/etc/systemd/system` metadata is preserved, as is existing `/etc/gost` ownership, mode, content, and file metadata. Private manager directories are enforced and their prior metadata is restored if a later installation phase fails.
 
-Direct run also works:
+Direct source execution also works:
 
 ```bash
+sudo bash gost-manager.sh --version
 sudo bash gost-manager.sh
 ```
 

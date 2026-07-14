@@ -1,0 +1,212 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing version tag to validate, such as v2.0.0
+        required: true
+        type: string
+      publish:
+        description: Publish the validated tag as a GitHub Release
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact release tag
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'push' && github.ref || (startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version)) }}
+
+      - name: Validate tag, version, and release notes
+        id: metadata
+        env:
+          REQUESTED_TAG: ${{ inputs.version }}
+        run: |
+          set -Eeuo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            tag="${REQUESTED_TAG#refs/tags/}"
+            [[ "${tag}" == v* ]] || tag="v${tag}"
+          fi
+          [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::Release tag must match vMAJOR.MINOR.PATCH."
+            exit 1
+          }
+          [[ -f VERSION && ! -L VERSION ]] || {
+            echo "::error::VERSION is missing or unsafe."
+            exit 1
+          }
+          version="$(< VERSION)"
+          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::VERSION must match MAJOR.MINOR.PATCH."
+            exit 1
+          }
+          [[ "${tag}" == "v${version}" ]] || {
+            echo "::error::Tag ${tag} does not match VERSION ${version}."
+            exit 1
+          }
+          notes="docs/releases/${tag}.md"
+          [[ -f "${notes}" && ! -L "${notes}" && -s "${notes}" ]] || {
+            echo "::error::Release notes are missing, empty, or unsafe: ${notes}"
+            exit 1
+          }
+          tag_commit="$(git rev-list -n 1 "refs/tags/${tag}")"
+          head_commit="$(git rev-parse HEAD)"
+          [[ "${tag_commit}" == "${head_commit}" ]] || {
+            echo "::error::Tag ${tag} does not point at checked-out commit ${head_commit}."
+            exit 1
+          }
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "notes=${notes}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Run complete validation suite
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pycache
+        run: |
+          set -Eeuo pipefail
+          make check
+          git diff --check
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]] || {
+            echo "::error::Validation changed the release source tree."
+            git status --short
+            exit 1
+          }
+
+      - name: Build deterministic release assets
+        id: assets
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          asset_dir="${RUNNER_TEMP}/release-assets"
+          archive="${asset_dir}/gost-manager.tar.gz"
+          checksum="${asset_dir}/gost-manager.tar.gz.sha256"
+          file_list="${RUNNER_TEMP}/release-files.zlist"
+          mkdir -p "${asset_dir}"
+          git ls-files -z | LC_ALL=C sort -z > "${file_list}"
+          grep -zFxq VERSION "${file_list}"
+          grep -zFxq setup.sh "${file_list}"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          tar \
+            --create \
+            --format=gnu \
+            --null \
+            --files-from="${file_list}" \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --mtime="@${source_date_epoch}" \
+            --transform="s,^,GOST-Manager-${VERSION}/," \
+            --file="${archive%.gz}"
+          gzip -n -9 "${archive%.gz}"
+          (
+            cd "${asset_dir}"
+            sha256sum "$(basename "${archive}")" > "$(basename "${checksum}")"
+            sha256sum -c "$(basename "${checksum}")"
+          )
+          [[ "$(find "${asset_dir}" -maxdepth 1 -type f -print | wc -l)" -eq 2 ]]
+          {
+            echo "archive=${archive}"
+            echo "checksum=${checksum}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Validate generated archive
+        env:
+          ARCHIVE: ${{ steps.assets.outputs.archive }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          listing="${RUNNER_TEMP}/release-archive.list"
+          verbose="${RUNNER_TEMP}/release-archive.verbose"
+          tar -tzf "${ARCHIVE}" > "${listing}"
+          [[ -s "${listing}" ]]
+          while IFS= read -r member || [[ -n "${member}" ]]; do
+            [[ "${member}" == "GOST-Manager-${VERSION}/"* ]]
+            [[ "${member}" != /* && "${member}" != *"/../"* && "${member}" != *"/.." ]]
+          done < "${listing}"
+          tar -tvzf "${ARCHIVE}" > "${verbose}"
+          while IFS= read -r entry || [[ -n "${entry}" ]]; do
+            [[ "${entry:0:1}" == "-" || "${entry:0:1}" == "d" ]]
+          done < "${verbose}"
+          for required in VERSION setup.sh install.sh gost-manager.sh \
+            lib/gost-run-iran.sh lib/gost-run-kharej.sh \
+            packaging/monitoring-runtime-manifest.txt monitoring/__init__.py; do
+            grep -Fxq "GOST-Manager-${VERSION}/${required}" "${listing}"
+          done
+
+      - name: Refuse an unexpected existing release
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -Eeuo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::Release ${TAG} already exists unexpectedly."
+            exit 1
+          fi
+
+      - name: Publish verified GitHub Release
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+          NOTES: ${{ steps.metadata.outputs.notes }}
+          ARCHIVE: ${{ steps.assets.outputs.archive }}
+          CHECKSUM: ${{ steps.assets.outputs.checksum }}
+        run: |
+          set -Eeuo pipefail
+          remove_incomplete_release() {
+            if gh release view "${TAG}" >/dev/null 2>&1; then
+              if gh release delete "${TAG}" --yes; then
+                echo "::notice::Removed incomplete release ${TAG}."
+              else
+                echo "::error::Unable to remove incomplete release ${TAG}; manual cleanup is required."
+              fi
+            fi
+          }
+          if ! gh release create "${TAG}" \
+            "${ARCHIVE}" \
+            "${CHECKSUM}" \
+            --verify-tag \
+            --title "GOST Manager ${TAG}" \
+            --notes-file "${NOTES}" \
+            --draft; then
+            remove_incomplete_release
+            echo "::error::Release creation or asset upload failed; incomplete-release cleanup was attempted."
+            exit 1
+          fi
+          expected_assets=$'gost-manager.tar.gz\ngost-manager.tar.gz.sha256'
+          actual_assets="$(gh release view "${TAG}" --json assets --jq '.assets[].name' | LC_ALL=C sort)"
+          if [[ "${actual_assets}" != "${expected_assets}" ]]; then
+            remove_incomplete_release
+            echo "::error::Release assets are incomplete or unexpected; incomplete-release cleanup was attempted."
+            exit 1
+          fi
+          if ! gh release edit "${TAG}" --draft=false --prerelease=false; then
+            remove_incomplete_release
+            echo "::error::Release publication failed; incomplete-release cleanup was attempted."
+            exit 1
+          fi
+
+      - name: Confirm validation-only manual run
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
+        run: echo "Release validated without publication."

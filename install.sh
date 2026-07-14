@@ -10,6 +10,7 @@ GOST_MANAGER_ALLOW_TEST_PACKAGE_STUB="${GOST_MANAGER_ALLOW_TEST_PACKAGE_STUB:-0}
 GOST_MANAGER_TEST_MISSING_COMMANDS="${GOST_MANAGER_TEST_MISSING_COMMANDS:-}"
 GOST_MANAGER_TEST_DEP_BIN="${GOST_MANAGER_TEST_DEP_BIN:-}"
 GOST_MANAGER_FAIL_PHASE="${GOST_MANAGER_FAIL_PHASE:-}"
+GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST="${GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST:-}"
 
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 SYSTEMD_ANALYZE_BIN="${SYSTEMD_ANALYZE_BIN:-systemd-analyze}"
@@ -31,6 +32,7 @@ CONFIGURED_DB_PRODUCTION=""
 CONFIGURED_DB_ACTUAL=""
 CONFIGURED_ENV_PRODUCTION=""
 CONFIGURED_ENV_ACTUAL=""
+SOURCE_VERSION=""
 INSTALL_COMMITTED=0
 ROLLBACK_VERIFIED=0
 SERVICE_STATE_RECORDED=0
@@ -92,6 +94,7 @@ require_safe_root() {
   else
     [[ -z "${GOST_MANAGER_ROOT}" ]] || die "GOST_MANAGER_ROOT is allowed only in testing mode."
     [[ "${SOURCE_ROOT}" == "${SCRIPT_DIR}" ]] || die "GOST_MANAGER_SOURCE_ROOT is allowed only in testing mode."
+    [[ -z "${GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST}" ]] || die "GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST is allowed only in testing mode."
     [[ "${EUID}" -eq 0 ]] || die "install.sh must be run as root. Try: sudo bash install.sh"
   fi
   [[ "${SOURCE_ROOT}" == /* && -d "${SOURCE_ROOT}" && ! -L "${SOURCE_ROOT}" ]] || die "installer source root must be a real absolute directory."
@@ -199,6 +202,7 @@ validate_source_manifest() {
   local path entry existing
   local manifest="${SOURCE_ROOT}/packaging/monitoring-runtime-manifest.txt"
   local -a fixed=(
+    "VERSION"
     "gost-manager.sh"
     "lib/gost-run-iran.sh"
     "lib/gost-run-kharej.sh"
@@ -212,6 +216,8 @@ validate_source_manifest() {
   for path in "${fixed[@]}"; do
     [[ -f "${SOURCE_ROOT}/${path}" && ! -L "${SOURCE_ROOT}/${path}" ]] || die "required source file is missing or unsafe: ${path}"
   done
+  SOURCE_VERSION="$(< "${SOURCE_ROOT}/VERSION")"
+  [[ "${SOURCE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION must contain a semantic version such as 2.0.0."
   [[ -f "${manifest}" && ! -L "${manifest}" ]] || die "runtime manifest must be a regular non-symlink file."
   RUNTIME_MANIFEST_ENTRIES=()
   while IFS= read -r entry || [[ -n "${entry}" ]]; do
@@ -241,6 +247,7 @@ stage_sources() {
   STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gost-manager-install.XXXXXX")"
   "${CHMOD_BIN}" 700 "${STAGE_DIR}"
   "${INSTALL_BIN}" -d -m 755 "${STAGE_DIR}/lib" "${STAGE_DIR}/monitoring" "${STAGE_DIR}/sbin"
+  "${CP_BIN}" "${SOURCE_ROOT}/VERSION" "${STAGE_DIR}/VERSION"
   "${CP_BIN}" "${SOURCE_ROOT}/gost-manager.sh" "${STAGE_DIR}/gost-manager"
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-iran.sh" "${STAGE_DIR}/lib/gost-run-iran.sh"
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-kharej.sh" "${STAGE_DIR}/lib/gost-run-kharej.sh"
@@ -541,6 +548,8 @@ install_files() {
   ensure_configured_db_parent
 
   install_managed_file "${STAGE_DIR}/gost-manager" "$(path_for /usr/local/sbin/gost-manager)" 755
+  install_managed_file "${STAGE_DIR}/VERSION" "$(path_for /usr/local/lib/gost-manager/VERSION)" 644
+  inject_failure partial_file_replacement
   install_managed_file "${STAGE_DIR}/lib/gost-run-iran.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-iran.sh)" 755
   install_managed_file "${STAGE_DIR}/lib/gost-run-kharej.sh" "$(path_for /usr/local/lib/gost-manager/gost-run-kharej.sh)" 755
   install_monitoring_package
@@ -603,6 +612,22 @@ activate_collector() {
     "${SYSTEMCTL_BIN}" restart "${MONITOR_SERVICE}"
   fi
   inject_failure collector_start
+}
+
+verify_installed_runtime() {
+  local version_path manager_path installed_version
+  version_path="$(path_for /usr/local/lib/gost-manager/VERSION)"
+  manager_path="$(path_for /usr/local/sbin/gost-manager)"
+  reject_symlink_path "${version_path}"
+  reject_symlink_path "${manager_path}"
+  [[ -f "${version_path}" && ! -L "${version_path}" ]] || die "installed VERSION must be a regular non-symlink file."
+  [[ -f "${manager_path}" && ! -L "${manager_path}" && -x "${manager_path}" ]] || die "installed manager must be a safe executable file."
+  if [[ "${GOST_MANAGER_TESTING}" == "1" && -n "${GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST}" ]]; then
+    printf '%s\n' "${GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST}" > "${version_path}"
+  fi
+  installed_version="$(< "${version_path}")"
+  [[ "${installed_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "installed VERSION must contain a semantic version."
+  [[ "${installed_version}" == "${SOURCE_VERSION}" ]] || die "installed VERSION ${installed_version} does not match source VERSION ${SOURCE_VERSION}."
 }
 
 rollback_files() {
@@ -810,9 +835,10 @@ on_error() {
   if [[ "${INSTALL_COMMITTED}" != "1" ]]; then
     if rollback_transaction; then
       ROLLBACK_VERIFIED=1
+      status=1
     else
       print_recovery_guidance
-      status=1
+      status=70
     fi
   fi
   cleanup
@@ -842,9 +868,10 @@ main() {
   inject_failure file_replacement
   "${SYNC_BIN}"
   activate_collector
+  verify_installed_runtime
   INSTALL_COMMITTED=1
   cleanup
-  info "GOST Manager and monitoring installed."
+  info "GOST Manager v${SOURCE_VERSION} and monitoring installed."
   info "Monitoring database: ${CONFIGURED_DB_PRODUCTION}"
   info "Run: sudo gost-manager"
 }

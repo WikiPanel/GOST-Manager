@@ -2,7 +2,7 @@
 
 ## Product boundary
 
-v0.2 is Direct Mode plus optional local Monitoring Lite. NGINX Gateway and
+GOST Manager v2.0.0 is Direct Mode plus optional local Monitoring Lite. NGINX Gateway and
 Native GOST Gateway are cancelled. Do not add placeholders, hidden commands,
 Gateway packages, NGINX discovery, or a second traffic runtime.
 
@@ -46,6 +46,8 @@ Run supported Bash suites:
     bash tests/test-profiles.sh
     bash tests/test-firewall-multi-source.sh
     bash tests/test-stability.sh
+    bash tests/test-setup.sh
+    bash tests/test-release-workflow.sh
 
 Run the complete gate:
 
@@ -97,9 +99,71 @@ must prove:
 
 ## Release
 
-1. Run make check and git diff --check.
+1. Run `make check` and `git diff --check`.
 2. Confirm Ubuntu 22.04 and Ubuntu 24.04 gates.
-3. Update CHANGELOG.md and user documentation.
+3. Update `VERSION`, `CHANGELOG.md`, both README languages, and
+   `docs/releases/vX.Y.Z.md`.
 4. Record behavior, compatibility, security, tests, manual plan, and rollback
    in the pull request.
 5. Keep a pull request Draft until human review is complete.
+6. Create the version tag only after approval. The tag workflow validates the
+   exact tag, builds deterministic assets, verifies SHA256 locally, and then
+   publishes. Manual workflow runs are validation-only unless their protected
+   `publish` input is explicitly enabled.
+
+## Real-server release validation
+
+This plan is for a disposable or approved staging server. It is documented for
+human execution and must not run automatically against production.
+
+### Phase A: pre-merge branch validation
+
+Phase A is the executable pre-merge blocker. On an approved Ubuntu 22.04 or
+24.04 staging server, install from the exact pull-request branch:
+
+```bash
+git clone --depth 1 \
+  --branch release/v2.0.0-setup \
+  https://github.com/WikiPanel/GOST-Manager.git \
+  /opt/GOST-Manager-v2-review
+cd /opt/GOST-Manager-v2-review
+bash install.sh --install-dependencies
+```
+
+Before running the installer on an existing staging server:
+
+1. Capture every exact `gost-iran-*.service` and
+   `gost-kharej-*.service` `MainPID` and `NRestarts` value.
+2. Checksum `/etc/gost/*.env`, exact managed traffic units, their drop-ins,
+   and `/etc/sysctl.d/99-gost-stability.conf`.
+3. Record firewall state and the monitoring database inode, size, schema
+   version, latest readable samples, and current manager version.
+4. Record collector health and active-user continuity using an approved
+   traffic-level observation without storing credentials.
+
+After installation, compare every recorded value and verify the new manager
+version. Expected results are zero traffic PID changes, zero restart-count
+increases, zero env/unit/drop-in/firewall/stability-file changes, preserved
+monitoring database and readable history, compatible schema, healthy
+Monitoring Lite, and uninterrupted active users.
+
+Phase A validates the local transactional installer and manager upgrade. It
+does not validate the unpublished public Release URL. Do not manually replace
+the production `/opt/GOST-Manager` source during review unless the operator
+explicitly approves that action.
+
+### Phase B: post-release public setup smoke
+
+Run Phase B only after `setup.sh` is merged to `main`, the `v2.0.0` tag exists,
+and both v2.0.0 release assets have been published. Test the public command on
+one fresh supported staging server and one approved existing canary server:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/WikiPanel/GOST-Manager/main/setup.sh)
+```
+
+Repeat the same traffic-continuity, configuration-preservation, monitoring
+history, collector-health, source-version, and installed-version checks. The
+exact public latest-release path cannot be tested until its release assets
+exist, so this post-release smoke is not a pre-merge blocker and requires no
+RC tag or prerelease.

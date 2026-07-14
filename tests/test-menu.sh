@@ -60,6 +60,10 @@ source "${ROOT_DIR}/gost-manager.sh"
 
 menu_file="${TEST_HOME}/menu.txt"
 show_menu > "${menu_file}"
+assert_contains "main menu displays release version" "GOST Manager v2.0.0" "${menu_file}"
+assert_eq "version command displays release version" "GOST Manager v2.0.0" "$(GOST_MANAGER_TESTING=0 bash "${ROOT_DIR}/gost-manager.sh" --version)"
+GOST_MANAGER_VERSION_FILE_TEST="${TEST_HOME}/missing-version" assert_eq \
+  "missing version has a safe fallback" "GOST Manager version unknown" "$(GOST_MANAGER_VERSION_FILE_TEST="${TEST_HOME}/missing-version" manager_banner)"
 for label in \
   "1) Install / Update GOST" \
   "2) Create Kharej tunnel" \
@@ -202,7 +206,7 @@ stability_return_output="${TEST_HOME}/stability-return.out"
 (
   main_menu <<< $'11\n0'
 ) > "${stability_return_output}"
-assert_eq "Server Stability returns to the main menu" "2" "$(grep -c '^GOST Manager$' "${stability_return_output}")"
+assert_eq "Server Stability returns to the main menu" "2" "$(grep -c '^GOST Manager v2.0.0$' "${stability_return_output}")"
 assert_contains "Server Stability dispatch completes before return" "stability" "${DISPATCH_LOG}"
 
 lite_menu_file="${TEST_HOME}/monitoring-lite-menu.txt"

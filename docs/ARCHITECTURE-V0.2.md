@@ -56,8 +56,8 @@ GOST protocol behavior is not changed by this project.
 
 ## Menu contract
 
-    GOST Manager
-    ============
+    GOST Manager v2.0.0
+    ====================
 
     1) Install / Update GOST
     2) Create Kharej tunnel
@@ -122,6 +122,7 @@ schema version and does not erase history.
       metrics.sqlite3
 
     /usr/local/lib/gost-manager/
+      VERSION
       gost-run-iran.sh
       gost-run-kharej.sh
       monitoring/

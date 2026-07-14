@@ -49,6 +49,7 @@ create_fixture() {
   printf 'monitor\n' > "${root}/usr/local/sbin/gost-monitor"
   printf 'admin\n' > "${root}/usr/local/sbin/gost-monitor-admin"
   printf 'collector\n' > "${root}/usr/local/sbin/gost-monitor-collector"
+  printf '2.0.0\n' > "${root}/usr/local/lib/gost-manager/VERSION"
   printf 'python\n' > "${root}/usr/local/lib/gost-manager/monitoring/__init__.py"
   printf 'iran-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-iran.sh"
   printf 'kharej-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-kharej.sh"
@@ -135,6 +136,7 @@ manager_root="${TEST_HOME}/manager"
 create_fixture "${manager_root}"
 run_plan "${manager_root}" manager >/dev/null
 assert_absent "manager-only removes CLI" "${manager_root}/usr/local/sbin/gost-manager"
+assert_absent "manager-only removes VERSION" "${manager_root}/usr/local/lib/gost-manager/VERSION"
 assert_file "manager-only keeps traffic unit" "${manager_root}/etc/systemd/system/gost-iran-1.service"
 assert_file "manager-only keeps monitoring" "${manager_root}/usr/local/sbin/gost-monitor"
 

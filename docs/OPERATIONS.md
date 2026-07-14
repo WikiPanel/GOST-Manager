@@ -3,20 +3,26 @@
 ## Fresh Server Setup
 
 1. Use Ubuntu 22.04 or Ubuntu 24.04.
-2. Clone this repository.
-3. Install the manager:
+2. Run the checksum-verified public setup from a root shell:
 
 ```bash
-sudo bash install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/WikiPanel/GOST-Manager/main/setup.sh)
 ```
 
-4. Start the menu:
+3. Confirm the version and start the menu:
 
 ```bash
-sudo gost-manager
+gost-manager --version
+gost-manager
 ```
 
-5. Choose `1) Install / Update GOST`.
+4. Choose `1) Install / Update GOST`.
+
+Rerun the same setup command for an upgrade. Use
+`GOST_MANAGER_VERSION=v2.0.0` before the command when an exact release must be
+pinned. The verified release source remains at `/opt/GOST-Manager`; manual Git
+clone plus `bash install.sh --install-dependencies` remains the offline/local
+fallback.
 
 ## Kharej Setup
 

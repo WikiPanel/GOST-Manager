@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - feat/direct-mode-multi-server
+      - main
 
 permissions:
   contents: read
@@ -19,7 +19,8 @@ jobs:
           - ubuntu-24.04
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Tool versions
         run: |
           shellcheck --version
