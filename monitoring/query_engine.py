@@ -842,6 +842,7 @@ class QueryEngine:
                 conn,
                 max_rows=self.limits.max_entities,
             )
+            optional_sources = self.database.optional_source_states(conn)
             invalid_env_sources = self.database.invalid_managed_env_sources(conn)
             points = self.database.latest_points(
                 conn,
@@ -884,6 +885,7 @@ class QueryEngine:
             "cycle": cycle,
             "metrics": metric_values,
             "entities": entities,
+            "optional_sources": optional_sources,
             "events": [event.to_dict() for event in events],
             "health_events": [event.to_dict() for event in health_events],
             "health_events_truncated": health_events_truncated,

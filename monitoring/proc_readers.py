@@ -306,11 +306,13 @@ def database_size_metrics(
 def conntrack_metrics(count_text: str, max_text: str) -> list[Metric]:
     count = int(count_text.strip())
     maximum = int(max_text.strip())
-    utilization = count * 100.0 / maximum if maximum > 0 else None
+    if count < 0 or maximum <= 0:
+        raise ValueError("invalid conntrack counters")
+    utilization = count * 100.0 / maximum
     return [
         Metric("host", "conntrack_count", count, "count", "exact", entity_type="host", entity_id="local"),
         Metric("host", "conntrack_max", maximum, "count", "exact", entity_type="host", entity_id="local"),
-        Metric("host", "conntrack_utilization_percent", utilization, "percent", "derived" if utilization is not None else "unavailable", entity_type="host", entity_id="local"),
+        Metric("host", "conntrack_utilization_percent", utilization, "percent", "derived", entity_type="host", entity_id="local"),
     ]
 
 

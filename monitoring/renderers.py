@@ -122,11 +122,41 @@ def render_snapshot_plain(
         ("load 1", "load1"),
         ("load 5", "load5"),
         ("load 15", "load15"),
-        ("conntrack", "conntrack_utilization_percent"),
-        ("file handles", "file_handles_utilization_percent"),
     ):
         point = metrics.get(("host", "local", name))
         lines.append(f"{label}: {_value(point)} [{point.get('quality', 'unavailable') if point else 'unavailable'}; {_age(point)}]")
+    optional_sources = snapshot.get("optional_sources")
+    optional_sources = optional_sources if isinstance(optional_sources, dict) else {}
+    conntrack_source = optional_sources.get("conntrack")
+    conntrack_state = (
+        conntrack_source.get("state")
+        if isinstance(conntrack_source, dict)
+        else None
+    )
+    if conntrack_state in {"unsupported", "failed"}:
+        source_updated_at = conntrack_source.get("updated_at")
+        generated_at = int(snapshot.get("generated_at", 0))
+        source_updated_at = (
+            int(source_updated_at)
+            if isinstance(source_updated_at, (int, float))
+            else generated_at
+        )
+        source_point = {
+            "ts": source_updated_at,
+            "data_age_seconds": max(0, generated_at - source_updated_at),
+        }
+        lines.append(f"conntrack: {conntrack_state} [exact; {_age(source_point)}]")
+    else:
+        point = metrics.get(("host", "local", "conntrack_utilization_percent"))
+        lines.append(
+            f"conntrack: {_value(point)} "
+            f"[{point.get('quality', 'unavailable') if point else 'unavailable'}; {_age(point)}]"
+        )
+    point = metrics.get(("host", "local", "file_handles_utilization_percent"))
+    lines.append(
+        f"file handles: {_value(point)} "
+        f"[{point.get('quality', 'unavailable') if point else 'unavailable'}; {_age(point)}]"
+    )
     root = metrics.get(("filesystem", "fs:/", "filesystem_used_percent"))
     monitor_fs = metrics.get(("filesystem", "fs:/var/lib/gost-manager", "filesystem_used_percent"))
     lines.append(f"root filesystem: {_value(root)} [{_age(root)}]")

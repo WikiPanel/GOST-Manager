@@ -268,6 +268,29 @@ class ReadOnlyDatabase:
         return result
 
     @staticmethod
+    def optional_source_states(conn: sqlite3.Connection) -> dict[str, dict[str, object]]:
+        rows = conn.execute(
+            "SELECT entity_id,metadata_json,updated_at FROM entities "
+            "WHERE entity_type='collector_source' AND entity_id='conntrack'"
+        ).fetchall()
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            try:
+                metadata = json.loads(str(row[1] or "{}"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            state = metadata.get("state")
+            if state not in {"available", "unsupported", "failed"}:
+                continue
+            result[str(row[0])] = {
+                "state": str(state),
+                "updated_at": int(row[2]),
+            }
+        return result
+
+    @staticmethod
     def invalid_managed_env_sources(
         conn: sqlite3.Connection,
         max_rows: int = 64,

@@ -233,6 +233,12 @@ Option `10` opens the compact Monitoring Lite workflow:
 
 The normal live view focuses on host, network, TCP connections, Direct Mode GOST services, tunnels, and collector health. Monitoring is local and optional, has no NGINX dependency, and never enters the traffic path. Existing snapshot/detail/event/export/maintenance/service-control commands remain available under `Advanced tools`. Monitoring command failures return to the manager menu and never trigger traffic service actions.
 
+Conntrack monitoring is also optional. Hosts without both conntrack sysctl files
+report `conntrack: unsupported`; this does not increase source-error counters or
+degrade otherwise healthy observations. A partial, unreadable, or malformed
+conntrack source remains a real collection failure. The collector never loads a
+kernel module to change host capability.
+
 Direct commands are also available:
 
 ```bash

@@ -38,6 +38,52 @@ class EventState:
         message = f"Metric source {source} is {'available' if available else 'unavailable'}"
         return [Event(ts, severity, code, message, {"source": source})]
 
+    def optional_availability(
+        self,
+        source: str,
+        current: str,
+        ts: int,
+    ) -> list[Event]:
+        if current not in {"available", "unsupported", "failed"}:
+            raise ValueError("invalid optional source state")
+        key = f"event.source.{source}"
+        previous_raw = get_json_state(self.conn, key)
+        if previous_raw is True:
+            previous = "available"
+        elif previous_raw is False:
+            previous = "failed"
+        elif previous_raw in {"available", "unsupported", "failed"}:
+            previous = str(previous_raw)
+        else:
+            previous = None
+        set_json_state(self.conn, key, current)
+        if previous == current or (previous is None and current == "available"):
+            return []
+        if current == "unsupported":
+            return [
+                Event(
+                    ts,
+                    "info",
+                    "optional_source_unsupported",
+                    f"Optional metric source {source} is unsupported",
+                    {"source": source},
+                )
+            ]
+        if current == "available" and previous == "unsupported":
+            return [
+                Event(
+                    ts,
+                    "info",
+                    "optional_source_available",
+                    f"Optional metric source {source} is available",
+                    {"source": source},
+                )
+            ]
+        code = "metric_source_available" if current == "available" else "metric_source_unavailable"
+        severity = "info" if current == "available" else "warning"
+        message = f"Metric source {source} is {'available' if current == 'available' else 'unavailable'}"
+        return [Event(ts, severity, code, message, {"source": source})]
+
     def value_transition(
         self,
         key: str,

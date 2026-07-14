@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Classified hosts with neither conntrack sysctl file as an unsupported
+  optional monitoring capability, preserving historical error counters while
+  stopping repeated errors and showing the state explicitly in snapshots.
 - Added an idempotent Server Stability wizard that verifies bounded sysctl
   tuning and installs exact per-profile systemd resource-limit drop-ins
   without restarting GOST or changing Direct Mode configuration.
