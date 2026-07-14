@@ -3,7 +3,7 @@
 GOST Manager یک ابزار Bash منومحور برای نصب GOST v3 و مدیریت چند پروفایل
 شماره‌دار Direct Mode در سمت ایران و خارج روی Ubuntu 22.04 و Ubuntu 24.04 است.
 
-Direct Mode تنها حالت ترافیکی پشتیبانی‌شده در GOST Manager v2.0.0 است. پروژه artifact رسمی
+Direct Mode تنها حالت ترافیکی پشتیبانی‌شده در GOST Manager v2.0.1 است. پروژه artifact رسمی
 go-gost/gost را بدون تغییر نصب می‌کند و فقط wrapper نصب، پیکربندی و سرویس است؛
 رفتار protocol در GOST upstream را تغییر نمی‌دهد.
 
@@ -32,10 +32,13 @@ GitHub Release پایدار را انتخاب می‌کند، SHA256 و ساخت
     bash <(curl -fsSL https://raw.githubusercontent.com/WikiPanel/GOST-Manager/main/setup.sh)
 
 این حالت پیش‌فرض معادل انتخاب `GOST_MANAGER_VERSION=latest` است.
+Setup هم فایل عادی `/etc/os-release` و هم symlink استاندارد Ubuntu به
+`/usr/lib/os-release` را می‌پذیرد؛ metadata فقط در همین مسیرهای مورد اعتماد
+resolve و پیش از هر دانلود به‌صورت داده parse می‌شود.
 
-برای نصب نسخه دقیق، هر دو فرم `v2.0.0` و `2.0.0` پذیرفته می‌شوند:
+برای نصب نسخه دقیق، هر دو فرم `v2.0.1` و `2.0.1` پذیرفته می‌شوند:
 
-    GOST_MANAGER_VERSION=v2.0.0 \
+    GOST_MANAGER_VERSION=v2.0.1 \
     bash <(curl -fsSL https://raw.githubusercontent.com/WikiPanel/GOST-Manager/main/setup.sh)
 
 برای upgrade همان فرمان latest را دوباره اجرا کنید. نصب مجدد همان نسخه
@@ -88,7 +91,7 @@ Direct Mode حفظ می‌شوند. مسیرهای `/etc/gost/`، `/etc/gost-man
 
 ## منوی اصلی
 
-    GOST Manager v2.0.0
+    GOST Manager v2.0.1
     ====================
 
     1) Install / Update GOST

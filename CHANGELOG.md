@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 2.0.1 - 2026-07-14
+
+- Fixed public setup compatibility with the standard Ubuntu
+  `/etc/os-release -> ../usr/lib/os-release` symlink layout.
+- Added a bounded, non-executing OS metadata resolver that accepts trusted
+  regular and symlink layouts, safely falls back to `/usr/lib/os-release`,
+  and rejects broken, looping, writable, oversized, non-root-owned, or
+  unexpected targets before any download or installation work.
+- Added deterministic setup regressions and focused Ubuntu 22.04/24.04
+  real-host OS metadata preflight coverage without changing Direct Mode,
+  firewall, Monitoring schema, or transactional source/runtime behavior.
+
 ## 2.0.0 - 2026-07-14
 
 - Declared the first stable major release of the official upstream GOST

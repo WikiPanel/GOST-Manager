@@ -2,7 +2,7 @@
 
 ## Product boundary
 
-GOST Manager v2.0.0 is Direct Mode plus optional local Monitoring Lite. NGINX Gateway and
+GOST Manager v2.0.1 is Direct Mode plus optional local Monitoring Lite. NGINX Gateway and
 Native GOST Gateway are cancelled. Do not add placeholders, hidden commands,
 Gateway packages, NGINX discovery, or a second traffic runtime.
 

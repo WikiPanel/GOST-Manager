@@ -25,6 +25,15 @@ jobs:
         run: |
           shellcheck --version
           systemd-analyze --version
+      - name: Inspect real Ubuntu OS metadata layout
+        run: |
+          ls -ld /etc /usr /usr/lib
+          ls -l /etc/os-release
+          readlink -f /etc/os-release
+          stat /etc/os-release
+          stat "$(readlink -f /etc/os-release)"
+      - name: Validate real Ubuntu OS metadata preflight
+        run: bash -c 'source ./setup.sh; read_os_release'
       - name: Full local gate
         run: make check
       - name: Real Linux systemd verification

@@ -4,6 +4,7 @@ set -Eeuo pipefail
 readonly RELEASE_ORIGIN="https://github.com/WikiPanel/GOST-Manager"
 readonly ARCHIVE_NAME="gost-manager.tar.gz"
 readonly CHECKSUM_NAME="gost-manager.tar.gz.sha256"
+readonly OS_RELEASE_MAX_BYTES=65536
 
 WORK_DIR=""
 CANDIDATE_DIR=""
@@ -39,6 +40,7 @@ reject_production_test_controls() {
     GOST_MANAGER_SETUP_EUID_TEST \
     GOST_MANAGER_SETUP_ARCH_TEST \
     GOST_MANAGER_SETUP_OS_RELEASE_TEST \
+    GOST_MANAGER_SETUP_OS_RELEASE_UID_TEST \
     GOST_MANAGER_RELEASE_BASE_URL_TEST \
     GOST_MANAGER_SETUP_MISSING_DEPS_TEST \
     GOST_MANAGER_SETUP_DEPENDENCIES_READY_TEST \
@@ -246,24 +248,165 @@ require_root() {
   [[ "${current_euid}" == "0" ]] || die "setup must run as root. Try piping the command to sudo bash."
 }
 
+os_release_stat_mode() {
+  local path="$1"
+  stat -c '%a' -- "${path}" 2>/dev/null || stat -f '%Lp' "${path}"
+}
+
+os_release_stat_uid() {
+  local path="$1"
+  if testing_enabled && [[ -n "${GOST_MANAGER_SETUP_OS_RELEASE_UID_TEST:-}" ]]; then
+    printf '%s\n' "${GOST_MANAGER_SETUP_OS_RELEASE_UID_TEST}"
+    return 0
+  fi
+  stat -c '%u' -- "${path}" 2>/dev/null || stat -f '%u' "${path}"
+}
+
+os_release_stat_size() {
+  local path="$1"
+  stat -c '%s' -- "${path}" 2>/dev/null || stat -f '%z' "${path}"
+}
+
+validate_os_release_mode() {
+  local path="$1"
+  local description="$2"
+  local mode permissions
+  mode="$(os_release_stat_mode "${path}")" || die "cannot inspect ${description} permissions."
+  [[ "${mode}" =~ ^[0-7]{3,4}$ ]] || die "cannot validate ${description} permissions."
+  permissions=$((8#${mode}))
+  (( (permissions & 8#022) == 0 )) || die "${description} must not be writable by group or others."
+}
+
+validate_os_release_parents() {
+  local logical physical canonical uid
+  for logical in /etc /usr /usr/lib; do
+    physical="$(path_for "${logical}")"
+    [[ -d "${physical}" && ! -L "${physical}" ]] || die "unsafe OS metadata directory: ${logical}."
+    canonical="$(cd "${physical}" 2>/dev/null && pwd -P)" || die "cannot resolve OS metadata directory: ${logical}."
+    [[ "${canonical}" == "${physical}" ]] || die "OS metadata directory resolves outside its trusted path: ${logical}."
+    validate_os_release_mode "${physical}" "OS metadata directory ${logical}"
+    if ! testing_enabled; then
+      uid="$(stat -c '%u' -- "${physical}" 2>/dev/null || stat -f '%u' "${physical}")" || \
+        die "cannot inspect OS metadata directory ownership: ${logical}."
+      [[ "${uid}" == "0" ]] || die "OS metadata directory must be owned by root: ${logical}."
+    fi
+  done
+}
+
+resolve_os_release_candidate() {
+  local current="$1"
+  local target parent base canonical_parent
+  local depth=0
+
+  while [[ -L "${current}" ]]; do
+    depth=$((depth + 1))
+    (( depth <= 16 )) || return 1
+    target="$(readlink "${current}")" || return 1
+    [[ -n "${target}" ]] || return 1
+    if [[ "${target}" == /* ]]; then
+      if testing_enabled; then
+        current="$(path_for "${target}")"
+      else
+        current="${target}"
+      fi
+    else
+      current="$(dirname -- "${current}")/${target}"
+    fi
+  done
+
+  [[ -e "${current}" && ! -L "${current}" ]] || return 1
+  parent="$(dirname -- "${current}")"
+  base="$(basename -- "${current}")"
+  canonical_parent="$(cd "${parent}" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "${canonical_parent%/}" "${base}"
+}
+
+resolve_os_release() {
+  local etc_candidate usr_candidate selected resolved
+  local trusted_etc trusted_usr
+  validate_os_release_parents
+  etc_candidate="$(path_for /etc/os-release)"
+  usr_candidate="$(path_for /usr/lib/os-release)"
+  trusted_etc="${etc_candidate}"
+  trusted_usr="${usr_candidate}"
+
+  if [[ -e "${etc_candidate}" || -L "${etc_candidate}" ]]; then
+    selected="${etc_candidate}"
+  elif [[ -e "${usr_candidate}" || -L "${usr_candidate}" ]]; then
+    selected="${usr_candidate}"
+  else
+    die "cannot find OS metadata at /etc/os-release or /usr/lib/os-release."
+  fi
+
+  resolved="$(resolve_os_release_candidate "${selected}")" || die "cannot safely resolve the OS metadata file."
+  case "${resolved}" in
+    "${trusted_etc}"|"${trusted_usr}") ;;
+    *) die "OS metadata resolves outside trusted paths." ;;
+  esac
+  printf '%s\n' "${resolved}"
+}
+
+validate_os_release_file() {
+  local path="$1"
+  local uid size
+  [[ -f "${path}" && ! -L "${path}" && -r "${path}" ]] || die "resolved OS metadata is not a safe regular file."
+  uid="$(os_release_stat_uid "${path}")" || die "cannot inspect OS metadata ownership."
+  [[ "${uid}" =~ ^[0-9]+$ && "${uid}" == "0" ]] || die "OS metadata must be owned by root."
+  validate_os_release_mode "${path}" "OS metadata file"
+  size="$(os_release_stat_size "${path}")" || die "cannot inspect OS metadata size."
+  [[ "${size}" =~ ^[0-9]+$ ]] || die "cannot validate OS metadata size."
+  (( size <= OS_RELEASE_MAX_BYTES )) || die "OS metadata exceeds the ${OS_RELEASE_MAX_BYTES}-byte safety limit."
+  if LC_ALL=C grep -q '[[:cntrl:]]' "${path}"; then
+    die "OS metadata contains control characters."
+  fi
+}
+
+parse_os_release_scalar() {
+  local raw="$1"
+  local value
+  if [[ "${raw}" == \"* ]]; then
+    [[ "${#raw}" -ge 2 && "${raw: -1}" == '"' ]] || return 1
+    value="${raw:1:${#raw}-2}"
+  elif [[ "${raw}" == \'* ]]; then
+    [[ "${#raw}" -ge 2 && "${raw: -1}" == "'" ]] || return 1
+    value="${raw:1:${#raw}-2}"
+  else
+    value="${raw}"
+  fi
+  [[ "${value}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  printf '%s\n' "${value}"
+}
+
 read_os_release() {
   local os_release
-  os_release="$(path_for /etc/os-release)"
-  if testing_enabled && [[ -n "${GOST_MANAGER_SETUP_OS_RELEASE_TEST:-}" ]]; then
-    os_release="${GOST_MANAGER_SETUP_OS_RELEASE_TEST}"
-  fi
-  [[ -f "${os_release}" && ! -L "${os_release}" ]] || die "cannot read a safe /etc/os-release file."
+  os_release="$(resolve_os_release)"
+  validate_os_release_file "${os_release}"
 
-  local id="" version_id="" key value
-  while IFS='=' read -r key value || [[ -n "${key}" ]]; do
-    value="${value%\"}"
-    value="${value#\"}"
+  local id="" version_id="" line key raw value
+  local id_seen=0 version_seen=0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    [[ "${line}" =~ ^[A-Z_][A-Z0-9_]*=.*$ ]] || die "OS metadata contains a malformed key line."
+    key="${line%%=*}"
+    raw="${line#*=}"
     case "${key}" in
-      ID) id="${value}" ;;
-      VERSION_ID) version_id="${value}" ;;
+      ID)
+        (( id_seen == 0 )) || die "OS metadata contains duplicate ID fields."
+        value="$(parse_os_release_scalar "${raw}")" || die "OS metadata has a malformed ID field."
+        id="${value}"
+        id_seen=1
+        ;;
+      VERSION_ID)
+        (( version_seen == 0 )) || die "OS metadata contains duplicate VERSION_ID fields."
+        value="$(parse_os_release_scalar "${raw}")" || die "OS metadata has a malformed VERSION_ID field."
+        version_id="${value}"
+        version_seen=1
+        ;;
     esac
   done < "${os_release}"
 
+  (( id_seen == 1 )) || die "OS metadata is missing ID."
+  (( version_seen == 1 )) || die "OS metadata is missing VERSION_ID."
   [[ "${id}" == "ubuntu" ]] || die "unsupported operating system: GOST Manager supports Ubuntu only."
   case "${version_id}" in
     22.04|24.04) ;;
@@ -637,4 +780,6 @@ main() {
   launch_or_explain
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

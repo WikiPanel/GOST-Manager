@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CURRENT_VERSION="$(< "${ROOT_DIR}/VERSION")"
+PREVIOUS_VERSION="2.0.0"
 # shellcheck source=integration-test-lib.sh
 source "${ROOT_DIR}/tests/integration-test-lib.sh"
 
@@ -63,6 +65,15 @@ write_checksum() {
   printf '%s  gost-manager.tar.gz\n' "${digest}" > "${directory}/gost-manager.tar.gz.sha256"
 }
 
+write_os_release() {
+  local path="$1"
+  local id="${2:-ubuntu}"
+  local version_id="${3:-24.04}"
+  mkdir -p "$(dirname "${path}")"
+  printf 'ID=%s\nVERSION_ID="%s"\n' "${id}" "${version_id}" > "${path}"
+  chmod 644 "${path}"
+}
+
 create_release_tree() {
   local directory="$1"
   local version="$2"
@@ -103,7 +114,7 @@ INSTALLER
 
 create_release_assets() {
   local directory="$1"
-  local version="${2:-2.0.0}"
+  local version="${2:-${CURRENT_VERSION}}"
   local omit="${3:-}"
   local build="${directory}/build"
   mkdir -p "${build}"
@@ -136,15 +147,15 @@ create_malicious_assets() {
   local kind="$2"
   local build="${directory}/build"
   mkdir -p "${build}"
-  create_release_tree "${build}" "2.0.0"
-  python3 - "${build}" "${directory}/gost-manager.tar.gz" "${kind}" <<'PY'
+  create_release_tree "${build}" "${CURRENT_VERSION}"
+  python3 - "${build}" "${directory}/gost-manager.tar.gz" "${kind}" "${CURRENT_VERSION}" <<'PY'
 import io
 import os
 import tarfile
 import sys
 
-build, destination, kind = sys.argv[1:]
-root = "GOST-Manager-2.0.0"
+build, destination, kind, version = sys.argv[1:]
+root = f"GOST-Manager-{version}"
 if kind == "required-symlink":
     os.unlink(os.path.join(build, root, "install.sh"))
 with tarfile.open(destination, "w:gz") as archive:
@@ -201,11 +212,13 @@ new_case() {
     "${case_dir}/root/etc/systemd/system/gost-iran-1.service.d" \
     "${case_dir}/root/etc/systemd/system/gost-kharej-1.service.d" \
     "${case_dir}/root/etc/sysctl.d" \
+    "${case_dir}/root/tmp" \
+    "${case_dir}/root/usr/lib" \
     "${case_dir}/root/var/lib/gost-manager" \
     "${case_dir}/assets" \
     "${case_dir}/state" \
     "${case_dir}/tmp"
-  printf 'ID=ubuntu\nVERSION_ID="24.04"\n' > "${case_dir}/os-release"
+  write_os_release "${case_dir}/root/etc/os-release"
   printf 'test-ca\n' > "${case_dir}/root/etc/ssl/certs/ca-certificates.crt"
   printf 'credential-canary\n' > "${case_dir}/root/etc/gost/iran-1.env"
   printf 'kharej-credential-canary\n' > "${case_dir}/root/etc/gost/kharej-1.env"
@@ -230,7 +243,7 @@ run_setup() {
   GOST_MANAGER_SETUP_ROOT="${case_dir}/root" \
   GOST_MANAGER_SETUP_EUID_TEST="${SETUP_EUID_TEST:-0}" \
   GOST_MANAGER_SETUP_ARCH_TEST="${SETUP_ARCH_TEST:-x86_64}" \
-  GOST_MANAGER_SETUP_OS_RELEASE_TEST="${SETUP_OS_RELEASE_TEST:-${case_dir}/os-release}" \
+  GOST_MANAGER_SETUP_OS_RELEASE_UID_TEST="${SETUP_OS_RELEASE_UID_TEST:-0}" \
   GOST_MANAGER_RELEASE_BASE_URL_TEST="https://fixtures.example/WikiPanel/GOST-Manager" \
   GOST_MANAGER_SETUP_MISSING_DEPS_TEST="${SETUP_MISSING_DEPS_TEST:-}" \
   GOST_MANAGER_SETUP_DEPENDENCIES_READY_TEST="${SETUP_DEPENDENCIES_READY_TEST:-}" \
@@ -249,6 +262,36 @@ run_setup() {
   TMPDIR="${case_dir}/tmp" \
   PATH="${STUB_BIN}:${PATH}" \
     bash "${ROOT_DIR}/setup.sh" "$@" > "${output}" 2>&1
+}
+
+run_os_release_check() {
+  local case_dir="$1"
+  local output="$2"
+  GOST_MANAGER_SETUP_TESTING=1 \
+  GOST_MANAGER_SETUP_ROOT="${case_dir}/root" \
+  GOST_MANAGER_SETUP_OS_RELEASE_UID_TEST="${SETUP_OS_RELEASE_UID_TEST:-0}" \
+    bash -c 'source "$1"; reject_production_test_controls; validate_testing_root; read_os_release' \
+      _ "${ROOT_DIR}/setup.sh" > "${output}" 2>&1
+}
+
+assert_os_release_success() {
+  local name="$1"
+  local case_dir="$2"
+  if run_os_release_check "${case_dir}" "${case_dir}/os-release.out"; then
+    pass "${name}"
+  else
+    fail "${name}"
+  fi
+}
+
+assert_os_release_failure() {
+  local name="$1"
+  local case_dir="$2"
+  if run_os_release_check "${case_dir}" "${case_dir}/os-release.out"; then
+    fail "${name}"
+  else
+    pass "${name}"
+  fi
 }
 
 assert_setup_success() {
@@ -314,9 +357,9 @@ assert_old_transaction_state() {
   local case_dir="$2"
   local source_digest="$3"
   local runtime_digest="$4"
-  assert_eq "${prefix} keeps installed runtime VERSION" "1.9.0" \
+  assert_eq "${prefix} keeps installed runtime VERSION" "${PREVIOUS_VERSION}" \
     "$(< "${case_dir}/root/usr/local/lib/gost-manager/VERSION")"
-  assert_eq "${prefix} keeps source VERSION" "1.9.0" \
+  assert_eq "${prefix} keeps source VERSION" "${PREVIOUS_VERSION}" \
     "$(< "${case_dir}/root/opt/GOST-Manager/VERSION")"
   assert_eq "${prefix} restores prior source digest" "${source_digest}" \
     "$(tree_digest "${case_dir}/root/opt/GOST-Manager")"
@@ -327,11 +370,11 @@ assert_old_transaction_state() {
 assert_new_transaction_alignment() {
   local prefix="$1"
   local case_dir="$2"
-  assert_eq "${prefix} installs runtime VERSION" "2.0.0" \
+  assert_eq "${prefix} installs runtime VERSION" "${CURRENT_VERSION}" \
     "$(< "${case_dir}/root/usr/local/lib/gost-manager/VERSION")"
-  assert_eq "${prefix} installs source VERSION" "2.0.0" \
+  assert_eq "${prefix} installs source VERSION" "${CURRENT_VERSION}" \
     "$(< "${case_dir}/root/opt/GOST-Manager/VERSION")"
-  assert_eq "${prefix} manager reports aligned VERSION" "GOST Manager v2.0.0" \
+  assert_eq "${prefix} manager reports aligned VERSION" "GOST Manager v${CURRENT_VERSION}" \
     "$(installed_manager_version "${case_dir}")"
 }
 
@@ -344,16 +387,16 @@ for curl_flag in "--fail" "--silent" "--show-error" "--location" "--proto" "=htt
   assert_contains "curl uses ${curl_flag}" "${curl_flag}" "${latest_case}/commands.log"
 done
 assert_contains "local installer receives dependency option" "installer --install-dependencies" "${latest_case}/commands.log"
-assert_contains "success prints exact version" "GOST Manager v2.0.0 installed successfully." "${latest_case}/setup.out"
+assert_contains "success prints exact version" "GOST Manager v${CURRENT_VERSION} installed successfully." "${latest_case}/setup.out"
 assert_contains "noninteractive setup prints launch command" "Run: gost-manager" "${latest_case}/setup.out"
 assert_not_contains "noninteractive setup does not launch manager" "launched" "${latest_case}/commands.log"
 assert_file "source tree installed under opt" "${latest_case}/root/opt/GOST-Manager/setup.sh"
-assert_eq "source tree VERSION is exact" "2.0.0" "$(< "${latest_case}/root/opt/GOST-Manager/VERSION")"
-assert_eq "installed VERSION is exact" "2.0.0" "$(< "${latest_case}/root/usr/local/lib/gost-manager/VERSION")"
+assert_eq "source tree VERSION is exact" "${CURRENT_VERSION}" "$(< "${latest_case}/root/opt/GOST-Manager/VERSION")"
+assert_eq "installed VERSION is exact" "${CURRENT_VERSION}" "$(< "${latest_case}/root/usr/local/lib/gost-manager/VERSION")"
 assert_file "installed manager exists" "${latest_case}/root/usr/local/sbin/gost-manager"
-assert_eq "stored source reports its version" "GOST Manager v2.0.0" \
+assert_eq "stored source reports its version" "GOST Manager v${CURRENT_VERSION}" \
   "$(bash "${latest_case}/root/opt/GOST-Manager/gost-manager.sh" --version)"
-assert_contains "stored source menu renders version" "GOST Manager v2.0.0" \
+assert_contains "stored source menu renders version" "GOST Manager v${CURRENT_VERSION}" \
   <(printf '0\n' | bash "${latest_case}/root/opt/GOST-Manager/gost-manager.sh")
 assert_eq "Direct credentials preserved" "credential-canary" "$(< "${latest_case}/root/etc/gost/iran-1.env")"
 assert_eq "Kharej credentials preserved" "kharej-credential-canary" "$(< "${latest_case}/root/etc/gost/kharej-1.env")"
@@ -375,18 +418,18 @@ assert_no_setup_temp "same-version rerun removes workspace" "${latest_case}"
 
 pinned_case="$(new_case pinned)"
 create_release_assets "${pinned_case}/assets"
-SETUP_VERSION_TEST=2.0.0 assert_setup_success "pinned version without v succeeds" "${pinned_case}"
-assert_contains "pinned URL uses normalized tag" "/releases/download/v2.0.0/gost-manager.tar.gz" "${pinned_case}/commands.log"
-SETUP_VERSION_TEST=v2.0.0 assert_setup_success "pinned version with v succeeds" "${pinned_case}"
-assert_contains "pinned v input remains normalized" "/releases/download/v2.0.0/gost-manager.tar.gz.sha256" "${pinned_case}/commands.log"
+SETUP_VERSION_TEST="${CURRENT_VERSION}" assert_setup_success "pinned version without v succeeds" "${pinned_case}"
+assert_contains "pinned URL uses normalized tag" "/releases/download/v${CURRENT_VERSION}/gost-manager.tar.gz" "${pinned_case}/commands.log"
+SETUP_VERSION_TEST="v${CURRENT_VERSION}" assert_setup_success "pinned version with v succeeds" "${pinned_case}"
+assert_contains "pinned v input remains normalized" "/releases/download/v${CURRENT_VERSION}/gost-manager.tar.gz.sha256" "${pinned_case}/commands.log"
 
 upgrade_case="$(new_case newer-upgrade)"
-create_release_assets "${upgrade_case}/assets" 1.9.0
-SETUP_VERSION_TEST=v1.9.0 assert_setup_success "older pinned release installs" "${upgrade_case}"
-assert_eq "older release VERSION installed" "1.9.0" "$(< "${upgrade_case}/root/usr/local/lib/gost-manager/VERSION")"
-create_release_assets "${upgrade_case}/assets" 2.0.0
+create_release_assets "${upgrade_case}/assets" "${PREVIOUS_VERSION}"
+SETUP_VERSION_TEST="v${PREVIOUS_VERSION}" assert_setup_success "older pinned release installs" "${upgrade_case}"
+assert_eq "older release VERSION installed" "${PREVIOUS_VERSION}" "$(< "${upgrade_case}/root/usr/local/lib/gost-manager/VERSION")"
+create_release_assets "${upgrade_case}/assets" "${CURRENT_VERSION}"
 assert_setup_success "newer release upgrade succeeds" "${upgrade_case}"
-assert_eq "newer release replaces installed VERSION" "2.0.0" "$(< "${upgrade_case}/root/usr/local/lib/gost-manager/VERSION")"
+assert_eq "newer release replaces installed VERSION" "${CURRENT_VERSION}" "$(< "${upgrade_case}/root/usr/local/lib/gost-manager/VERSION")"
 assert_eq "newer release preserves monitoring config" "monitor-config-canary" "$(< "${upgrade_case}/root/etc/gost-manager/monitoring.env")"
 
 interactive_case="$(new_case interactive)"
@@ -454,7 +497,7 @@ assert_eq "malformed version performs no download" "0" "$(wc -l < "${invalid_ver
 
 prerelease_case="$(new_case prerelease-version)"
 create_release_assets "${prerelease_case}/assets"
-SETUP_VERSION_TEST=v2.0.0-beta assert_setup_failure "prerelease version is rejected" "${prerelease_case}"
+SETUP_VERSION_TEST="v${CURRENT_VERSION}-beta" assert_setup_failure "prerelease version is rejected" "${prerelease_case}"
 assert_eq "prerelease rejection performs no download" "0" "$(wc -l < "${prerelease_case}/commands.log" | tr -d ' ')"
 
 non_root_case="$(new_case non-root)"
@@ -462,17 +505,191 @@ create_release_assets "${non_root_case}/assets"
 SETUP_EUID_TEST=1000 assert_setup_failure "non-root setup is rejected" "${non_root_case}"
 assert_contains "non-root guidance mentions sudo" "sudo bash" "${non_root_case}/setup.out"
 
+regular_os_case="$(new_case os-release-regular)"
+assert_os_release_success "regular /etc/os-release succeeds" "${regular_os_case}"
+
+relative_os_case="$(new_case os-release-relative-symlink)"
+rm -f "${relative_os_case}/root/etc/os-release"
+write_os_release "${relative_os_case}/root/usr/lib/os-release"
+ln -s ../usr/lib/os-release "${relative_os_case}/root/etc/os-release"
+assert_os_release_success "relative standard os-release symlink succeeds" "${relative_os_case}"
+assert_os_release_success "real Iran standard symlink incident is covered" "${relative_os_case}"
+
+absolute_os_case="$(new_case os-release-absolute-symlink)"
+rm -f "${absolute_os_case}/root/etc/os-release"
+write_os_release "${absolute_os_case}/root/usr/lib/os-release"
+ln -s /usr/lib/os-release "${absolute_os_case}/root/etc/os-release"
+assert_os_release_success "absolute standard os-release symlink succeeds" "${absolute_os_case}"
+
+fallback_os_case="$(new_case os-release-usr-fallback)"
+rm -f "${fallback_os_case}/root/etc/os-release"
+write_os_release "${fallback_os_case}/root/usr/lib/os-release"
+assert_os_release_success "missing /etc/os-release uses safe /usr/lib fallback" "${fallback_os_case}"
+
+broken_os_case="$(new_case os-release-broken-symlink)"
+rm -f "${broken_os_case}/root/etc/os-release"
+write_os_release "${broken_os_case}/root/usr/lib/os-release"
+ln -s ../usr/lib/missing-os-release "${broken_os_case}/root/etc/os-release"
+assert_os_release_failure "broken os-release symlink is rejected" "${broken_os_case}"
+assert_not_contains "broken preferred candidate never falls back silently" \
+  "unsupported operating system" "${broken_os_case}/os-release.out"
+assert_contains "broken symlink failure is explicit" "cannot safely resolve" "${broken_os_case}/os-release.out"
+create_release_assets "${broken_os_case}/assets"
+: > "${broken_os_case}/commands.log"
+assert_setup_failure "broken os-release stops public setup pre-download" "${broken_os_case}"
+assert_eq "OS validation failure performs no download" "0" \
+  "$(wc -l < "${broken_os_case}/commands.log" | tr -d ' ')"
+
+loop_os_case="$(new_case os-release-symlink-loop)"
+rm -f "${loop_os_case}/root/etc/os-release"
+ln -s ../usr/lib/os-release "${loop_os_case}/root/etc/os-release"
+ln -s ../../etc/os-release "${loop_os_case}/root/usr/lib/os-release"
+assert_os_release_failure "os-release symlink loop is rejected" "${loop_os_case}"
+
+unexpected_os_case="$(new_case os-release-unexpected-target)"
+rm -f "${unexpected_os_case}/root/etc/os-release"
+write_os_release "${unexpected_os_case}/root/tmp/os-release"
+ln -s /tmp/os-release "${unexpected_os_case}/root/etc/os-release"
+assert_os_release_failure "os-release symlink to /tmp is rejected" "${unexpected_os_case}"
+assert_contains "unexpected target failure names trusted boundary" \
+  "outside trusted paths" "${unexpected_os_case}/os-release.out"
+
+escape_os_case="$(new_case os-release-root-escape)"
+rm -f "${escape_os_case}/root/etc/os-release"
+write_os_release "${escape_os_case}/outside-os-release"
+ln -s ../../outside-os-release "${escape_os_case}/root/etc/os-release"
+assert_os_release_failure "os-release symlink escaping test root is rejected" "${escape_os_case}"
+
+missing_os_case="$(new_case os-release-missing-both)"
+rm -f "${missing_os_case}/root/etc/os-release"
+assert_os_release_failure "missing trusted os-release candidates are rejected" "${missing_os_case}"
+
+parent_link_os_case="$(new_case os-release-parent-link)"
+rm -rf "${parent_link_os_case}/root/usr/lib"
+mkdir -p "${parent_link_os_case}/outside-lib"
+ln -s "${parent_link_os_case}/outside-lib" "${parent_link_os_case}/root/usr/lib"
+assert_os_release_failure "symlinked OS metadata parent is rejected" "${parent_link_os_case}"
+
+writable_parent_os_case="$(new_case os-release-writable-parent)"
+chmod 775 "${writable_parent_os_case}/root/usr/lib"
+assert_os_release_failure "group-writable OS metadata parent is rejected" "${writable_parent_os_case}"
+
+directory_os_case="$(new_case os-release-directory)"
+rm -f "${directory_os_case}/root/etc/os-release"
+mkdir "${directory_os_case}/root/etc/os-release"
+assert_os_release_failure "os-release directory target is rejected" "${directory_os_case}"
+
+fifo_os_case="$(new_case os-release-fifo)"
+rm -f "${fifo_os_case}/root/etc/os-release"
+mkfifo "${fifo_os_case}/root/etc/os-release"
+assert_os_release_failure "os-release FIFO target is rejected" "${fifo_os_case}"
+
+device_os_case="$(new_case os-release-device)"
+rm -f "${device_os_case}/root/etc/os-release"
+if mknod "${device_os_case}/root/etc/os-release" c 1 3 2>/dev/null; then
+  assert_os_release_failure "os-release device target is rejected" "${device_os_case}"
+else
+  printf 'SKIP: os-release device fixture requires mknod permission\n'
+fi
+
+group_writable_os_case="$(new_case os-release-group-writable)"
+chmod 664 "${group_writable_os_case}/root/etc/os-release"
+assert_os_release_failure "group-writable os-release is rejected" "${group_writable_os_case}"
+assert_contains "group-writable rejection is explicit" \
+  "must not be writable by group or others" "${group_writable_os_case}/os-release.out"
+
+world_writable_os_case="$(new_case os-release-world-writable)"
+chmod 666 "${world_writable_os_case}/root/etc/os-release"
+assert_os_release_failure "world-writable os-release is rejected" "${world_writable_os_case}"
+
+owner_os_case="$(new_case os-release-owner)"
+SETUP_OS_RELEASE_UID_TEST=1000 assert_os_release_failure \
+  "non-root-owned production metadata is rejected" "${owner_os_case}"
+assert_contains "ownership rejection is explicit" "must be owned by root" "${owner_os_case}/os-release.out"
+
+oversized_os_case="$(new_case os-release-oversized)"
+dd if=/dev/zero of="${oversized_os_case}/root/etc/os-release" bs=65537 count=1 2>/dev/null
+chmod 644 "${oversized_os_case}/root/etc/os-release"
+assert_os_release_failure "oversized os-release is rejected" "${oversized_os_case}"
+assert_contains "oversized rejection names size limit" "65536-byte safety limit" "${oversized_os_case}/os-release.out"
+
+missing_id_os_case="$(new_case os-release-missing-id)"
+printf 'VERSION_ID="24.04"\n' > "${missing_id_os_case}/root/etc/os-release"
+assert_os_release_failure "os-release missing ID is rejected" "${missing_id_os_case}"
+
+missing_version_os_case="$(new_case os-release-missing-version)"
+printf 'ID=ubuntu\n' > "${missing_version_os_case}/root/etc/os-release"
+assert_os_release_failure "os-release missing VERSION_ID is rejected" "${missing_version_os_case}"
+
+malformed_id_os_case="$(new_case os-release-malformed-id)"
+printf 'ID=ubuntu;id\nVERSION_ID="24.04"\n' > "${malformed_id_os_case}/root/etc/os-release"
+assert_os_release_failure "malformed os-release ID is rejected" "${malformed_id_os_case}"
+
+malformed_line_os_case="$(new_case os-release-malformed-line)"
+printf 'ID =ubuntu\nVERSION_ID="24.04"\n' > "${malformed_line_os_case}/root/etc/os-release"
+assert_os_release_failure "malformed os-release key line is rejected" "${malformed_line_os_case}"
+
+control_os_case="$(new_case os-release-control-character)"
+printf 'ID=ubuntu\r\nVERSION_ID="24.04"\n' > "${control_os_case}/root/etc/os-release"
+assert_os_release_failure "control characters in os-release are rejected" "${control_os_case}"
+
 unsupported_os_case="$(new_case unsupported-os)"
 create_release_assets "${unsupported_os_case}/assets"
-printf 'ID=debian\nVERSION_ID="12"\n' > "${unsupported_os_case}/os-release"
+write_os_release "${unsupported_os_case}/root/etc/os-release" debian 12
 assert_setup_failure "unsupported operating system is rejected" "${unsupported_os_case}"
 assert_contains "unsupported OS is reported" "supports Ubuntu only" "${unsupported_os_case}/setup.out"
 
 unsupported_release_case="$(new_case unsupported-release)"
 create_release_assets "${unsupported_release_case}/assets"
-printf 'ID=ubuntu\nVERSION_ID="20.04"\n' > "${unsupported_release_case}/os-release"
+write_os_release "${unsupported_release_case}/root/etc/os-release" ubuntu 20.04
 assert_setup_failure "unsupported Ubuntu release is rejected" "${unsupported_release_case}"
 assert_contains "supported Ubuntu releases are named" "Ubuntu 22.04 or 24.04" "${unsupported_release_case}/setup.out"
+
+ubuntu_22_symlink_case="$(new_case ubuntu-22-symlink)"
+rm -f "${ubuntu_22_symlink_case}/root/etc/os-release"
+write_os_release "${ubuntu_22_symlink_case}/root/usr/lib/os-release" ubuntu 22.04
+ln -s ../usr/lib/os-release "${ubuntu_22_symlink_case}/root/etc/os-release"
+assert_os_release_success "Ubuntu 22.04 through standard symlink succeeds" "${ubuntu_22_symlink_case}"
+
+ubuntu_24_symlink_case="$(new_case ubuntu-24-symlink)"
+rm -f "${ubuntu_24_symlink_case}/root/etc/os-release"
+write_os_release "${ubuntu_24_symlink_case}/root/usr/lib/os-release" ubuntu 24.04
+ln -s /usr/lib/os-release "${ubuntu_24_symlink_case}/root/etc/os-release"
+assert_os_release_success "Ubuntu 24.04 through standard symlink succeeds" "${ubuntu_24_symlink_case}"
+
+public_symlink_case="$(new_case public-symlink-setup)"
+rm -f "${public_symlink_case}/root/etc/os-release"
+write_os_release "${public_symlink_case}/root/usr/lib/os-release" ubuntu 24.04
+ln -s ../usr/lib/os-release "${public_symlink_case}/root/etc/os-release"
+cp "${ROOT_DIR}/packaging/monitoring.env" \
+  "${public_symlink_case}/root/etc/gost-manager/monitoring.env"
+create_transactional_release_assets "${public_symlink_case}/assets" "${CURRENT_VERSION}"
+public_env_before="$(tree_digest "${public_symlink_case}/root/etc/gost")"
+public_units_before="$(cksum \
+  "${public_symlink_case}/root/etc/systemd/system/gost-iran-1.service" \
+  "${public_symlink_case}/root/etc/systemd/system/gost-kharej-1.service" \
+  "${public_symlink_case}/root/etc/systemd/system/gost-iran-1.service.d/override.conf" \
+  "${public_symlink_case}/root/etc/systemd/system/gost-kharej-1.service.d/override.conf")"
+assert_setup_success "public setup fixture continues after symlink validation" "${public_symlink_case}"
+assert_new_transaction_alignment "public symlink setup" "${public_symlink_case}"
+assert_contains "public symlink setup reaches release download" "curl" "${public_symlink_case}/commands.log"
+assert_eq "public symlink setup preserves tunnel env files" "${public_env_before}" \
+  "$(tree_digest "${public_symlink_case}/root/etc/gost")"
+assert_eq "public symlink setup preserves traffic units" "${public_units_before}" \
+  "$(cksum \
+    "${public_symlink_case}/root/etc/systemd/system/gost-iran-1.service" \
+    "${public_symlink_case}/root/etc/systemd/system/gost-kharej-1.service" \
+    "${public_symlink_case}/root/etc/systemd/system/gost-iran-1.service.d/override.conf" \
+    "${public_symlink_case}/root/etc/systemd/system/gost-kharej-1.service.d/override.conf")"
+assert_eq "public symlink setup issues zero GOST lifecycle commands" "0" \
+  "$(grep -Ec '^systemctl .*(start|stop|restart|reload).*gost-(iran|kharej)-' \
+    "${public_symlink_case}/commands.log" || true)"
+assert_eq "public symlink setup issues zero firewall commands" "0" \
+  "$(grep -Ec '(^|[[:space:]])(iptables|nft)([[:space:]]|$)' \
+    "${public_symlink_case}/commands.log" || true)"
+assert_eq "public symlink setup preserves Monitoring schema 4" "4" \
+  "$(python3 -c 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])' \
+    "${public_symlink_case}/root/var/lib/gost-manager/metrics.sqlite3")"
 
 unsupported_arch_case="$(new_case unsupported-arch)"
 create_release_assets "${unsupported_arch_case}/assets"
@@ -540,13 +757,13 @@ for malicious_kind in traversal absolute symlink hardlink fifo device required-s
 done
 
 missing_case="$(new_case missing-required)"
-create_release_assets "${missing_case}/assets" 2.0.0 install.sh
+create_release_assets "${missing_case}/assets" "${CURRENT_VERSION}" install.sh
 assert_setup_failure "archive missing required file is rejected" "${missing_case}"
 assert_contains "missing required file is reported" "missing install.sh" "${missing_case}/setup.out"
 
 mismatch_case="$(new_case version-mismatch)"
-create_release_assets "${mismatch_case}/assets" 2.0.1
-SETUP_VERSION_TEST=2.0.0 assert_setup_failure "pinned release mismatch is rejected" "${mismatch_case}"
+create_release_assets "${mismatch_case}/assets" 2.0.2
+SETUP_VERSION_TEST="${CURRENT_VERSION}" assert_setup_failure "pinned release mismatch is rejected" "${mismatch_case}"
 assert_contains "pinned mismatch is reported" "does not match requested" "${mismatch_case}/setup.out"
 
 existing_source_case="$(new_case existing-source)"
@@ -558,15 +775,15 @@ assert_contains "local installer runs from activated source" "installer observed
 assert_absent "successful replacement removes old managed source" "${existing_source_case}/root/opt/GOST-Manager/old-source"
 assert_file "successful replacement preserves complete new source" "${existing_source_case}/root/opt/GOST-Manager/install.sh"
 
-transaction_base="$(new_case transaction-base-1.9.0)"
+transaction_base="$(new_case transaction-base-${PREVIOUS_VERSION})"
 cp "${ROOT_DIR}/packaging/monitoring.env" \
   "${transaction_base}/root/etc/gost-manager/monitoring.env"
-create_transactional_release_assets "${transaction_base}/assets" 1.9.0
-SETUP_VERSION_TEST=v1.9.0 assert_setup_success \
+create_transactional_release_assets "${transaction_base}/assets" "${PREVIOUS_VERSION}"
+SETUP_VERSION_TEST="v${PREVIOUS_VERSION}" assert_setup_success \
   "transaction baseline installs through real local installer" "${transaction_base}"
-assert_eq "transaction baseline runtime VERSION is old" "1.9.0" \
+assert_eq "transaction baseline runtime VERSION is old" "${PREVIOUS_VERSION}" \
   "$(< "${transaction_base}/root/usr/local/lib/gost-manager/VERSION")"
-assert_eq "transaction baseline source VERSION is old" "1.9.0" \
+assert_eq "transaction baseline source VERSION is old" "${PREVIOUS_VERSION}" \
   "$(< "${transaction_base}/root/opt/GOST-Manager/VERSION")"
 
 new_transaction_case() {
@@ -578,7 +795,7 @@ new_transaction_case() {
   cp -a "${transaction_base}/root/." "${case_dir}/root/"
   touch "${case_dir}/state/enabled" "${case_dir}/state/active"
   : > "${case_dir}/commands.log"
-  create_transactional_release_assets "${case_dir}/assets" 2.0.0
+  create_transactional_release_assets "${case_dir}/assets" "${CURRENT_VERSION}"
   printf '%s\n' "${case_dir}"
 }
 
@@ -641,7 +858,7 @@ assert_dir "unverified installer rollback retains prior source backup" \
   "${unverified_source_backup}"
 assert_dir "unverified installer rollback retains managed runtime backup" \
   "${unverified_runtime_backup}"
-assert_eq "unverified installer rollback retains old source VERSION" "1.9.0" \
+assert_eq "unverified installer rollback retains old source VERSION" "${PREVIOUS_VERSION}" \
   "$(< "${unverified_source_backup}/VERSION")"
 assert_contains "unverified installer rollback reports installer recovery" \
   "Installer rollback could not be verified" "${unverified_installer_case}/setup.out"
@@ -666,13 +883,13 @@ SETUP_FAIL_PHASE_TEST=after_source_activation,source_restore assert_setup_failur
 restore_backup="$(find "${restore_failure_case}/root/opt" -maxdepth 1 \
   -type d -name '.GOST-Manager.backup.*' -print -quit)"
 assert_dir "source restore failure retains prior source backup" "${restore_backup}"
-assert_eq "source restore failure retains old backup VERSION" "1.9.0" \
+assert_eq "source restore failure retains old backup VERSION" "${PREVIOUS_VERSION}" \
   "$(< "${restore_backup}/VERSION")"
 assert_eq "source restore failure retains exact prior source digest" \
   "${restore_source_digest}" "$(tree_digest "${restore_backup}")"
 assert_eq "source restore failure leaves runtime unchanged" \
   "${restore_runtime_digest}" "$(managed_runtime_digest "${restore_failure_case}")"
-assert_eq "source restore failure reports current activated source" "2.0.0" \
+assert_eq "source restore failure reports current activated source" "${CURRENT_VERSION}" \
   "$(< "${restore_failure_case}/root/opt/GOST-Manager/VERSION")"
 assert_contains "source restore failure reports unverified rollback" \
   "source rollback could not be verified" "${restore_failure_case}/setup.out"
@@ -688,7 +905,7 @@ cleanup_backup="$(find "${cleanup_failure_case}/root/opt" -maxdepth 1 \
   -type d -name '.GOST-Manager.backup.*' -print -quit)"
 assert_new_transaction_alignment "backup cleanup failure" "${cleanup_failure_case}"
 assert_dir "backup cleanup failure retains private backup" "${cleanup_backup}"
-assert_eq "backup cleanup failure retains old source VERSION" "1.9.0" \
+assert_eq "backup cleanup failure retains old source VERSION" "${PREVIOUS_VERSION}" \
   "$(< "${cleanup_backup}/VERSION")"
 assert_contains "backup cleanup failure prints exact retained path" \
   "${cleanup_backup}" "${cleanup_failure_case}/setup.out"
