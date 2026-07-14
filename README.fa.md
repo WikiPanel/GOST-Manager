@@ -185,6 +185,12 @@ Monitoring Lite اختیاری است، به NGINX وابسته نیست و در
 نمی‌گیرد. failure، maintenance یا حذف آن هیچ سرویس GOST را stop، restart یا
 reconfigure نمی‌کند.
 
+داده‌ی conntrack نیز اختیاری است. اگر هر دو فایل sysctl مربوط به conntrack روی
+میزبان وجود نداشته باشند، خروجی `conntrack: unsupported` نمایش داده می‌شود؛
+این حالت شمارنده‌ی خطا را افزایش نمی‌دهد و سلامت سایر مشاهده‌های معتبر را
+کاهش نمی‌دهد. وجود ناقص فایل‌ها، خطای مجوز یا مقدار نامعتبر همچنان failure
+واقعی است. collector برای تغییر قابلیت kernel هیچ moduleای load نمی‌کند.
+
 دستورات مستقیم:
 
     gost-monitor snapshot

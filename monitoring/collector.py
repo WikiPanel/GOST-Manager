@@ -198,6 +198,7 @@ class CollectorConfig:
 class Capture:
     values: dict[str, object] = dataclasses.field(default_factory=dict)
     errors: dict[str, str] = dataclasses.field(default_factory=dict)
+    states: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def record_error(self, code: str, error: Exception | str) -> None:
         if isinstance(error, CommandExecutionError):
@@ -211,6 +212,21 @@ class Capture:
         else:
             kind = error.__class__.__name__
         self.errors[code] = kind
+        self.states[code] = "failed"
+
+    def record_unsupported(self, code: str) -> None:
+        self.values.pop(code, None)
+        self.errors.pop(code, None)
+        self.states[code] = "unsupported"
+
+    def source_state(self, code: str) -> str:
+        if code in self.errors:
+            return "failed"
+        if code in self.states:
+            return self.states[code]
+        if code in self.values:
+            return "available"
+        raise KeyError(code)
 
     def read(self, code: str, reader: Callable[[], object]) -> object | None:
         try:
@@ -219,6 +235,8 @@ class Capture:
             self.record_error(code, exc)
             return None
         self.values[code] = value
+        self.errors.pop(code, None)
+        self.states[code] = "available"
         return value
 
 
@@ -230,6 +248,27 @@ class CollectionCycleError(RuntimeError):
 
 def _source_metric_name(source: str) -> str:
     return "source_" + re.sub(r"[^a-zA-Z0-9]+", "_", source).strip("_").lower() + "_available"
+
+
+def _capture_conntrack(capture: Capture, sources: CollectorSources, proc: Path) -> None:
+    count_path = proc / "sys/net/netfilter/nf_conntrack_count"
+    maximum_path = proc / "sys/net/netfilter/nf_conntrack_max"
+    try:
+        count_exists = sources.exists(count_path)
+        maximum_exists = sources.exists(maximum_path)
+    except Exception as exc:
+        capture.record_error("conntrack", exc)
+        return
+    if not count_exists and not maximum_exists:
+        capture.record_unsupported("conntrack")
+        return
+    capture.read(
+        "conntrack",
+        lambda: (
+            sources.read_text(count_path),
+            sources.read_text(maximum_path),
+        ),
+    )
 
 
 def _unavailable(
@@ -416,13 +455,7 @@ def _capture_raw(
         ),
     )
     capture.read("proc_diskstats", lambda: parse_diskstats(sources.read_text(proc / "diskstats")))
-    capture.read(
-        "conntrack",
-        lambda: (
-            sources.read_text(proc / "sys/net/netfilter/nf_conntrack_count"),
-            sources.read_text(proc / "sys/net/netfilter/nf_conntrack_max"),
-        ),
-    )
+    _capture_conntrack(capture, sources, proc)
     capture.read(
         "file_handles",
         lambda: (
@@ -548,11 +581,12 @@ def _source_status(
     state = EventState(conn)
     metrics: list[Metric] = []
     events: list[Event] = []
-    all_sources = set(capture.values) | set(capture.errors)
+    all_sources = set(capture.values) | set(capture.errors) | set(capture.states)
     for source in sorted(all_sources):
-        available = source not in capture.errors
-        labels = {"source": source}
-        if not available:
+        source_state = capture.source_state(source)
+        available = source_state == "available"
+        labels = {"source": source, "state": source_state}
+        if source_state == "failed":
             labels["error_kind"] = capture.errors[source]
         metrics.append(
             Metric(
@@ -566,7 +600,10 @@ def _source_status(
                 source,
             )
         )
-        events.extend(state.availability(source, available, ts))
+        if source == "conntrack":
+            events.extend(state.optional_availability(source, source_state, ts))
+        else:
+            events.extend(state.availability(source, available, ts))
     total_raw = get_state(conn, "counter.source_errors_total")
     previous = get_json_state(conn, "counter.source_errors_by_source")
     legacy = get_json_state(conn, "counter.source_errors")
@@ -644,6 +681,7 @@ def _source_status(
                 "exact",
                 {
                     "source": source,
+                    "state": "failed",
                     "error_kind": capture.errors.get(source, "unknown"),
                 },
                 "collector_source",
@@ -713,8 +751,8 @@ def _host_metrics(
     if isinstance(conntrack, tuple):
         try:
             metrics.extend(conntrack_metrics(str(conntrack[0]), str(conntrack[1])))
-        except (ValueError, IndexError) as exc:
-            capture.record_error("conntrack", exc)
+        except (ValueError, IndexError):
+            capture.record_error("conntrack", "parse_error")
             conntrack = None
     if conntrack is None:
         metrics.extend(_unavailable("host", (("conntrack_count", "count"), ("conntrack_max", "count"), ("conntrack_utilization_percent", "percent")), "host", "local"))

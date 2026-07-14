@@ -99,6 +99,23 @@ deduplicated.
 - listen drops and overflows where available;
 - conntrack use and capacity where available.
 
+Conntrack is an optional host capability with three explicit states:
+
+- `available`: both sysctl files are readable and valid, so count, maximum,
+  and derived utilization are collected;
+- `unsupported`: both sysctl files are absent, so numeric metrics are
+  unavailable without an active source error;
+- `failed`: only one file exists, a read is denied, or a value cannot be
+  parsed.
+
+Unsupported cycles do not increment `source_errors_total` and are not included
+in `source_error_codes`. The historical cumulative total is preserved. State
+changes emit at most one informational `optional_source_unsupported` or
+`optional_source_available` event, and repeated cycles in one state emit
+nothing. These informational events do not degrade health. The capability is
+checked every cycle, so files may appear or disappear without restarting the
+collector. Monitoring never runs `modprobe` or changes the host kernel.
+
 ### GOST services
 
 All current exact gost-iran-<number>.service and
@@ -252,3 +269,28 @@ capacity.
   recovery anchors, and restores the original database after injected failure.
 - Tests use temporary directories and command stubs; they never modify the
   host's real /etc, systemd, firewall, GOST services, or /usr/local.
+
+### VMware conntrack regression check
+
+On a host where both conntrack sysctl files are absent, record the cumulative
+counter before upgrade and compare it after several collection intervals:
+
+```bash
+BEFORE=$(gost-monitor collector --window 10m \
+  | awk '/source_errors_total/ {print $0}' | tail -1)
+sleep 30
+AFTER=$(gost-monitor collector --window 10m \
+  | awk '/source_errors_total/ {print $0}' | tail -1)
+printf 'before: %s\nafter:  %s\n' "$BEFORE" "$AFTER"
+
+gost-monitor snapshot | sed -n '1,35p'
+gost-monitor export --window 10m --format csv --granularity raw \
+  --entity-type collector_source --output -
+```
+
+Before this fix, `source_error_codes` could remain 1 and
+`source_errors_total` could increase every 10 seconds. After upgrade, expect
+`source_error_codes = 0`, an unchanged historical `source_errors_total`,
+`conntrack: unsupported`, and `status: healthy` with
+`reasons: observations_current` when all required observations are current.
+The cumulative total is historical and is not expected to reset to zero.
