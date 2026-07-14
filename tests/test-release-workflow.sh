@@ -51,6 +51,18 @@ assert_file "release workflow exists" "${WORKFLOW}"
 assert_file "integration workflow exists" "${INTEGRATION_WORKFLOW}"
 assert_checkout_pin "release workflow" "${WORKFLOW}"
 assert_checkout_pin "integration workflow" "${INTEGRATION_WORKFLOW}"
+assert_contains "integration records trusted OS metadata directories" \
+  "ls -ld /etc /usr /usr/lib" "${INTEGRATION_WORKFLOW}"
+assert_contains "integration records /etc/os-release symlink layout" \
+  "ls -l /etc/os-release" "${INTEGRATION_WORKFLOW}"
+assert_contains "integration records canonical OS metadata target" \
+  "readlink -f /etc/os-release" "${INTEGRATION_WORKFLOW}"
+assert_contains "integration records candidate OS metadata stat" \
+  "stat /etc/os-release" "${INTEGRATION_WORKFLOW}"
+assert_contains "integration records resolved OS metadata stat" \
+  'stat "$(readlink -f /etc/os-release)"' "${INTEGRATION_WORKFLOW}"
+assert_contains "integration runs only focused OS metadata preflight" \
+  "source ./setup.sh; read_os_release" "${INTEGRATION_WORKFLOW}"
 assert_contains "tag trigger exists" "- 'v*.*.*'" "${WORKFLOW}"
 assert_contains "manual dispatch exists" "workflow_dispatch:" "${WORKFLOW}"
 assert_contains "manual version input exists" "version:" "${WORKFLOW}"

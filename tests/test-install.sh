@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CURRENT_VERSION="$(< "${ROOT_DIR}/VERSION")"
 # shellcheck source=integration-test-lib.sh
 source "${ROOT_DIR}/tests/integration-test-lib.sh"
 
@@ -68,8 +69,8 @@ if [[ -f "${fresh_root}/usr/local/lib/gost-manager/VERSION" && ! -L "${fresh_roo
 else
   fail "fresh VERSION is a regular non-symlink file"
 fi
-assert_eq "fresh VERSION content" "2.0.0" "$(< "${fresh_root}/usr/local/lib/gost-manager/VERSION")"
-assert_eq "installed manager version output" "GOST Manager v2.0.0" "$(GOST_MANAGER_TESTING=1 GOST_MANAGER_VERSION_FILE_TEST="${fresh_root}/usr/local/lib/gost-manager/VERSION" bash -c 'source "$1"; manager_banner' _ "${fresh_root}/usr/local/sbin/gost-manager")"
+assert_eq "fresh VERSION content" "${CURRENT_VERSION}" "$(< "${fresh_root}/usr/local/lib/gost-manager/VERSION")"
+assert_eq "installed manager version output" "GOST Manager v${CURRENT_VERSION}" "$(GOST_MANAGER_TESTING=1 GOST_MANAGER_VERSION_FILE_TEST="${fresh_root}/usr/local/lib/gost-manager/VERSION" bash -c 'source "$1"; manager_banner' _ "${fresh_root}/usr/local/sbin/gost-manager")"
 assert_file "fresh query launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor"
 assert_file "fresh collector launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor-collector"
 assert_file "fresh admin launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor-admin"
