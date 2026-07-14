@@ -9,11 +9,16 @@
 - Added the public checksum-verified `setup.sh` flow for latest and pinned
   GitHub Releases, with safe archive validation and rollback-safe source
   replacement at `/opt/GOST-Manager`.
+- Aligned setup source activation with the local installer transaction, added
+  a pre-commit installed VERSION/executable gate, and retained exact recovery
+  paths when source backup cleanup or rollback cannot be verified.
 - Added explicit `VERSION` installation, `gost-manager --version`, and a
   versioned interactive menu header.
 - Added deterministic tag-to-release automation with exact VERSION/tag/notes
   validation, complete local gates, two verified assets, and validation-only
   manual runs by default.
+- Pinned checkout in release and Ubuntu integration workflows to the reviewed
+  immutable `actions/checkout` v4.2.2 commit.
 - Classified hosts with neither conntrack sysctl file as an unsupported
   optional monitoring capability, preserving historical error counters while
   stopping repeated errors and showing the state explicitly in snapshots.

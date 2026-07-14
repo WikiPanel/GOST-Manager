@@ -10,7 +10,11 @@ CANDIDATE_DIR=""
 BACKUP_DIR=""
 TARGET_DIR=""
 TARGET_PARENT=""
-SOURCE_REPLACED=0
+SOURCE_CANDIDATE_READY=0
+PRIOR_SOURCE_BACKED_UP=0
+NEW_SOURCE_ACTIVATED=0
+LOCAL_INSTALL_SUCCEEDED=0
+LOCAL_INSTALL_ROLLBACK_UNVERIFIED=0
 SETUP_COMMITTED=0
 MISSING_DEPENDENCIES=()
 
@@ -40,9 +44,41 @@ reject_production_test_controls() {
     GOST_MANAGER_SETUP_DEPENDENCIES_READY_TEST \
     GOST_MANAGER_SETUP_INTERACTIVE_TEST \
     GOST_MANAGER_SETUP_LAUNCHER_TEST \
-    GOST_MANAGER_SETUP_FAIL_AFTER_SOURCE_REPLACE_TEST; do
+    GOST_MANAGER_SETUP_FAIL_PHASE_TEST; do
     [[ -z "${!name:-}" ]] || die "${name} is a test-only setting."
   done
+}
+
+validate_test_failure_phases() {
+  local phase
+  local -a phases=()
+  testing_enabled || return 0
+  [[ -n "${GOST_MANAGER_SETUP_FAIL_PHASE_TEST:-}" ]] || return 0
+  IFS=',' read -r -a phases <<< "${GOST_MANAGER_SETUP_FAIL_PHASE_TEST}"
+  for phase in "${phases[@]}"; do
+    case "${phase}" in
+      before_source_activation|candidate_rename|after_source_activation|source_restore|backup_cleanup) ;;
+      *) die "unknown setup test failure phase: ${phase:-empty}" ;;
+    esac
+  done
+}
+
+setup_failure_enabled() {
+  local expected="$1"
+  local phase
+  local -a phases=()
+  testing_enabled || return 1
+  IFS=',' read -r -a phases <<< "${GOST_MANAGER_SETUP_FAIL_PHASE_TEST:-}"
+  for phase in "${phases[@]+"${phases[@]}"}"; do
+    [[ "${phase}" == "${expected}" ]] && return 0
+  done
+  return 1
+}
+
+inject_setup_failure() {
+  local phase="$1"
+  setup_failure_enabled "${phase}" || return 0
+  die "injected setup failure at phase: ${phase}"
 }
 
 validate_testing_root() {
@@ -64,42 +100,137 @@ path_for() {
   fi
 }
 
+validate_private_source_path() {
+  local path="$1"
+  local kind="$2"
+  local parent base
+  [[ -n "${path}" && "${path}" != "/" ]] || return 1
+  parent="$(dirname -- "${path}")"
+  base="$(basename -- "${path}")"
+  [[ "${parent}" == "${TARGET_PARENT}" ]] || return 1
+  case "${kind}" in
+    candidate) [[ "${base}" =~ ^\.GOST-Manager\.new\.[A-Za-z0-9]+$ ]] ;;
+    backup) [[ "${base}" =~ ^\.GOST-Manager\.backup\.[A-Za-z0-9]+$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
 remove_private_tree() {
   local path="$1"
-  [[ -n "${path}" && "${path}" != "/" ]] || return 0
-  case "${path}" in
-    "${TARGET_PARENT}"/.GOST-Manager.new.*|"${TARGET_PARENT}"/.GOST-Manager.backup.*|"${WORK_DIR}")
-      rm -rf -- "${path}"
+  local kind="$2"
+  [[ ! -e "${path}" && ! -L "${path}" ]] && return 0
+  [[ -d "${path}" && ! -L "${path}" ]] || {
+    printf 'ERROR: refusing to remove unsafe %s path: %s\n' "${kind}" "${path}" >&2
+    return 1
+  }
+  case "${kind}" in
+    candidate|backup)
+      validate_private_source_path "${path}" "${kind}" || {
+        printf 'ERROR: refusing to remove unexpected %s path: %s\n' "${kind}" "${path}" >&2
+        return 1
+      }
+      ;;
+    workspace)
+      [[ "${path}" == "${WORK_DIR}" && "$(basename -- "${path}")" =~ ^gost-manager-setup\.[A-Za-z0-9]+$ ]] || {
+        printf 'ERROR: refusing to remove unexpected setup workspace: %s\n' "${path}" >&2
+        return 1
+      }
+      ;;
+    active-source)
+      [[ "${NEW_SOURCE_ACTIVATED}" == "1" && "${path}" == "${TARGET_DIR}" ]] || {
+        printf 'ERROR: refusing to remove an unproven active source: %s\n' "${path}" >&2
+        return 1
+      }
       ;;
     *)
-      die "refusing to remove an unexpected setup path: ${path}"
+      printf 'ERROR: refusing to remove unknown setup path kind: %s\n' "${kind}" >&2
+      return 1
       ;;
   esac
+  rm -rf -- "${path}"
+}
+
+print_source_recovery() {
+  printf 'ERROR: source rollback could not be verified.\n' >&2
+  if [[ -e "${TARGET_DIR}" || -L "${TARGET_DIR}" ]]; then
+    printf 'Current source path: %s\n' "${TARGET_DIR}" >&2
+  fi
+  if [[ -n "${BACKUP_DIR}" ]]; then
+    printf 'Retained source backup: %s\n' "${BACKUP_DIR}" >&2
+  fi
+  if [[ -n "${CANDIDATE_DIR}" && ( -e "${CANDIDATE_DIR}" || -L "${CANDIDATE_DIR}" ) ]]; then
+    printf 'Retained source candidate: %s\n' "${CANDIDATE_DIR}" >&2
+  fi
+}
+
+rollback_source_tree() {
+  if [[ "${PRIOR_SOURCE_BACKED_UP}" == "0" && "${NEW_SOURCE_ACTIVATED}" == "0" ]]; then
+    return 0
+  fi
+  if setup_failure_enabled source_restore; then
+    printf 'ERROR: injected setup failure at phase: source_restore\n' >&2
+    return 1
+  fi
+  if [[ "${PRIOR_SOURCE_BACKED_UP}" == "1" ]]; then
+    validate_private_source_path "${BACKUP_DIR}" backup || return 1
+    [[ -d "${BACKUP_DIR}" && ! -L "${BACKUP_DIR}" ]] || return 1
+  fi
+  if [[ "${NEW_SOURCE_ACTIVATED}" == "1" ]]; then
+    remove_private_tree "${TARGET_DIR}" active-source || return 1
+    NEW_SOURCE_ACTIVATED=0
+  fi
+  if [[ "${PRIOR_SOURCE_BACKED_UP}" == "1" ]]; then
+    [[ ! -e "${TARGET_DIR}" && ! -L "${TARGET_DIR}" ]] || return 1
+    mv -- "${BACKUP_DIR}" "${TARGET_DIR}" || return 1
+    [[ -d "${TARGET_DIR}" && ! -L "${TARGET_DIR}" && ! -e "${BACKUP_DIR}" ]] || return 1
+    BACKUP_DIR=""
+    PRIOR_SOURCE_BACKED_UP=0
+  fi
+  return 0
 }
 
 cleanup() {
   local status=$?
+  local cleanup_failed=0
   trap - EXIT INT TERM
+  set +e
 
-  if [[ "${status}" -ne 0 && "${SOURCE_REPLACED}" == "1" && "${SETUP_COMMITTED}" == "0" ]]; then
-    if [[ -e "${TARGET_DIR}" || -L "${TARGET_DIR}" ]]; then
-      rm -rf -- "${TARGET_DIR}"
-    fi
-    if [[ -n "${BACKUP_DIR}" && -d "${BACKUP_DIR}" && ! -L "${BACKUP_DIR}" ]]; then
-      if mv -- "${BACKUP_DIR}" "${TARGET_DIR}"; then
-        BACKUP_DIR=""
-      else
-        printf 'ERROR: source rollback failed; recovery source remains at %s\n' "${BACKUP_DIR}" >&2
+  if [[ "${status}" -ne 0 && "${SETUP_COMMITTED}" == "0" ]]; then
+    if [[ "${LOCAL_INSTALL_ROLLBACK_UNVERIFIED}" == "1" ]]; then
+      printf 'ERROR: installer rollback was not verified; source rollback was skipped to retain matching recovery material.\n' >&2
+      print_source_recovery
+      status=1
+    elif [[ "${LOCAL_INSTALL_SUCCEEDED}" == "0" ]]; then
+      if ! rollback_source_tree; then
+        print_source_recovery
+        status=1
       fi
+    else
+      printf 'ERROR: local installation succeeded; source rollback was intentionally skipped to preserve runtime/source alignment.\n' >&2
+      print_source_recovery
+      status=1
     fi
   fi
 
-  if [[ -n "${CANDIDATE_DIR}" && -d "${CANDIDATE_DIR}" && ! -L "${CANDIDATE_DIR}" ]]; then
-    remove_private_tree "${CANDIDATE_DIR}"
+  if [[ -n "${CANDIDATE_DIR}" && ( -e "${CANDIDATE_DIR}" || -L "${CANDIDATE_DIR}" ) ]]; then
+    if ! remove_private_tree "${CANDIDATE_DIR}" candidate; then
+      cleanup_failed=1
+    else
+      CANDIDATE_DIR=""
+      SOURCE_CANDIDATE_READY=0
+    fi
   fi
-  if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" && ! -L "${WORK_DIR}" ]]; then
-    remove_private_tree "${WORK_DIR}"
+  if [[ -n "${BACKUP_DIR}" && "${PRIOR_SOURCE_BACKED_UP}" == "0" && ( -e "${BACKUP_DIR}" || -L "${BACKUP_DIR}" ) ]]; then
+    if ! remove_private_tree "${BACKUP_DIR}" backup; then
+      cleanup_failed=1
+    else
+      BACKUP_DIR=""
+    fi
   fi
+  if [[ -n "${WORK_DIR}" && ( -e "${WORK_DIR}" || -L "${WORK_DIR}" ) ]]; then
+    remove_private_tree "${WORK_DIR}" workspace || cleanup_failed=1
+  fi
+  [[ "${cleanup_failed}" == "0" ]] || status=1
   exit "${status}"
 }
 
@@ -311,9 +442,12 @@ extract_and_verify_release() {
 }
 
 validate_target() {
+  local resolved_parent
   TARGET_DIR="$(path_for /opt/GOST-Manager)"
   TARGET_PARENT="$(dirname "${TARGET_DIR}")"
   [[ -d "${TARGET_PARENT}" && ! -L "${TARGET_PARENT}" ]] || die "source parent is missing or unsafe: ${TARGET_PARENT}"
+  resolved_parent="$(cd "${TARGET_PARENT}" && pwd -P)"
+  [[ "${resolved_parent}" == "${TARGET_PARENT}" ]] || die "source parent contains a symlink component: ${TARGET_PARENT}"
   if [[ -e "${TARGET_DIR}" || -L "${TARGET_DIR}" ]]; then
     [[ -d "${TARGET_DIR}" && ! -L "${TARGET_DIR}" ]] || die "existing source path is not a safe directory: ${TARGET_DIR}"
   fi
@@ -324,37 +458,92 @@ prepare_source_tree() {
   CANDIDATE_DIR="$(mktemp -d "${TARGET_PARENT}/.GOST-Manager.new.XXXXXX")"
   chmod 700 "${CANDIDATE_DIR}"
   cp -a "${release_root}/." "${CANDIDATE_DIR}/"
+  validate_private_source_path "${CANDIDATE_DIR}" candidate || die "candidate source path is outside the managed source parent."
+  [[ -d "${CANDIDATE_DIR}" && ! -L "${CANDIDATE_DIR}" ]] || die "candidate source path is unsafe."
+  SOURCE_CANDIDATE_READY=1
 }
 
-replace_source_tree() {
+activate_source_tree() {
+  [[ "${SOURCE_CANDIDATE_READY}" == "1" ]] || die "source candidate is not ready."
+  inject_setup_failure before_source_activation
   if [[ -d "${TARGET_DIR}" ]]; then
     BACKUP_DIR="$(mktemp -d "${TARGET_PARENT}/.GOST-Manager.backup.XXXXXX")"
+    validate_private_source_path "${BACKUP_DIR}" backup || die "source backup path is outside the managed source parent."
     rmdir "${BACKUP_DIR}"
     mv -- "${TARGET_DIR}" "${BACKUP_DIR}"
+    PRIOR_SOURCE_BACKED_UP=1
+    [[ -d "${BACKUP_DIR}" && ! -L "${BACKUP_DIR}" ]] || die "prior source backup could not be verified."
   fi
-  SOURCE_REPLACED=1
+  inject_setup_failure candidate_rename
   mv -- "${CANDIDATE_DIR}" "${TARGET_DIR}"
+  NEW_SOURCE_ACTIVATED=1
+  SOURCE_CANDIDATE_READY=0
   CANDIDATE_DIR=""
-  if testing_enabled && [[ "${GOST_MANAGER_SETUP_FAIL_AFTER_SOURCE_REPLACE_TEST:-0}" == "1" ]]; then
-    die "injected failure after source replacement."
-  fi
+  [[ -d "${TARGET_DIR}" && ! -L "${TARGET_DIR}" ]] || die "activated source could not be verified."
+  inject_setup_failure after_source_activation
 }
 
 run_local_installer() {
-  local release_root="$1"
-  (
-    cd "${release_root}"
-    bash install.sh --install-dependencies
-  )
+  local status
+  [[ "${NEW_SOURCE_ACTIVATED}" == "1" ]] || die "local installer requires an activated source tree."
+  if testing_enabled; then
+    if (
+      cd "${TARGET_DIR}"
+      GOST_MANAGER_TESTING=1 \
+      GOST_MANAGER_ROOT="${GOST_MANAGER_SETUP_ROOT}" \
+      PYTHONPYCACHEPREFIX="${WORK_DIR}/pycache" \
+        bash install.sh --install-dependencies
+    ); then
+      LOCAL_INSTALL_SUCCEEDED=1
+      return 0
+    else
+      status=$?
+    fi
+  else
+    if (
+      cd "${TARGET_DIR}"
+      bash install.sh --install-dependencies
+    ); then
+      LOCAL_INSTALL_SUCCEEDED=1
+      return 0
+    else
+      status=$?
+    fi
+  fi
+  [[ "${status}" != "70" ]] || LOCAL_INSTALL_ROLLBACK_UNVERIFIED=1
+  return "${status}"
 }
 
-verify_installed_version() {
+verify_runtime_source_alignment() {
   local expected_version="$1"
-  local installed_file installed_version
+  local source_file installed_file manager_file source_version installed_version
+  source_file="${TARGET_DIR}/VERSION"
   installed_file="$(path_for /usr/local/lib/gost-manager/VERSION)"
+  manager_file="$(path_for /usr/local/sbin/gost-manager)"
+  [[ -f "${source_file}" && ! -L "${source_file}" ]] || die "source VERSION file is missing or unsafe."
   [[ -f "${installed_file}" && ! -L "${installed_file}" ]] || die "installed VERSION file is missing or unsafe."
+  [[ -f "${manager_file}" && ! -L "${manager_file}" && -x "${manager_file}" ]] || die "installed manager executable is missing or unsafe."
+  source_version="$(< "${source_file}")"
   installed_version="$(< "${installed_file}")"
-  [[ "${installed_version}" == "${expected_version}" ]] || die "installed version does not match release v${expected_version}."
+  [[ "${source_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "source VERSION is invalid after activation."
+  [[ "${installed_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "installed VERSION is invalid after installation."
+  [[ "${source_version}" == "${expected_version}" ]] || die "activated source version does not match release v${expected_version}."
+  [[ "${installed_version}" == "${source_version}" ]] || die "installed version does not match activated source v${source_version}."
+}
+
+cleanup_prior_source_backup() {
+  [[ "${PRIOR_SOURCE_BACKED_UP}" == "1" ]] || return 0
+  if setup_failure_enabled backup_cleanup; then
+    printf 'ERROR: injected setup failure at phase: backup_cleanup\n' >&2
+    printf 'Retained source backup: %s\n' "${BACKUP_DIR}" >&2
+    return 1
+  fi
+  remove_private_tree "${BACKUP_DIR}" backup || {
+    printf 'Retained source backup: %s\n' "${BACKUP_DIR}" >&2
+    return 1
+  }
+  BACKUP_DIR=""
+  PRIOR_SOURCE_BACKED_UP=0
 }
 
 launch_or_explain() {
@@ -384,6 +573,7 @@ main() {
   local requested_version="" release_path base archive_url checksum_url release_root version
   reject_production_test_controls
   validate_testing_root
+  validate_test_failure_phases
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       --version)
@@ -436,15 +626,12 @@ main() {
 
   prepare_source_tree "${release_root}"
   info "Installing GOST Manager v${version}..."
-  run_local_installer "${CANDIDATE_DIR}"
-  verify_installed_version "${version}"
-  replace_source_tree
+  activate_source_tree
+  run_local_installer
+  verify_runtime_source_alignment "${version}"
 
   SETUP_COMMITTED=1
-  if [[ -n "${BACKUP_DIR}" ]]; then
-    remove_private_tree "${BACKUP_DIR}"
-    BACKUP_DIR=""
-  fi
+  cleanup_prior_source_backup || die "installation committed, but prior source backup cleanup failed."
   info "Source installed at: /opt/GOST-Manager"
   info "GOST Manager v${version} installed successfully."
   launch_or_explain

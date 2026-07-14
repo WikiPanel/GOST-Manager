@@ -116,28 +116,54 @@ must prove:
 This plan is for a disposable or approved staging server. It is documented for
 human execution and must not run automatically against production.
 
-Fresh Ubuntu 22.04/24.04 server:
+### Phase A: pre-merge branch validation
 
-1. Run
-   `bash <(curl -fsSL https://raw.githubusercontent.com/WikiPanel/GOST-Manager/main/setup.sh)`.
-2. Verify `gost-manager --version`, menu startup, and the complete source at
-   `/opt/GOST-Manager`.
-3. Verify the monitoring collector is healthy.
-4. Verify no Iran or Kharej profile or service was created automatically.
+Phase A is the executable pre-merge blocker. On an approved Ubuntu 22.04 or
+24.04 staging server, install from the exact pull-request branch:
 
-Existing server before setup:
+```bash
+git clone --depth 1 \
+  --branch release/v2.0.0-setup \
+  https://github.com/WikiPanel/GOST-Manager.git \
+  /opt/GOST-Manager-v2-review
+cd /opt/GOST-Manager-v2-review
+bash install.sh --install-dependencies
+```
+
+Before running the installer on an existing staging server:
 
 1. Capture every exact `gost-iran-*.service` and
    `gost-kharej-*.service` `MainPID` and `NRestarts` value.
 2. Checksum `/etc/gost/*.env`, exact managed traffic units, their drop-ins,
    and `/etc/sysctl.d/99-gost-stability.conf`.
-3. Record the monitoring database inode, size, schema version, latest readable
-   samples, and current manager version.
-4. Record active-user continuity using an approved traffic-level observation,
-   without storing credentials.
+3. Record firewall state and the monitoring database inode, size, schema
+   version, latest readable samples, and current manager version.
+4. Record collector health and active-user continuity using an approved
+   traffic-level observation without storing credentials.
 
-Run the same latest `setup.sh` command, then compare every recorded value.
-Expected results are zero traffic PID changes, zero restart-count increases,
-zero env/unit/firewall modifications, preserved monitoring database and
-readable history, compatible schema, healthy Monitoring Lite, correct manager
-version, and uninterrupted active users.
+After installation, compare every recorded value and verify the new manager
+version. Expected results are zero traffic PID changes, zero restart-count
+increases, zero env/unit/drop-in/firewall/stability-file changes, preserved
+monitoring database and readable history, compatible schema, healthy
+Monitoring Lite, and uninterrupted active users.
+
+Phase A validates the local transactional installer and manager upgrade. It
+does not validate the unpublished public Release URL. Do not manually replace
+the production `/opt/GOST-Manager` source during review unless the operator
+explicitly approves that action.
+
+### Phase B: post-release public setup smoke
+
+Run Phase B only after `setup.sh` is merged to `main`, the `v2.0.0` tag exists,
+and both v2.0.0 release assets have been published. Test the public command on
+one fresh supported staging server and one approved existing canary server:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/WikiPanel/GOST-Manager/main/setup.sh)
+```
+
+Repeat the same traffic-continuity, configuration-preservation, monitoring
+history, collector-health, source-version, and installed-version checks. The
+exact public latest-release path cannot be tested until its release assets
+exist, so this post-release smoke is not a pre-merge blocker and requires no
+RC tag or prerelease.

@@ -58,6 +58,16 @@ mkdir -p "${fresh_root}"
 run_installer "${fresh_root}" >/dev/null
 assert_file "fresh manager installed" "${fresh_root}/usr/local/sbin/gost-manager"
 assert_file "fresh VERSION installed" "${fresh_root}/usr/local/lib/gost-manager/VERSION"
+if [[ -x "${fresh_root}/usr/local/sbin/gost-manager" && ! -L "${fresh_root}/usr/local/sbin/gost-manager" ]]; then
+  pass "fresh manager is a safe executable"
+else
+  fail "fresh manager is a safe executable"
+fi
+if [[ -f "${fresh_root}/usr/local/lib/gost-manager/VERSION" && ! -L "${fresh_root}/usr/local/lib/gost-manager/VERSION" ]]; then
+  pass "fresh VERSION is a regular non-symlink file"
+else
+  fail "fresh VERSION is a regular non-symlink file"
+fi
 assert_eq "fresh VERSION content" "2.0.0" "$(< "${fresh_root}/usr/local/lib/gost-manager/VERSION")"
 assert_eq "installed manager version output" "GOST Manager v2.0.0" "$(GOST_MANAGER_TESTING=1 GOST_MANAGER_VERSION_FILE_TEST="${fresh_root}/usr/local/lib/gost-manager/VERSION" bash -c 'source "$1"; manager_banner' _ "${fresh_root}/usr/local/sbin/gost-manager")"
 assert_file "fresh query launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor"
@@ -245,7 +255,24 @@ assert_eq "rollback leaves unreleased experimental files untouched" "${experimen
 assert_eq "rollback preserves custom config" "${custom_before}" "$(cksum "${custom_config}")"
 assert_not_contains "rollback never targets traffic" "gost-iran-" "${COMMAND_LOG}"
 
-for failure_phase in staging bash_validation python_validation config_validation unit_validation backup file_replacement migration collector_start; do
+printf '1.9.0\n' > "${fresh_root}/usr/local/lib/gost-manager/VERSION"
+printf 'pre-gate-manager-canary\n' > "${fresh_root}/usr/local/sbin/gost-manager"
+version_gate_before="$(cksum "${fresh_root}/usr/local/lib/gost-manager/VERSION")"
+manager_gate_before="$(cksum "${fresh_root}/usr/local/sbin/gost-manager")"
+if GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST=9.9.9 \
+  run_installer "${fresh_root}" > "${TEST_HOME}/version-gate.out" 2>&1; then
+  fail "installed VERSION mismatch fails before commit"
+else
+  pass "installed VERSION mismatch fails before commit"
+fi
+assert_eq "VERSION mismatch rollback restores prior VERSION" \
+  "${version_gate_before}" "$(cksum "${fresh_root}/usr/local/lib/gost-manager/VERSION")"
+assert_eq "VERSION mismatch rollback restores prior manager" \
+  "${manager_gate_before}" "$(cksum "${fresh_root}/usr/local/sbin/gost-manager")"
+assert_contains "VERSION mismatch reports source/install inequality" \
+  "does not match source VERSION" "${TEST_HOME}/version-gate.out"
+
+for failure_phase in staging bash_validation python_validation config_validation unit_validation backup partial_file_replacement file_replacement migration collector_start; do
   phase_root="${TEST_HOME}/phase-${failure_phase}"
   mkdir -p "${phase_root}"
   rm -f "${STUB_STATE_DIR}/enabled" "${STUB_STATE_DIR}/active"

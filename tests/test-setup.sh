@@ -54,6 +54,7 @@ set -Eeuo pipefail
 printf 'launched\n' >> "${COMMAND_LOG}"
 STUB
 chmod 755 "${STUB_BIN}/curl" "${STUB_BIN}/apt-get" "${STUB_BIN}/manager-launcher"
+make_command_stubs "${STUB_BIN}"
 
 write_checksum() {
   local directory="$1"
@@ -82,9 +83,10 @@ set -Eeuo pipefail
 printf 'installer %s\n' "$*" >> "${COMMAND_LOG}"
 [[ "${STUB_INSTALL_FAIL:-0}" != "1" ]] || exit 42
 root="${GOST_MANAGER_SETUP_ROOT%/}"
+[[ "$(pwd -P)" == "${root}/opt/GOST-Manager" ]]
+printf 'installer observed activated source\n' >> "${COMMAND_LOG}"
 if [[ -n "${STUB_EXPECT_SOURCE_FILE:-}" ]]; then
   [[ -f "${root}/opt/GOST-Manager/${STUB_EXPECT_SOURCE_FILE}" ]]
-  printf 'installer observed old source\n' >> "${COMMAND_LOG}"
 fi
 mkdir -p "${root}/usr/local/lib/gost-manager" "${root}/usr/local/sbin"
 cp VERSION "${root}/usr/local/lib/gost-manager/VERSION"
@@ -106,6 +108,25 @@ create_release_assets() {
   local build="${directory}/build"
   mkdir -p "${build}"
   create_release_tree "${build}" "${version}" "${omit}"
+  tar -czf "${directory}/gost-manager.tar.gz" -C "${build}" "GOST-Manager-${version}"
+  write_checksum "${directory}"
+}
+
+create_transactional_release_assets() {
+  local directory="$1"
+  local version="$2"
+  local build="${directory}/build-transactional"
+  local release_root="${build}/GOST-Manager-${version}"
+  rm -rf "${build}"
+  mkdir -p "${release_root}"
+  cp "${ROOT_DIR}/VERSION" "${ROOT_DIR}/setup.sh" "${ROOT_DIR}/install.sh" \
+    "${ROOT_DIR}/gost-manager.sh" "${release_root}/"
+  cp -R "${ROOT_DIR}/lib" "${ROOT_DIR}/monitoring" "${ROOT_DIR}/packaging" \
+    "${release_root}/"
+  printf '%s\n' "${version}" > "${release_root}/VERSION"
+  chmod 755 "${release_root}/setup.sh" "${release_root}/install.sh" \
+    "${release_root}/gost-manager.sh" "${release_root}/lib/gost-run-iran.sh" \
+    "${release_root}/lib/gost-run-kharej.sh"
   tar -czf "${directory}/gost-manager.tar.gz" -C "${build}" "GOST-Manager-${version}"
   write_checksum "${directory}"
 }
@@ -182,6 +203,7 @@ new_case() {
     "${case_dir}/root/etc/sysctl.d" \
     "${case_dir}/root/var/lib/gost-manager" \
     "${case_dir}/assets" \
+    "${case_dir}/state" \
     "${case_dir}/tmp"
   printf 'ID=ubuntu\nVERSION_ID="24.04"\n' > "${case_dir}/os-release"
   printf 'test-ca\n' > "${case_dir}/root/etc/ssl/certs/ca-certificates.crt"
@@ -214,12 +236,16 @@ run_setup() {
   GOST_MANAGER_SETUP_DEPENDENCIES_READY_TEST="${SETUP_DEPENDENCIES_READY_TEST:-}" \
   GOST_MANAGER_SETUP_INTERACTIVE_TEST="${SETUP_INTERACTIVE_TEST:-0}" \
   GOST_MANAGER_SETUP_LAUNCHER_TEST="${STUB_BIN}/manager-launcher" \
-  GOST_MANAGER_SETUP_FAIL_AFTER_SOURCE_REPLACE_TEST="${SETUP_FAIL_AFTER_REPLACE_TEST:-0}" \
+  GOST_MANAGER_SETUP_FAIL_PHASE_TEST="${SETUP_FAIL_PHASE_TEST:-}" \
   GOST_MANAGER_VERSION="${SETUP_VERSION_TEST:-latest}" \
+  GOST_MANAGER_FAIL_PHASE="${INSTALL_FAIL_PHASE_TEST:-}" \
+  GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST="${INSTALL_VERSION_OVERRIDE_TEST:-}" \
   STUB_CURL_FAIL="${STUB_CURL_FAIL:-0}" \
   STUB_APT_FAIL="${STUB_APT_FAIL:-0}" \
   STUB_INSTALL_FAIL="${STUB_INSTALL_FAIL:-0}" \
   STUB_EXPECT_SOURCE_FILE="${STUB_EXPECT_SOURCE_FILE:-}" \
+  STUB_STATE_DIR="${case_dir}/state" \
+  STUB_UNIT_PATH="${case_dir}/root/etc/systemd/system/gost-monitor-collector.service" \
   TMPDIR="${case_dir}/tmp" \
   PATH="${STUB_BIN}:${PATH}" \
     bash "${ROOT_DIR}/setup.sh" "$@" > "${output}" 2>&1
@@ -253,6 +279,60 @@ assert_no_setup_temp() {
   local count
   count="$(find "${case_dir}/tmp" -maxdepth 1 -name 'gost-manager-setup.*' -print | wc -l | tr -d ' ')"
   assert_eq "${name}" "0" "${count}"
+}
+
+managed_runtime_digest() {
+  local case_dir="$1"
+  local relative path
+  {
+    for relative in \
+      usr/local/sbin \
+      usr/local/lib/gost-manager \
+      etc/gost-manager \
+      etc/systemd/system/gost-monitor-collector.service; do
+      path="${case_dir}/root/${relative}"
+      printf 'PATH:%s\n' "${relative}"
+      if [[ -e "${path}" || -L "${path}" ]]; then
+        filesystem_manifest "${path}"
+      else
+        printf 'absent\n'
+      fi
+    done
+  } | cksum | awk '{print $1":"$2}'
+}
+
+installed_manager_version() {
+  local case_dir="$1"
+  GOST_MANAGER_TESTING=1 \
+  GOST_MANAGER_VERSION_FILE_TEST="${case_dir}/root/usr/local/lib/gost-manager/VERSION" \
+    bash -c 'source "$1"; manager_banner' _ \
+      "${case_dir}/root/usr/local/sbin/gost-manager"
+}
+
+assert_old_transaction_state() {
+  local prefix="$1"
+  local case_dir="$2"
+  local source_digest="$3"
+  local runtime_digest="$4"
+  assert_eq "${prefix} keeps installed runtime VERSION" "1.9.0" \
+    "$(< "${case_dir}/root/usr/local/lib/gost-manager/VERSION")"
+  assert_eq "${prefix} keeps source VERSION" "1.9.0" \
+    "$(< "${case_dir}/root/opt/GOST-Manager/VERSION")"
+  assert_eq "${prefix} restores prior source digest" "${source_digest}" \
+    "$(tree_digest "${case_dir}/root/opt/GOST-Manager")"
+  assert_eq "${prefix} restores prior runtime digest" "${runtime_digest}" \
+    "$(managed_runtime_digest "${case_dir}")"
+}
+
+assert_new_transaction_alignment() {
+  local prefix="$1"
+  local case_dir="$2"
+  assert_eq "${prefix} installs runtime VERSION" "2.0.0" \
+    "$(< "${case_dir}/root/usr/local/lib/gost-manager/VERSION")"
+  assert_eq "${prefix} installs source VERSION" "2.0.0" \
+    "$(< "${case_dir}/root/opt/GOST-Manager/VERSION")"
+  assert_eq "${prefix} manager reports aligned VERSION" "GOST Manager v2.0.0" \
+    "$(installed_manager_version "${case_dir}")"
 }
 
 latest_case="$(new_case latest)"
@@ -469,40 +549,190 @@ create_release_assets "${mismatch_case}/assets" 2.0.1
 SETUP_VERSION_TEST=2.0.0 assert_setup_failure "pinned release mismatch is rejected" "${mismatch_case}"
 assert_contains "pinned mismatch is reported" "does not match requested" "${mismatch_case}/setup.out"
 
-replace_failure_case="$(new_case replacement-failure)"
-create_release_assets "${replace_failure_case}/assets"
-mkdir -p "${replace_failure_case}/root/opt/GOST-Manager"
-printf 'old-source\n' > "${replace_failure_case}/root/opt/GOST-Manager/canary"
-source_before="$(tree_digest "${replace_failure_case}/root/opt/GOST-Manager")"
-SETUP_FAIL_AFTER_REPLACE_TEST=1 assert_setup_failure "source replacement failure is reported" "${replace_failure_case}"
-assert_eq "failed source replacement restores prior tree" "${source_before}" "$(tree_digest "${replace_failure_case}/root/opt/GOST-Manager")"
-assert_no_setup_temp "replacement failure removes workspace" "${replace_failure_case}"
-
-installer_failure_case="$(new_case installer-failure)"
-create_release_assets "${installer_failure_case}/assets"
-mkdir -p "${installer_failure_case}/root/opt/GOST-Manager"
-printf 'old-source\n' > "${installer_failure_case}/root/opt/GOST-Manager/canary"
-installer_source_before="$(tree_digest "${installer_failure_case}/root/opt/GOST-Manager")"
-STUB_INSTALL_FAIL=1 assert_setup_failure "local installer failure aborts setup" "${installer_failure_case}"
-assert_eq "installer failure restores prior source" "${installer_source_before}" "$(tree_digest "${installer_failure_case}/root/opt/GOST-Manager")"
-assert_eq "installer failure preserves credentials" "credential-canary" "$(< "${installer_failure_case}/root/etc/gost/iran-1.env")"
-assert_no_setup_temp "installer failure removes workspace" "${installer_failure_case}"
-
 existing_source_case="$(new_case existing-source)"
 create_release_assets "${existing_source_case}/assets"
 mkdir -p "${existing_source_case}/root/opt/GOST-Manager"
 printf 'replace-me\n' > "${existing_source_case}/root/opt/GOST-Manager/old-source"
-STUB_EXPECT_SOURCE_FILE=old-source assert_setup_success "existing source replacement succeeds" "${existing_source_case}"
-assert_contains "local installer runs before source replacement" "installer observed old source" "${existing_source_case}/commands.log"
+STUB_EXPECT_SOURCE_FILE=install.sh assert_setup_success "existing source replacement succeeds" "${existing_source_case}"
+assert_contains "local installer runs from activated source" "installer observed activated source" "${existing_source_case}/commands.log"
 assert_absent "successful replacement removes old managed source" "${existing_source_case}/root/opt/GOST-Manager/old-source"
 assert_file "successful replacement preserves complete new source" "${existing_source_case}/root/opt/GOST-Manager/install.sh"
+
+transaction_base="$(new_case transaction-base-1.9.0)"
+cp "${ROOT_DIR}/packaging/monitoring.env" \
+  "${transaction_base}/root/etc/gost-manager/monitoring.env"
+create_transactional_release_assets "${transaction_base}/assets" 1.9.0
+SETUP_VERSION_TEST=v1.9.0 assert_setup_success \
+  "transaction baseline installs through real local installer" "${transaction_base}"
+assert_eq "transaction baseline runtime VERSION is old" "1.9.0" \
+  "$(< "${transaction_base}/root/usr/local/lib/gost-manager/VERSION")"
+assert_eq "transaction baseline source VERSION is old" "1.9.0" \
+  "$(< "${transaction_base}/root/opt/GOST-Manager/VERSION")"
+
+new_transaction_case() {
+  local name="$1"
+  local case_dir
+  case_dir="$(new_case "${name}")"
+  rm -rf "${case_dir}/root" "${case_dir}/state"
+  mkdir -p "${case_dir}/root" "${case_dir}/state"
+  cp -a "${transaction_base}/root/." "${case_dir}/root/"
+  touch "${case_dir}/state/enabled" "${case_dir}/state/active"
+  : > "${case_dir}/commands.log"
+  create_transactional_release_assets "${case_dir}/assets" 2.0.0
+  printf '%s\n' "${case_dir}"
+}
+
+before_activation_case="$(new_transaction_case failure-before-source-activation)"
+before_source_digest="$(tree_digest "${before_activation_case}/root/opt/GOST-Manager")"
+before_runtime_digest="$(managed_runtime_digest "${before_activation_case}")"
+SETUP_FAIL_PHASE_TEST=before_source_activation assert_setup_failure \
+  "failure before source activation returns non-zero" "${before_activation_case}"
+assert_old_transaction_state "failure before source activation" "${before_activation_case}" \
+  "${before_source_digest}" "${before_runtime_digest}"
+assert_no_setup_temp "failure before source activation removes workspace" "${before_activation_case}"
+
+after_activation_case="$(new_transaction_case failure-after-source-activation)"
+after_source_digest="$(tree_digest "${after_activation_case}/root/opt/GOST-Manager")"
+after_runtime_digest="$(managed_runtime_digest "${after_activation_case}")"
+SETUP_FAIL_PHASE_TEST=after_source_activation assert_setup_failure \
+  "failure after source activation returns non-zero" "${after_activation_case}"
+assert_old_transaction_state "failure after source activation" "${after_activation_case}" \
+  "${after_source_digest}" "${after_runtime_digest}"
+
+installer_pre_mutation_case="$(new_transaction_case installer-failure-before-mutation)"
+pre_mutation_source_digest="$(tree_digest "${installer_pre_mutation_case}/root/opt/GOST-Manager")"
+pre_mutation_runtime_digest="$(managed_runtime_digest "${installer_pre_mutation_case}")"
+INSTALL_FAIL_PHASE_TEST=unit_validation assert_setup_failure \
+  "installer failure before mutation returns non-zero" "${installer_pre_mutation_case}"
+assert_old_transaction_state "installer failure before mutation" "${installer_pre_mutation_case}" \
+  "${pre_mutation_source_digest}" "${pre_mutation_runtime_digest}"
+
+installer_partial_case="$(new_transaction_case installer-partial-file-replacement)"
+partial_source_digest="$(tree_digest "${installer_partial_case}/root/opt/GOST-Manager")"
+partial_runtime_digest="$(managed_runtime_digest "${installer_partial_case}")"
+INSTALL_FAIL_PHASE_TEST=partial_file_replacement assert_setup_failure \
+  "installer failure after partial replacement returns non-zero" "${installer_partial_case}"
+assert_old_transaction_state "installer partial replacement rollback" "${installer_partial_case}" \
+  "${partial_source_digest}" "${partial_runtime_digest}"
+assert_contains "partial replacement invokes installer rollback" \
+  "injected installer failure at phase: partial_file_replacement" \
+  "${installer_partial_case}/setup.out"
+
+installed_mismatch_case="$(new_transaction_case installed-version-mismatch)"
+mismatch_source_digest="$(tree_digest "${installed_mismatch_case}/root/opt/GOST-Manager")"
+mismatch_runtime_digest="$(managed_runtime_digest "${installed_mismatch_case}")"
+INSTALL_VERSION_OVERRIDE_TEST=9.9.9 assert_setup_failure \
+  "installed VERSION mismatch returns non-zero" "${installed_mismatch_case}"
+assert_old_transaction_state "installed VERSION mismatch rollback" "${installed_mismatch_case}" \
+  "${mismatch_source_digest}" "${mismatch_runtime_digest}"
+assert_contains "installed VERSION mismatch is caught inside installer" \
+  "does not match source VERSION" "${installed_mismatch_case}/setup.out"
+
+unverified_installer_case="$(new_transaction_case installer-rollback-unverified)"
+STUB_FAIL_SYSTEMCTL_ACTION=stop INSTALL_FAIL_PHASE_TEST=collector_start \
+  assert_setup_failure "unverified installer rollback returns non-zero" \
+    "${unverified_installer_case}"
+unverified_source_backup="$(find "${unverified_installer_case}/root/opt" -maxdepth 1 \
+  -type d -name '.GOST-Manager.backup.*' -print -quit)"
+unverified_runtime_backup="$(find "${unverified_installer_case}/root" \
+  -type d -name '*.gost-manager-backup.*' -print -quit)"
+assert_new_transaction_alignment "unverified installer rollback" "${unverified_installer_case}"
+assert_dir "unverified installer rollback retains prior source backup" \
+  "${unverified_source_backup}"
+assert_dir "unverified installer rollback retains managed runtime backup" \
+  "${unverified_runtime_backup}"
+assert_eq "unverified installer rollback retains old source VERSION" "1.9.0" \
+  "$(< "${unverified_source_backup}/VERSION")"
+assert_contains "unverified installer rollback reports installer recovery" \
+  "Installer rollback could not be verified" "${unverified_installer_case}/setup.out"
+assert_contains "unverified installer rollback skips unsafe source rollback" \
+  "source rollback was skipped" "${unverified_installer_case}/setup.out"
+assert_contains "unverified installer rollback prints exact source backup" \
+  "${unverified_source_backup}" "${unverified_installer_case}/setup.out"
+
+rename_failure_case="$(new_transaction_case candidate-rename-failure)"
+rename_source_digest="$(tree_digest "${rename_failure_case}/root/opt/GOST-Manager")"
+rename_runtime_digest="$(managed_runtime_digest "${rename_failure_case}")"
+SETUP_FAIL_PHASE_TEST=candidate_rename assert_setup_failure \
+  "candidate rename failure returns non-zero" "${rename_failure_case}"
+assert_old_transaction_state "candidate rename failure" "${rename_failure_case}" \
+  "${rename_source_digest}" "${rename_runtime_digest}"
+
+restore_failure_case="$(new_transaction_case source-restore-failure)"
+restore_source_digest="$(tree_digest "${restore_failure_case}/root/opt/GOST-Manager")"
+restore_runtime_digest="$(managed_runtime_digest "${restore_failure_case}")"
+SETUP_FAIL_PHASE_TEST=after_source_activation,source_restore assert_setup_failure \
+  "source restore failure returns non-zero" "${restore_failure_case}"
+restore_backup="$(find "${restore_failure_case}/root/opt" -maxdepth 1 \
+  -type d -name '.GOST-Manager.backup.*' -print -quit)"
+assert_dir "source restore failure retains prior source backup" "${restore_backup}"
+assert_eq "source restore failure retains old backup VERSION" "1.9.0" \
+  "$(< "${restore_backup}/VERSION")"
+assert_eq "source restore failure retains exact prior source digest" \
+  "${restore_source_digest}" "$(tree_digest "${restore_backup}")"
+assert_eq "source restore failure leaves runtime unchanged" \
+  "${restore_runtime_digest}" "$(managed_runtime_digest "${restore_failure_case}")"
+assert_eq "source restore failure reports current activated source" "2.0.0" \
+  "$(< "${restore_failure_case}/root/opt/GOST-Manager/VERSION")"
+assert_contains "source restore failure reports unverified rollback" \
+  "source rollback could not be verified" "${restore_failure_case}/setup.out"
+assert_contains "source restore failure prints exact backup path" \
+  "${restore_backup}" "${restore_failure_case}/setup.out"
+assert_not_contains "source restore failure never claims installation success" \
+  "installed successfully" "${restore_failure_case}/setup.out"
+
+cleanup_failure_case="$(new_transaction_case source-backup-cleanup-failure)"
+SETUP_FAIL_PHASE_TEST=backup_cleanup assert_setup_failure \
+  "backup cleanup failure returns non-zero after commit" "${cleanup_failure_case}"
+cleanup_backup="$(find "${cleanup_failure_case}/root/opt" -maxdepth 1 \
+  -type d -name '.GOST-Manager.backup.*' -print -quit)"
+assert_new_transaction_alignment "backup cleanup failure" "${cleanup_failure_case}"
+assert_dir "backup cleanup failure retains private backup" "${cleanup_backup}"
+assert_eq "backup cleanup failure retains old source VERSION" "1.9.0" \
+  "$(< "${cleanup_backup}/VERSION")"
+assert_contains "backup cleanup failure prints exact retained path" \
+  "${cleanup_backup}" "${cleanup_failure_case}/setup.out"
+assert_not_contains "backup cleanup failure does not report source rollback" \
+  "source rollback could not be verified" "${cleanup_failure_case}/setup.out"
+
+successful_transaction_case="$(new_transaction_case successful-newer-upgrade)"
+traffic_before="$(tree_digest "${successful_transaction_case}/root/etc/gost")"
+history_before="$(cksum "${successful_transaction_case}/root/var/lib/gost-manager/history.canary")"
+db_path="${successful_transaction_case}/root/var/lib/gost-manager/metrics.sqlite3"
+db_inode_before="$(stat -c '%i' "${db_path}" 2>/dev/null || stat -f '%i' "${db_path}")"
+assert_setup_success "newer transactional upgrade succeeds" "${successful_transaction_case}"
+assert_new_transaction_alignment "newer transactional upgrade" "${successful_transaction_case}"
+assert_eq "newer upgrade preserves tunnel env digest" "${traffic_before}" \
+  "$(tree_digest "${successful_transaction_case}/root/etc/gost")"
+assert_eq "newer upgrade preserves monitoring history canary" "${history_before}" \
+  "$(cksum "${successful_transaction_case}/root/var/lib/gost-manager/history.canary")"
+assert_eq "newer upgrade preserves monitoring database inode" "${db_inode_before}" \
+  "$(stat -c '%i' "${db_path}" 2>/dev/null || stat -f '%i' "${db_path}")"
+assert_eq "newer upgrade preserves monitoring schema version" "4" \
+  "$(python3 -c 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])' "${db_path}")"
+assert_eq "successful commit removes prior source backup" "0" \
+  "$(find "${successful_transaction_case}/root/opt" -maxdepth 1 \
+    -type d -name '.GOST-Manager.backup.*' -print | wc -l | tr -d ' ')"
+
+same_source_digest="$(tree_digest "${successful_transaction_case}/root/opt/GOST-Manager")"
+same_runtime_digest="$(managed_runtime_digest "${successful_transaction_case}")"
+: > "${successful_transaction_case}/commands.log"
+assert_setup_success "same-version transactional reinstall succeeds" "${successful_transaction_case}"
+assert_new_transaction_alignment "same-version transactional reinstall" "${successful_transaction_case}"
+assert_eq "same-version reinstall keeps source digest" "${same_source_digest}" \
+  "$(tree_digest "${successful_transaction_case}/root/opt/GOST-Manager")"
+assert_eq "same-version reinstall keeps runtime digest" "${same_runtime_digest}" \
+  "$(managed_runtime_digest "${successful_transaction_case}")"
+assert_not_contains "transaction tests never target Iran traffic lifecycle" \
+  "gost-iran-" "${successful_transaction_case}/commands.log"
+assert_not_contains "transaction tests never target Kharej traffic lifecycle" \
+  "gost-kharej-" "${successful_transaction_case}/commands.log"
 
 direct_install_root="${TEST_HOME}/direct-local/root"
 direct_stub_state="${TEST_HOME}/direct-local/state"
 direct_command_log="${TEST_HOME}/direct-local/commands.log"
 mkdir -p "${direct_install_root}" "${direct_stub_state}"
 : > "${direct_command_log}"
-make_command_stubs "${STUB_BIN}"
 if COMMAND_LOG="${direct_command_log}" STUB_STATE_DIR="${direct_stub_state}" \
   STUB_UNIT_PATH="${direct_install_root}/etc/systemd/system/gost-monitor-collector.service" \
   GOST_MANAGER_TESTING=1 GOST_MANAGER_ROOT="${direct_install_root}" \

@@ -7,6 +7,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT_DIR}/tests/integration-test-lib.sh"
 
 WORKFLOW="${ROOT_DIR}/.github/workflows/release.yml"
+INTEGRATION_WORKFLOW="${ROOT_DIR}/.github/workflows/monitoring-integration.yml"
+CHECKOUT_SHA="11bd71901bbe5b1630ceea73d27597364c9af683"
 TEST_HOME="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/gost-release-workflow-tests.XXXXXX")" && pwd -P)"
 cleanup_test_home() {
   local status=$?
@@ -29,7 +31,26 @@ assert_order() {
   fi
 }
 
+assert_checkout_pin() {
+  local name="$1"
+  local workflow="$2"
+  local checkout_ref checkout_line comment_line
+  checkout_ref="$(sed -n 's/^[[:space:]-]*uses: actions\/checkout@//p' "${workflow}")"
+  assert_eq "${name} uses one full checkout commit SHA" "${CHECKOUT_SHA}" "${checkout_ref}"
+  assert_eq "${name} checkout reference is 40 characters" "40" "${#checkout_ref}"
+  assert_not_contains "${name} has no floating checkout v4 tag" "actions/checkout@v4" "${workflow}"
+  assert_contains "${name} names the reviewed checkout release" \
+    "# actions/checkout v4.2.2" "${workflow}"
+  checkout_line="$(grep -nF "actions/checkout@${CHECKOUT_SHA}" "${workflow}" | cut -d: -f1)"
+  comment_line="$(grep -nF '# actions/checkout v4.2.2' "${workflow}" | cut -d: -f1)"
+  assert_eq "${name} keeps the release comment adjacent to checkout" \
+    "$((checkout_line - 1))" "${comment_line}"
+}
+
 assert_file "release workflow exists" "${WORKFLOW}"
+assert_file "integration workflow exists" "${INTEGRATION_WORKFLOW}"
+assert_checkout_pin "release workflow" "${WORKFLOW}"
+assert_checkout_pin "integration workflow" "${INTEGRATION_WORKFLOW}"
 assert_contains "tag trigger exists" "- 'v*.*.*'" "${WORKFLOW}"
 assert_contains "manual dispatch exists" "workflow_dispatch:" "${WORKFLOW}"
 assert_contains "manual version input exists" "version:" "${WORKFLOW}"
@@ -80,6 +101,8 @@ assert_contains "final release is non-draft" "--draft=false" "${WORKFLOW}"
 assert_contains "final release is non-prerelease" "--prerelease=false" "${WORKFLOW}"
 assert_contains "release uses built-in token" 'GH_TOKEN: ${{ github.token }}' "${WORKFLOW}"
 assert_contains "published assets are checked exactly" "expected_assets=" "${WORKFLOW}"
+assert_contains "release publication passes the verified archive" '"${ARCHIVE}"' "${WORKFLOW}"
+assert_contains "release publication passes the verified checksum" '"${CHECKSUM}"' "${WORKFLOW}"
 assert_contains "incomplete release is deleted" 'gh release delete "${TAG}" --yes' "${WORKFLOW}"
 assert_contains "asset upload failure is explicit" "asset upload failed" "${WORKFLOW}"
 assert_contains "manual validation-only condition exists" "!inputs.publish" "${WORKFLOW}"
