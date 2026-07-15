@@ -1,6 +1,7 @@
 BASH_SCRIPTS = gost-manager.sh setup.sh install.sh uninstall.sh \
 	lib/gost-run-iran.sh lib/gost-run-kharej.sh \
 	packaging/gost-monitor packaging/gost-monitor-admin packaging/gost-monitor-collector \
+	packaging/gost-upstream-watchdog packaging/gost-watchdog-admin \
 	tests/run-tests.sh tests/integration-test-lib.sh tests/test-install.sh \
 	tests/test-menu.sh tests/test-uninstall.sh tests/test-systemd-linux.sh \
 	tests/test-scope-reset.sh tests/test-profiles.sh tests/test-firewall-multi-source.sh \
@@ -8,7 +9,7 @@ BASH_SCRIPTS = gost-manager.sh setup.sh install.sh uninstall.sh \
 
 lint:
 	bash -n $(BASH_SCRIPTS)
-	python3 -m py_compile monitoring/*.py tests/test_monitoring*.py
+	python3 -m py_compile monitoring/*.py gost_watchdog/*.py tests/test_*.py
 	shellcheck -x -P SCRIPTDIR $(BASH_SCRIPTS)
 
 test:
@@ -23,6 +24,6 @@ test:
 	bash tests/test-stability.sh
 	bash tests/test-setup.sh
 	bash tests/test-release-workflow.sh
-	python3 -m unittest discover -s tests -p 'test_monitoring*.py'
+	python3 -m unittest discover -s tests
 
 check: lint test

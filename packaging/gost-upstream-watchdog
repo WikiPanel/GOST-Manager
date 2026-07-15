@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly GOST_MANAGER_LIBRARY_DIR="/usr/local/lib/gost-manager"
+export PYTHONPATH="${GOST_MANAGER_LIBRARY_DIR}"
+[[ "$#" -eq 0 ]] || {
+  printf 'Error: gost-upstream-watchdog accepts no command-line overrides.\n' >&2
+  exit 2
+}
+exec python3 -m gost_watchdog.daemon

@@ -26,6 +26,7 @@ CMP_BIN="${CMP_BIN:-cmp}"
 APT_GET_BIN="${APT_GET_BIN:-apt-get}"
 
 MONITOR_SERVICE="gost-monitor-collector.service"
+WATCHDOG_SERVICE="gost-upstream-watchdog.service"
 STAGE_DIR=""
 ACTIVE_CONFIG_PATH=""
 CONFIGURED_DB_PRODUCTION=""
@@ -44,8 +45,19 @@ FILES_CHANGED=0
 DATABASE_CREATED=0
 SERVICE_ENABLE_ATTEMPTED=0
 SERVICE_START_ATTEMPTED=0
+WATCHDOG_UNIT_CHANGED=0
+WATCHDOG_FILES_CHANGED=0
+PREVIOUS_WATCHDOG_UNIT_EXISTED=0
+PREVIOUS_WATCHDOG_ENABLED=0
+PREVIOUS_WATCHDOG_ACTIVE=0
+WATCHDOG_SERVICE_STATE_RECORDED=0
+WATCHDOG_SERVICE_ENABLE_ATTEMPTED=0
+WATCHDOG_SERVICE_START_ATTEMPTED=0
+WATCHDOG_DATABASE_CREATED=0
 declare -a RUNTIME_MANIFEST_ENTRIES=()
 declare -a STAGED_MODULES=()
+declare -a WATCHDOG_RUNTIME_MANIFEST_ENTRIES=()
+declare -a STAGED_WATCHDOG_MODULES=()
 declare -a CHANGED_DESTINATIONS=()
 declare -a BACKUP_PATHS=()
 declare -a BACKUP_CONTAINERS=()
@@ -201,6 +213,7 @@ manifest_contains() {
 validate_source_manifest() {
   local path entry existing
   local manifest="${SOURCE_ROOT}/packaging/monitoring-runtime-manifest.txt"
+  local watchdog_manifest="${SOURCE_ROOT}/packaging/watchdog-runtime-manifest.txt"
   local -a fixed=(
     "VERSION"
     "gost-manager.sh"
@@ -212,6 +225,11 @@ validate_source_manifest() {
     "packaging/gost-monitor-collector.service"
     "packaging/monitoring.env"
     "packaging/monitoring-runtime-manifest.txt"
+    "packaging/gost-upstream-watchdog"
+    "packaging/gost-watchdog-admin"
+    "packaging/gost-upstream-watchdog.service"
+    "packaging/watchdog.conf"
+    "packaging/watchdog-runtime-manifest.txt"
   )
   for path in "${fixed[@]}"; do
     [[ -f "${SOURCE_ROOT}/${path}" && ! -L "${SOURCE_ROOT}/${path}" ]] || die "required source file is missing or unsafe: ${path}"
@@ -240,13 +258,36 @@ validate_source_manifest() {
     manifest_contains "${path}" || die "runtime manifest omits required module: ${path}"
   done
 
+  [[ -f "${watchdog_manifest}" && ! -L "${watchdog_manifest}" ]] || die "Watchdog runtime manifest must be a regular non-symlink file."
+  WATCHDOG_RUNTIME_MANIFEST_ENTRIES=()
+  while IFS= read -r entry || [[ -n "${entry}" ]]; do
+    [[ -n "${entry}" ]] || die "Watchdog runtime manifest contains a blank record."
+    [[ "${entry}" != /* && "${entry}" != *".."* ]] || die "Watchdog runtime manifest contains an unsafe path: ${entry}"
+    [[ "${entry}" =~ ^gost_watchdog/[A-Za-z_][A-Za-z0-9_]*\.py$ ]] || die "Watchdog runtime manifest contains an invalid module: ${entry}"
+    existing=0
+    for path in "${WATCHDOG_RUNTIME_MANIFEST_ENTRIES[@]+"${WATCHDOG_RUNTIME_MANIFEST_ENTRIES[@]}"}"; do
+      [[ "${path}" != "${entry}" ]] || existing=1
+    done
+    [[ "${existing}" == "0" ]] || die "Watchdog runtime manifest contains a duplicate module: ${entry}"
+    [[ -f "${SOURCE_ROOT}/${entry}" && ! -L "${SOURCE_ROOT}/${entry}" ]] || die "Watchdog runtime module is missing, non-regular, or symlinked: ${entry}"
+    WATCHDOG_RUNTIME_MANIFEST_ENTRIES+=("${entry}")
+  done < "${watchdog_manifest}"
+  [[ "${#WATCHDOG_RUNTIME_MANIFEST_ENTRIES[@]}" -gt 1 ]] || die "Watchdog runtime manifest is incomplete."
+  for path in gost_watchdog/__init__.py gost_watchdog/admin_cli.py gost_watchdog/daemon.py gost_watchdog/engine.py gost_watchdog/storage.py; do
+    existing=0
+    for entry in "${WATCHDOG_RUNTIME_MANIFEST_ENTRIES[@]}"; do
+      [[ "${entry}" != "${path}" ]] || existing=1
+    done
+    [[ "${existing}" == "1" ]] || die "Watchdog runtime manifest omits required module: ${path}"
+  done
+
 }
 
 stage_sources() {
   local entry destination
   STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gost-manager-install.XXXXXX")"
   "${CHMOD_BIN}" 700 "${STAGE_DIR}"
-  "${INSTALL_BIN}" -d -m 755 "${STAGE_DIR}/lib" "${STAGE_DIR}/monitoring" "${STAGE_DIR}/sbin"
+  "${INSTALL_BIN}" -d -m 755 "${STAGE_DIR}/lib" "${STAGE_DIR}/monitoring" "${STAGE_DIR}/gost_watchdog" "${STAGE_DIR}/sbin"
   "${CP_BIN}" "${SOURCE_ROOT}/VERSION" "${STAGE_DIR}/VERSION"
   "${CP_BIN}" "${SOURCE_ROOT}/gost-manager.sh" "${STAGE_DIR}/gost-manager"
   "${CP_BIN}" "${SOURCE_ROOT}/lib/gost-run-iran.sh" "${STAGE_DIR}/lib/gost-run-iran.sh"
@@ -257,11 +298,21 @@ stage_sources() {
     "${CP_BIN}" "${SOURCE_ROOT}/${entry}" "${destination}"
     STAGED_MODULES+=("${destination}")
   done
+  STAGED_WATCHDOG_MODULES=()
+  for entry in "${WATCHDOG_RUNTIME_MANIFEST_ENTRIES[@]}"; do
+    destination="${STAGE_DIR}/gost_watchdog/${entry##*/}"
+    "${CP_BIN}" "${SOURCE_ROOT}/${entry}" "${destination}"
+    STAGED_WATCHDOG_MODULES+=("${destination}")
+  done
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor" "${STAGE_DIR}/sbin/gost-monitor"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor-admin" "${STAGE_DIR}/sbin/gost-monitor-admin"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor-collector" "${STAGE_DIR}/sbin/gost-monitor-collector"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-monitor-collector.service" "${STAGE_DIR}/gost-monitor-collector.service"
   "${CP_BIN}" "${SOURCE_ROOT}/packaging/monitoring.env" "${STAGE_DIR}/monitoring.env"
+  "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-upstream-watchdog" "${STAGE_DIR}/sbin/gost-upstream-watchdog"
+  "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-watchdog-admin" "${STAGE_DIR}/sbin/gost-watchdog-admin"
+  "${CP_BIN}" "${SOURCE_ROOT}/packaging/gost-upstream-watchdog.service" "${STAGE_DIR}/gost-upstream-watchdog.service"
+  "${CP_BIN}" "${SOURCE_ROOT}/packaging/watchdog.conf" "${STAGE_DIR}/watchdog.conf"
 }
 
 validate_staged_bash() {
@@ -271,11 +322,13 @@ validate_staged_bash() {
     "${STAGE_DIR}/lib/gost-run-kharej.sh" \
     "${STAGE_DIR}/sbin/gost-monitor" \
     "${STAGE_DIR}/sbin/gost-monitor-admin" \
-    "${STAGE_DIR}/sbin/gost-monitor-collector"
+    "${STAGE_DIR}/sbin/gost-monitor-collector" \
+    "${STAGE_DIR}/sbin/gost-upstream-watchdog" \
+    "${STAGE_DIR}/sbin/gost-watchdog-admin"
 }
 
 validate_staged_python() {
-  PYTHONPYCACHEPREFIX="${STAGE_DIR}/pycache" "${PYTHON_BIN}" -m py_compile "${STAGED_MODULES[@]}"
+  PYTHONPYCACHEPREFIX="${STAGE_DIR}/pycache" "${PYTHON_BIN}" -m py_compile "${STAGED_MODULES[@]}" "${STAGED_WATCHDOG_MODULES[@]}"
 }
 
 admin_config_command() {
@@ -324,6 +377,28 @@ validate_staged_config() {
   CONFIGURED_ENV_ACTUAL="$(path_for "${CONFIGURED_ENV_PRODUCTION}")"
   reject_symlink_path "${CONFIGURED_DB_ACTUAL}"
   reject_symlink_path "${CONFIGURED_ENV_ACTUAL}"
+}
+
+watchdog_admin_command() {
+  local -a root_args=()
+  if [[ -n "${GOST_MANAGER_ROOT}" ]]; then
+    root_args=(--path-root "${GOST_MANAGER_ROOT}")
+  fi
+  PYTHONPATH="${STAGE_DIR}" "${PYTHON_BIN}" -m gost_watchdog.admin_cli \
+    --policy installed "${root_args[@]+"${root_args[@]}"}" "$@"
+}
+
+validate_staged_watchdog_config() {
+  local installed_config
+  [[ -f "${STAGE_DIR}/watchdog.conf" && ! -L "${STAGE_DIR}/watchdog.conf" ]] || die "staged Watchdog config is missing or unsafe."
+  PYTHONPATH="${STAGE_DIR}" "${PYTHON_BIN}" -c \
+    'import sys; from pathlib import Path; from gost_watchdog.config import parse_global_config; parse_global_config(Path(sys.argv[1]).read_text(encoding="ascii"))' \
+    "${STAGE_DIR}/watchdog.conf"
+  installed_config="$(path_for /etc/gost-manager/watchdog.conf)"
+  if [[ -e "${installed_config}" || -L "${installed_config}" ]]; then
+    reject_symlink_path "${installed_config}"
+    watchdog_admin_command validate-config >/dev/null || die "existing Watchdog global config is invalid or unsafe."
+  fi
 }
 
 validate_unit_content() {
@@ -377,6 +452,64 @@ validate_unit_content() {
   fi
 }
 
+validate_watchdog_unit_content() {
+  local unit="${STAGE_DIR}/gost-upstream-watchdog.service"
+  local forbidden required verification_dir verification_unit output
+  for forbidden in 'Requires=' 'PartOf=' 'BindsTo=' 'gost-iran-' 'gost-kharej-' 'PrivateNetwork='; do
+    if grep -Fq "${forbidden}" "${unit}"; then
+      die "Watchdog unit contains forbidden setting: ${forbidden}"
+    fi
+  done
+  for required in \
+    'Wants=network-online.target' \
+    'After=network-online.target' \
+    'ExecStartPre=/usr/local/sbin/gost-watchdog-admin validate-config' \
+    'ExecStart=/usr/local/sbin/gost-upstream-watchdog' \
+    'Restart=on-failure' 'RestartSec=5' 'UMask=0077' \
+    'WorkingDirectory=/var/lib/gost-manager/watchdog' \
+    'ReadWritePaths=/var/lib/gost-manager/watchdog' \
+    'LimitNOFILE=4096' 'ProtectSystem=strict'; do
+    grep -Fq "${required}" "${unit}" || die "Watchdog unit lacks required production setting: ${required}"
+  done
+  if ! command -v "${SYSTEMD_ANALYZE_BIN}" >/dev/null 2>&1; then
+    info "systemd-analyze unavailable; deterministic Watchdog unit validation passed."
+    return 0
+  fi
+  verification_dir="$(mktemp -d "${STAGE_DIR}/watchdog-systemd-verify.XXXXXX")"
+  verification_unit="${verification_dir}/${WATCHDOG_SERVICE}"
+  "${CP_BIN}" "${unit}" "${verification_unit}"
+  "${INSTALL_BIN}" -d -m 700 \
+    "${verification_dir}/state" "${verification_dir}/watchdog.d" \
+    "${verification_dir}/gost" "${verification_dir}/systemd"
+  "${CP_BIN}" "${STAGE_DIR}/watchdog.conf" "${verification_dir}/watchdog.conf"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${verification_dir}/gost-watchdog-admin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${verification_dir}/gost-upstream-watchdog"
+  "${CHMOD_BIN}" 755 "${verification_dir}/gost-watchdog-admin" "${verification_dir}/gost-upstream-watchdog"
+  "${PYTHON_BIN}" -c \
+    'import functools, sys; from pathlib import Path; p=Path(sys.argv[1]); s=p.read_text(); pairs=zip(sys.argv[2::2],sys.argv[3::2]); p.write_text(functools.reduce(lambda value, pair: value.replace(*pair), pairs, s))' \
+    "${verification_unit}" \
+    /usr/local/sbin/gost-watchdog-admin "${verification_dir}/gost-watchdog-admin" \
+    /usr/local/sbin/gost-upstream-watchdog "${verification_dir}/gost-upstream-watchdog" \
+    /var/lib/gost-manager/watchdog "${verification_dir}/state" \
+    /etc/gost-manager/watchdog.conf "${verification_dir}/watchdog.conf" \
+    /etc/gost-manager/watchdog.d "${verification_dir}/watchdog.d" \
+    /etc/gost "${verification_dir}/gost" \
+    /etc/systemd/system "${verification_dir}/systemd"
+  if ! output="$("${SYSTEMD_ANALYZE_BIN}" verify "${verification_unit}" 2>&1)"; then
+    [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
+    die "real host Watchdog systemd unit verification failed."
+  fi
+  if [[ -n "${output}" ]]; then
+    case "${output}" in
+      *"${WATCHDOG_SERVICE}"*|*"${verification_dir}"*)
+        printf '%s\n' "${output}" >&2
+        die "real host Watchdog unit verification emitted candidate warnings."
+        ;;
+      *) info "systemd-analyze reported unrelated host-unit diagnostics; the staged Watchdog unit passed." ;;
+    esac
+  fi
+}
+
 record_service_state() {
   local unit_path
   unit_path="$(path_for /etc/systemd/system/${MONITOR_SERVICE})"
@@ -388,6 +521,19 @@ record_service_state() {
     PREVIOUS_ACTIVE=1
   fi
   SERVICE_STATE_RECORDED=1
+}
+
+record_watchdog_service_state() {
+  local unit_path
+  unit_path="$(path_for /etc/systemd/system/${WATCHDOG_SERVICE})"
+  [[ -e "${unit_path}" ]] && PREVIOUS_WATCHDOG_UNIT_EXISTED=1
+  if "${SYSTEMCTL_BIN}" is-enabled --quiet "${WATCHDOG_SERVICE}" >/dev/null 2>&1; then
+    PREVIOUS_WATCHDOG_ENABLED=1
+  fi
+  if "${SYSTEMCTL_BIN}" is-active --quiet "${WATCHDOG_SERVICE}" >/dev/null 2>&1; then
+    PREVIOUS_WATCHDOG_ACTIVE=1
+  fi
+  WATCHDOG_SERVICE_STATE_RECORDED=1
 }
 
 record_metadata() {
@@ -537,14 +683,48 @@ install_monitoring_package() {
   FILES_CHANGED=1
 }
 
+install_watchdog_package() {
+  local destination candidate backup backup_container entry
+  destination="$(path_for /usr/local/lib/gost-manager/gost_watchdog)"
+  reject_symlink_path "${destination}"
+  if [[ -e "${destination}" && ! -d "${destination}" ]]; then
+    die "Watchdog package destination is not a directory."
+  fi
+  [[ ! -d "${destination}" ]] || record_metadata "${destination}"
+  candidate="$(mktemp -d "${destination}.gost-manager-new.XXXXXX")"
+  PENDING_PATHS+=("${candidate}")
+  "${CHMOD_BIN}" 755 "${candidate}"
+  for entry in "${WATCHDOG_RUNTIME_MANIFEST_ENTRIES[@]}"; do
+    "${INSTALL_BIN}" -m 644 "${STAGE_DIR}/gost_watchdog/${entry##*/}" "${candidate}/${entry##*/}"
+  done
+  "${CHOWN_BIN}" -R root:root "${candidate}"
+  if [[ -d "${destination}" ]]; then
+    backup_container="$(mktemp -d "${destination}.gost-manager-backup.XXXXXX")"
+    BACKUP_CONTAINERS+=("${backup_container}")
+    "${CHMOD_BIN}" 700 "${backup_container}"
+    "${CHOWN_BIN}" root:root "${backup_container}"
+    backup="${backup_container}/original"
+    "${MV_BIN}" "${destination}" "${backup}"
+  else
+    backup=""
+  fi
+  CHANGED_DESTINATIONS+=("${destination}")
+  BACKUP_PATHS+=("${backup}")
+  "${MV_BIN}" "${candidate}" "${destination}"
+  FILES_CHANGED=1
+  WATCHDOG_FILES_CHANGED=1
+}
+
 install_files() {
-  local config_path unit_path before_count
+  local config_path unit_path before_count watchdog_config watchdog_unit
   ensure_shared_directory "$(path_for /usr/local/sbin)" 755
   ensure_private_directory "$(path_for /usr/local/lib/gost-manager)" 755
   ensure_legacy_directory "$(path_for /etc/gost)"
   ensure_private_directory "$(path_for /etc/gost-manager)" 700
   ensure_shared_directory "$(path_for /etc/systemd/system)" 755
   ensure_private_directory "$(path_for /var/lib/gost-manager)" 700
+  ensure_private_directory "$(path_for /etc/gost-manager/watchdog.d)" 700
+  ensure_private_directory "$(path_for /var/lib/gost-manager/watchdog)" 700
   ensure_configured_db_parent
 
   install_managed_file "${STAGE_DIR}/gost-manager" "$(path_for /usr/local/sbin/gost-manager)" 755
@@ -556,6 +736,14 @@ install_files() {
   install_managed_file "${STAGE_DIR}/sbin/gost-monitor" "$(path_for /usr/local/sbin/gost-monitor)" 755
   install_managed_file "${STAGE_DIR}/sbin/gost-monitor-admin" "$(path_for /usr/local/sbin/gost-monitor-admin)" 755
   install_managed_file "${STAGE_DIR}/sbin/gost-monitor-collector" "$(path_for /usr/local/sbin/gost-monitor-collector)" 755
+
+  before_count="${#CHANGED_DESTINATIONS[@]}"
+  install_watchdog_package
+  install_managed_file "${STAGE_DIR}/sbin/gost-upstream-watchdog" "$(path_for /usr/local/sbin/gost-upstream-watchdog)" 755
+  install_managed_file "${STAGE_DIR}/sbin/gost-watchdog-admin" "$(path_for /usr/local/sbin/gost-watchdog-admin)" 755
+  if [[ "${#CHANGED_DESTINATIONS[@]}" -gt "${before_count}" ]]; then
+    WATCHDOG_FILES_CHANGED=1
+  fi
 
   config_path="$(path_for /etc/gost-manager/monitoring.env)"
   if [[ ! -e "${config_path}" ]]; then
@@ -572,6 +760,23 @@ install_files() {
   install_managed_file "${STAGE_DIR}/gost-monitor-collector.service" "${unit_path}" 644
   if [[ "${#CHANGED_DESTINATIONS[@]}" -gt "${before_count}" ]]; then
     UNIT_CHANGED=1
+  fi
+
+  watchdog_config="$(path_for /etc/gost-manager/watchdog.conf)"
+  if [[ ! -e "${watchdog_config}" ]]; then
+    install_managed_file "${STAGE_DIR}/watchdog.conf" "${watchdog_config}" 600
+    WATCHDOG_FILES_CHANGED=1
+  else
+    record_metadata "${watchdog_config}"
+    "${CHMOD_BIN}" 600 "${watchdog_config}"
+    "${CHOWN_BIN}" root:root "${watchdog_config}"
+  fi
+  watchdog_unit="$(path_for /etc/systemd/system/${WATCHDOG_SERVICE})"
+  before_count="${#CHANGED_DESTINATIONS[@]}"
+  install_managed_file "${STAGE_DIR}/gost-upstream-watchdog.service" "${watchdog_unit}" 644
+  if [[ "${#CHANGED_DESTINATIONS[@]}" -gt "${before_count}" ]]; then
+    WATCHDOG_UNIT_CHANGED=1
+    WATCHDOG_FILES_CHANGED=1
   fi
 }
 
@@ -596,8 +801,25 @@ migrate_configured_database() {
   "${CHOWN_BIN}" root:root "${CONFIGURED_DB_ACTUAL}"
 }
 
+migrate_watchdog_database() {
+  local database
+  local -a root_args=()
+  database="$(path_for /var/lib/gost-manager/watchdog/watchdog.sqlite3)"
+  reject_symlink_path "${database}"
+  [[ -e "${database}" ]] || WATCHDOG_DATABASE_CREATED=1
+  [[ ! -e "${database}" ]] || record_metadata "${database}"
+  if [[ -n "${GOST_MANAGER_ROOT}" ]]; then
+    root_args=(--path-root "${GOST_MANAGER_ROOT}")
+  fi
+  PYTHONPATH="$(path_for /usr/local/lib/gost-manager)" "${PYTHON_BIN}" \
+    -m gost_watchdog.admin_cli --policy installed \
+    "${root_args[@]+"${root_args[@]}"}" migrate >/dev/null
+  "${CHMOD_BIN}" 600 "${database}"
+  "${CHOWN_BIN}" root:root "${database}"
+}
+
 activate_collector() {
-  if [[ "${UNIT_CHANGED}" == "1" ]]; then
+  if [[ "${UNIT_CHANGED}" == "1" || "${WATCHDOG_UNIT_CHANGED}" == "1" ]]; then
     "${SYSTEMCTL_BIN}" daemon-reload
   fi
   inject_failure daemon_reload
@@ -612,16 +834,35 @@ activate_collector() {
     "${SYSTEMCTL_BIN}" restart "${MONITOR_SERVICE}"
   fi
   inject_failure collector_start
+  migrate_watchdog_database
+  inject_failure watchdog_migration
+  if [[ "${PREVIOUS_WATCHDOG_UNIT_EXISTED}" == "0" ]]; then
+    WATCHDOG_SERVICE_ENABLE_ATTEMPTED=1
+    "${SYSTEMCTL_BIN}" enable "${WATCHDOG_SERVICE}"
+    WATCHDOG_SERVICE_START_ATTEMPTED=1
+    "${SYSTEMCTL_BIN}" start "${WATCHDOG_SERVICE}"
+  elif [[ "${PREVIOUS_WATCHDOG_ACTIVE}" == "1" && "${WATCHDOG_FILES_CHANGED}" == "1" ]]; then
+    "${SYSTEMCTL_BIN}" restart "${WATCHDOG_SERVICE}"
+  fi
+  inject_failure watchdog_start
 }
 
 verify_installed_runtime() {
-  local version_path manager_path installed_version
+  local version_path manager_path watchdog_path watchdog_admin watchdog_config watchdog_unit installed_version
   version_path="$(path_for /usr/local/lib/gost-manager/VERSION)"
   manager_path="$(path_for /usr/local/sbin/gost-manager)"
   reject_symlink_path "${version_path}"
   reject_symlink_path "${manager_path}"
   [[ -f "${version_path}" && ! -L "${version_path}" ]] || die "installed VERSION must be a regular non-symlink file."
   [[ -f "${manager_path}" && ! -L "${manager_path}" && -x "${manager_path}" ]] || die "installed manager must be a safe executable file."
+  watchdog_path="$(path_for /usr/local/sbin/gost-upstream-watchdog)"
+  watchdog_admin="$(path_for /usr/local/sbin/gost-watchdog-admin)"
+  watchdog_config="$(path_for /etc/gost-manager/watchdog.conf)"
+  watchdog_unit="$(path_for /etc/systemd/system/${WATCHDOG_SERVICE})"
+  [[ -x "${watchdog_path}" && ! -L "${watchdog_path}" ]] || die "installed Watchdog daemon launcher is missing or unsafe."
+  [[ -x "${watchdog_admin}" && ! -L "${watchdog_admin}" ]] || die "installed Watchdog admin launcher is missing or unsafe."
+  [[ -f "${watchdog_config}" && ! -L "${watchdog_config}" ]] || die "installed Watchdog config is missing or unsafe."
+  [[ -f "${watchdog_unit}" && ! -L "${watchdog_unit}" ]] || die "installed Watchdog unit is missing or unsafe."
   if [[ "${GOST_MANAGER_TESTING}" == "1" && -n "${GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST}" ]]; then
     printf '%s\n' "${GOST_MANAGER_INSTALLED_VERSION_OVERRIDE_TEST}" > "${version_path}"
   fi
@@ -675,6 +916,26 @@ verify_collector_not_loaded() {
   [[ "${state}" == "not-found" ]]
 }
 
+watchdog_is_active() {
+  "${SYSTEMCTL_BIN}" is-active --quiet "${WATCHDOG_SERVICE}" >/dev/null 2>&1
+}
+
+watchdog_is_enabled() {
+  "${SYSTEMCTL_BIN}" is-enabled --quiet "${WATCHDOG_SERVICE}" >/dev/null 2>&1
+}
+
+verify_watchdog_loaded() {
+  local state
+  state="$("${SYSTEMCTL_BIN}" show "${WATCHDOG_SERVICE}" --property=LoadState --value 2>/dev/null)" || return 1
+  [[ -n "${state}" && "${state}" != "not-found" ]]
+}
+
+verify_watchdog_not_loaded() {
+  local state
+  state="$("${SYSTEMCTL_BIN}" show "${WATCHDOG_SERVICE}" --property=LoadState --value 2>/dev/null)" || return 1
+  [[ "${state}" == "not-found" ]]
+}
+
 prepare_service_rollback() {
   if [[ "${PREVIOUS_UNIT_EXISTED}" == "0" ]]; then
     if [[ "${SERVICE_START_ATTEMPTED}" == "1" ]] || collector_is_active; then
@@ -693,6 +954,29 @@ prepare_service_rollback() {
     "${SYSTEMCTL_BIN}" stop "${MONITOR_SERVICE}" >/dev/null 2>&1 || true
     if collector_is_active; then
       info "Existing collector could not be stopped for file restoration."
+      return 1
+    fi
+  fi
+}
+
+prepare_watchdog_service_rollback() {
+  if [[ "${PREVIOUS_WATCHDOG_UNIT_EXISTED}" == "0" ]]; then
+    if [[ "${WATCHDOG_SERVICE_START_ATTEMPTED}" == "1" ]] || watchdog_is_active; then
+      "${SYSTEMCTL_BIN}" stop "${WATCHDOG_SERVICE}" >/dev/null 2>&1 || true
+    fi
+    if [[ "${WATCHDOG_SERVICE_ENABLE_ATTEMPTED}" == "1" ]] || watchdog_is_enabled; then
+      "${SYSTEMCTL_BIN}" disable "${WATCHDOG_SERVICE}" >/dev/null 2>&1 || true
+    fi
+    if watchdog_is_active || watchdog_is_enabled; then
+      info "Watchdog cleanup could not be verified before fresh-install rollback."
+      return 1
+    fi
+    return 0
+  fi
+  if [[ "${WATCHDOG_FILES_CHANGED}" == "1" && "${PREVIOUS_WATCHDOG_ACTIVE}" == "1" ]]; then
+    "${SYSTEMCTL_BIN}" stop "${WATCHDOG_SERVICE}" >/dev/null 2>&1 || true
+    if watchdog_is_active; then
+      info "Existing Watchdog could not be stopped for file restoration."
       return 1
     fi
   fi
@@ -722,12 +1006,42 @@ restore_recorded_service_state() {
   return 0
 }
 
+restore_recorded_watchdog_state() {
+  if [[ "${PREVIOUS_WATCHDOG_ENABLED}" == "1" ]]; then
+    "${SYSTEMCTL_BIN}" enable "${WATCHDOG_SERVICE}" >/dev/null 2>&1 || true
+  else
+    "${SYSTEMCTL_BIN}" disable "${WATCHDOG_SERVICE}" >/dev/null 2>&1 || true
+  fi
+  if [[ "${PREVIOUS_WATCHDOG_ACTIVE}" == "1" ]]; then
+    "${SYSTEMCTL_BIN}" start "${WATCHDOG_SERVICE}" >/dev/null 2>&1 || true
+  else
+    "${SYSTEMCTL_BIN}" stop "${WATCHDOG_SERVICE}" >/dev/null 2>&1 || true
+  fi
+  if [[ "${PREVIOUS_WATCHDOG_ENABLED}" == "1" ]]; then
+    watchdog_is_enabled || return 1
+  else
+    ! watchdog_is_enabled || return 1
+  fi
+  if [[ "${PREVIOUS_WATCHDOG_ACTIVE}" == "1" ]]; then
+    watchdog_is_active || return 1
+  else
+    ! watchdog_is_active || return 1
+  fi
+  return 0
+}
+
 remove_created_database() {
   if [[ "${DATABASE_CREATED}" == "1" && -n "${CONFIGURED_DB_ACTUAL}" ]]; then
     "${RM_BIN}" -f \
       "${CONFIGURED_DB_ACTUAL}" \
       "${CONFIGURED_DB_ACTUAL}-wal" \
       "${CONFIGURED_DB_ACTUAL}-shm" || return 1
+  fi
+  if [[ "${WATCHDOG_DATABASE_CREATED}" == "1" ]]; then
+    "${RM_BIN}" -f \
+      "$(path_for /var/lib/gost-manager/watchdog/watchdog.sqlite3)" \
+      "$(path_for /var/lib/gost-manager/watchdog/watchdog.sqlite3)-wal" \
+      "$(path_for /var/lib/gost-manager/watchdog/watchdog.sqlite3)-shm" || return 1
   fi
   return 0
 }
@@ -744,7 +1058,7 @@ remove_created_directories() {
 }
 
 rollback_transaction() {
-  [[ "${SERVICE_STATE_RECORDED}" == "1" ]] || {
+  [[ "${SERVICE_STATE_RECORDED}" == "1" && "${WATCHDOG_SERVICE_STATE_RECORDED}" == "1" ]] || {
     rollback_files || return 1
     restore_metadata || return 1
     remove_created_database || return 1
@@ -752,6 +1066,7 @@ rollback_transaction() {
     return 0
   }
   prepare_service_rollback || return 1
+  prepare_watchdog_service_rollback || return 1
   rollback_files || return 1
   remove_created_database || return 1
   restore_metadata || return 1
@@ -765,16 +1080,31 @@ rollback_transaction() {
       info "Fresh collector state remains after rollback."
       return 1
     fi
-    return 0
+  else
+    restore_recorded_service_state || {
+      info "Previous collector enabled/active state could not be restored."
+      return 1
+    }
+    verify_collector_loaded || {
+      info "Previous collector unit is not loaded after rollback."
+      return 1
+    }
   fi
-  restore_recorded_service_state || {
-    info "Previous collector enabled/active state could not be restored."
-    return 1
-  }
-  verify_collector_loaded || {
-    info "Previous collector unit is not loaded after rollback."
-    return 1
-  }
+  if [[ "${PREVIOUS_WATCHDOG_UNIT_EXISTED}" == "0" ]]; then
+    if watchdog_is_active || watchdog_is_enabled || ! verify_watchdog_not_loaded; then
+      info "Fresh Watchdog state remains after rollback."
+      return 1
+    fi
+  else
+    restore_recorded_watchdog_state || {
+      info "Previous Watchdog enabled/active state could not be restored."
+      return 1
+    }
+    verify_watchdog_loaded || {
+      info "Previous Watchdog unit is not loaded after rollback."
+      return 1
+    }
+  fi
   return 0
 }
 
@@ -803,6 +1133,7 @@ print_recovery_guidance() {
   info "Installer rollback could not be verified; recovery backups were retained."
   info "Run these recovery commands after inspecting the retained files:"
   printf 'systemctl stop %q\n' "${MONITOR_SERVICE}"
+  printf 'systemctl stop %q\n' "${WATCHDOG_SERVICE}"
   for ((index=${#CHANGED_DESTINATIONS[@]}-1; index>=0; index--)); do
     destination="${CHANGED_DESTINATIONS[index]}"
     backup="${BACKUP_PATHS[index]}"
@@ -823,6 +1154,17 @@ print_recovery_guidance() {
     printf 'systemctl stop %q\n' "${MONITOR_SERVICE}"
   fi
   printf 'systemctl status %q --no-pager\n' "${MONITOR_SERVICE}"
+  if [[ "${PREVIOUS_WATCHDOG_ENABLED}" == "1" ]]; then
+    printf 'systemctl enable %q\n' "${WATCHDOG_SERVICE}"
+  else
+    printf 'systemctl disable %q\n' "${WATCHDOG_SERVICE}"
+  fi
+  if [[ "${PREVIOUS_WATCHDOG_ACTIVE}" == "1" ]]; then
+    printf 'systemctl start %q\n' "${WATCHDOG_SERVICE}"
+  else
+    printf 'systemctl stop %q\n' "${WATCHDOG_SERVICE}"
+  fi
+  printf 'systemctl status %q --no-pager\n' "${WATCHDOG_SERVICE}"
   for path in "${BACKUP_CONTAINERS[@]+"${BACKUP_CONTAINERS[@]}"}"; do
     [[ -z "${path}" ]] || info "Retained backup: ${path}"
   done
@@ -861,9 +1203,14 @@ main() {
   inject_failure python_validation
   validate_staged_config
   inject_failure config_validation
+  validate_staged_watchdog_config
+  inject_failure watchdog_config_validation
   validate_unit_content
   inject_failure unit_validation
+  validate_watchdog_unit_content
+  inject_failure watchdog_unit_validation
   record_service_state
+  record_watchdog_service_state
   install_files
   inject_failure file_replacement
   "${SYNC_BIN}"
@@ -871,8 +1218,10 @@ main() {
   verify_installed_runtime
   INSTALL_COMMITTED=1
   cleanup
-  info "GOST Manager v${SOURCE_VERSION} and monitoring installed."
+  info "GOST Manager v${SOURCE_VERSION}, monitoring, and Upstream Watchdog installed."
   info "Monitoring database: ${CONFIGURED_DB_PRODUCTION}"
+  info "Watchdog database: /var/lib/gost-manager/watchdog/watchdog.sqlite3"
+  info "All Iran profiles remain Watchdog Disabled until explicitly configured."
   info "Run: sudo gost-manager"
 }
 

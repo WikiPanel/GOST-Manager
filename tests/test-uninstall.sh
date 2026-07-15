@@ -40,26 +40,34 @@ create_fixture() {
   mkdir -p \
     "${root}/usr/local/sbin" \
     "${root}/usr/local/lib/gost-manager/monitoring" \
+    "${root}/usr/local/lib/gost-manager/gost_watchdog" \
     "${root}/usr/local/bin" \
     "${root}/etc/systemd/system" \
     "${root}/etc/gost-manager" \
+    "${root}/etc/gost-manager/watchdog.d" \
     "${root}/etc/gost" \
-    "${root}/var/lib/gost-manager"
+    "${root}/var/lib/gost-manager/watchdog"
   printf 'manager\n' > "${root}/usr/local/sbin/gost-manager"
   printf 'monitor\n' > "${root}/usr/local/sbin/gost-monitor"
   printf 'admin\n' > "${root}/usr/local/sbin/gost-monitor-admin"
   printf 'collector\n' > "${root}/usr/local/sbin/gost-monitor-collector"
+  printf 'watchdog\n' > "${root}/usr/local/sbin/gost-upstream-watchdog"
+  printf 'watchdog-admin\n' > "${root}/usr/local/sbin/gost-watchdog-admin"
   printf '2.0.0\n' > "${root}/usr/local/lib/gost-manager/VERSION"
   printf 'python\n' > "${root}/usr/local/lib/gost-manager/monitoring/__init__.py"
+  printf 'python\n' > "${root}/usr/local/lib/gost-manager/gost_watchdog/__init__.py"
   printf 'iran-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-iran.sh"
   printf 'kharej-runner\n' > "${root}/usr/local/lib/gost-manager/gost-run-kharej.sh"
   printf 'gost\n' > "${root}/usr/local/bin/gost"
   printf '[Unit]\nDescription=monitor\n' > "${root}/etc/systemd/system/gost-monitor-collector.service"
+  printf '[Unit]\nDescription=watchdog\n' > "${root}/etc/systemd/system/gost-upstream-watchdog.service"
   printf '[Unit]\nDescription=managed\n' > "${root}/etc/systemd/system/gost-iran-1.service"
   printf '[Unit]\nDescription=unmanaged\n' > "${root}/etc/systemd/system/custom-gost.service"
   printf 'MAPPINGS=2052:2052\nPASSWORD=uninstall-secret-canary\n' > "${root}/etc/gost/iran-1.env"
   printf 'TUNNEL_PORT=28420\nALLOWED_IRAN_SOURCES=198.51.100.10/32,198.51.100.11/32\nPROFILE_LABEL=uninstall-kharej\nPASSWORD=uninstall-kharej-canary\n' > "${root}/etc/gost/kharej-2.env"
   cp "${ROOT_DIR}/packaging/monitoring.env" "${root}/etc/gost-manager/monitoring.env"
+  cp "${ROOT_DIR}/packaging/watchdog.conf" "${root}/etc/gost-manager/watchdog.conf"
+  printf 'MODE=monitor\n' > "${root}/etc/gost-manager/watchdog.d/iran-1.conf"
   PYTHONPATH="${ROOT_DIR}" python3 -m monitoring.admin_cli --policy generic \
     migrate --db "${root}/var/lib/gost-manager/metrics.sqlite3" >/dev/null
   PYTHONPATH="${ROOT_DIR}" python3 - "${root}/var/lib/gost-manager/metrics.sqlite3" <<'PY'
@@ -69,6 +77,8 @@ conn.execute("INSERT INTO events(ts,severity,code,message,details_json) VALUES(1
 conn.commit()
 conn.close()
 PY
+  PYTHONPATH="${ROOT_DIR}" python3 -m gost_watchdog.admin_cli --policy generic \
+    --path-root "${root}" migrate >/dev/null
 }
 
 configure_custom_history() {
@@ -108,6 +118,9 @@ run_plan() {
         monitor-code) REMOVE_MONITOR_CODE=1 ;;
         monitor-config) REMOVE_MONITOR_CONFIG=1 ;;
         history) REMOVE_MONITOR_HISTORY=1 ;;
+        watchdog-service) REMOVE_WATCHDOG_SERVICE=1 ;;
+        watchdog-code) REMOVE_WATCHDOG_CODE=1 ;;
+        watchdog-data) REMOVE_WATCHDOG_DATA=1 ;;
         traffic) REMOVE_TRAFFIC=1 ;;
         credentials) REMOVE_CREDENTIALS=1 ;;
         binary) REMOVE_GOST_BINARY=1 ;;
@@ -123,7 +136,7 @@ cancel_root="${TEST_HOME}/cancel"
 create_fixture "${cancel_root}"
 cancel_before="$(tree_digest "${cancel_root}")"
 : > "${COMMAND_LOG}"
-printf 'n\nn\nn\nn\nn\nn\nn\nn\n' | \
+printf 'n\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\n' | \
   GOST_MANAGER_TESTING=1 GOST_MANAGER_ROOT="${cancel_root}" \
   SYSTEMCTL_BIN=systemctl MONITOR_ADMIN_BIN="${STUB_BIN}/gost-monitor-admin" \
   bash "${ROOT_DIR}/uninstall.sh" >/dev/null
@@ -150,6 +163,7 @@ assert_file "monitor-only retains history" "${monitor_root}/var/lib/gost-manager
 assert_file "monitor-only retains config" "${monitor_root}/etc/gost-manager/monitoring.env"
 assert_file "monitor-only retains traffic unit" "${monitor_root}/etc/systemd/system/gost-iran-1.service"
 assert_file "monitor-only retains credentials" "${monitor_root}/etc/gost/iran-1.env"
+assert_file "monitor-only retains Watchdog service" "${monitor_root}/etc/systemd/system/gost-upstream-watchdog.service"
 assert_file "monitor-only retains labelled multi-source profile" "${monitor_root}/etc/gost/kharej-2.env"
 assert_not_contains "monitor-only never stops traffic" "gost-iran-1.service" "${COMMAND_LOG}"
 
@@ -186,7 +200,8 @@ create_fixture "${complete_monitor_root}"
 run_plan "${complete_monitor_root}" monitor-service monitor-code monitor-config history >/dev/null
 assert_absent "complete monitoring removal removes code" "${complete_monitor_root}/usr/local/lib/gost-manager/monitoring"
 assert_absent "complete monitoring removal removes config" "${complete_monitor_root}/etc/gost-manager/monitoring.env"
-assert_absent "complete monitoring removal removes history" "${complete_monitor_root}/var/lib/gost-manager"
+assert_absent "complete monitoring removal removes history" "${complete_monitor_root}/var/lib/gost-manager/metrics.sqlite3"
+assert_file "complete monitoring removal keeps Watchdog history" "${complete_monitor_root}/var/lib/gost-manager/watchdog/watchdog.sqlite3"
 assert_file "complete monitoring removal keeps traffic" "${complete_monitor_root}/etc/systemd/system/gost-iran-1.service"
 assert_file "complete monitoring removal keeps runners" "${complete_monitor_root}/usr/local/lib/gost-manager/gost-run-iran.sh"
 
@@ -205,11 +220,42 @@ assert_absent "traffic+credentials removes env tree" "${credentials_root}/etc/go
 assert_file "traffic+credentials keeps monitoring" "${credentials_root}/usr/local/sbin/gost-monitor"
 assert_file "traffic+credentials keeps unmanaged unit" "${credentials_root}/etc/systemd/system/custom-gost.service"
 
+watchdog_root="${TEST_HOME}/watchdog-only"
+create_fixture "${watchdog_root}"
+: > "${COMMAND_LOG}"
+run_plan "${watchdog_root}" watchdog-service watchdog-code >/dev/null
+assert_absent "Watchdog-only removes central unit" "${watchdog_root}/etc/systemd/system/gost-upstream-watchdog.service"
+assert_absent "Watchdog-only removes Python code" "${watchdog_root}/usr/local/lib/gost-manager/gost_watchdog"
+assert_file "Watchdog-only preserves global config" "${watchdog_root}/etc/gost-manager/watchdog.conf"
+assert_file "Watchdog-only preserves profile config" "${watchdog_root}/etc/gost-manager/watchdog.d/iran-1.conf"
+assert_file "Watchdog-only preserves history" "${watchdog_root}/var/lib/gost-manager/watchdog/watchdog.sqlite3"
+assert_file "Watchdog-only leaves traffic unit" "${watchdog_root}/etc/systemd/system/gost-iran-1.service"
+assert_not_contains "Watchdog-only never controls traffic" "systemctl disable --now gost-iran-" "${COMMAND_LOG}"
+
+watchdog_purge_root="${TEST_HOME}/watchdog-purge"
+create_fixture "${watchdog_purge_root}"
+run_plan "${watchdog_purge_root}" watchdog-service watchdog-code watchdog-data >/dev/null
+assert_absent "Watchdog purge removes global config" "${watchdog_purge_root}/etc/gost-manager/watchdog.conf"
+assert_absent "Watchdog purge removes profile config" "${watchdog_purge_root}/etc/gost-manager/watchdog.d"
+assert_absent "Watchdog purge removes history" "${watchdog_purge_root}/var/lib/gost-manager/watchdog"
+assert_file "Watchdog purge keeps monitoring config" "${watchdog_purge_root}/etc/gost-manager/monitoring.env"
+
+watchdog_dependency_root="${TEST_HOME}/watchdog-dependency"
+create_fixture "${watchdog_dependency_root}"
+if run_plan "${watchdog_dependency_root}" watchdog-code >/dev/null 2>&1; then
+  fail "Watchdog code removal refuses while service remains"
+else
+  pass "Watchdog code removal refuses while service remains"
+fi
+assert_file "Watchdog dependency refusal keeps code" "${watchdog_dependency_root}/usr/local/lib/gost-manager/gost_watchdog/__init__.py"
+
 full_root="${TEST_HOME}/full"
 create_fixture "${full_root}"
-run_plan "${full_root}" manager monitor-service monitor-code monitor-config history traffic credentials binary >/dev/null
+run_plan "${full_root}" manager monitor-service monitor-code monitor-config history \
+  watchdog-service watchdog-code watchdog-data traffic credentials binary >/dev/null
 assert_absent "full selection removes manager" "${full_root}/usr/local/sbin/gost-manager"
 assert_absent "full selection removes monitoring" "${full_root}/usr/local/sbin/gost-monitor"
+assert_absent "full selection removes Watchdog" "${full_root}/usr/local/sbin/gost-upstream-watchdog"
 assert_absent "full selection removes history" "${full_root}/var/lib/gost-manager"
 assert_absent "full selection removes credentials" "${full_root}/etc/gost"
 assert_absent "full selection removes GOST binary" "${full_root}/usr/local/bin/gost"

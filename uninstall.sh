@@ -9,12 +9,16 @@ RM_BIN="${RM_BIN:-rm}"
 RMDIR_BIN="${RMDIR_BIN:-rmdir}"
 MONITOR_ADMIN_BIN="${MONITOR_ADMIN_BIN:-/usr/local/sbin/gost-monitor-admin}"
 MONITOR_SERVICE="gost-monitor-collector.service"
+WATCHDOG_SERVICE="gost-upstream-watchdog.service"
 
 REMOVE_MANAGER=0
 REMOVE_MONITOR_SERVICE=0
 REMOVE_MONITOR_CODE=0
 REMOVE_MONITOR_CONFIG=0
 REMOVE_MONITOR_HISTORY=0
+REMOVE_WATCHDOG_SERVICE=0
+REMOVE_WATCHDOG_CODE=0
+REMOVE_WATCHDOG_DATA=0
 REMOVE_TRAFFIC=0
 REMOVE_CREDENTIALS=0
 REMOVE_GOST_BINARY=0
@@ -100,12 +104,17 @@ remove_file() {
 
 remove_exact_tree() {
   local path="$1"
-  local allowed_config allowed_credentials allowed_package
+  local allowed_config allowed_credentials allowed_package allowed_watchdog_config
+  local allowed_watchdog_package allowed_watchdog_state
   allowed_config="$(path_for /etc/gost-manager)"
   allowed_credentials="$(path_for /etc/gost)"
   allowed_package="$(path_for /usr/local/lib/gost-manager/monitoring)"
+  allowed_watchdog_config="$(path_for /etc/gost-manager/watchdog.d)"
+  allowed_watchdog_package="$(path_for /usr/local/lib/gost-manager/gost_watchdog)"
+  allowed_watchdog_state="$(path_for /var/lib/gost-manager/watchdog)"
   case "${path}" in
-    "${allowed_config}"|"${allowed_credentials}"|"${allowed_package}") ;;
+    "${allowed_config}"|"${allowed_credentials}"|"${allowed_package}"|\
+    "${allowed_watchdog_config}"|"${allowed_watchdog_package}"|"${allowed_watchdog_state}") ;;
     *)
       die "refusing unapproved recursive removal path: ${path}"
       return 1
@@ -158,6 +167,23 @@ monitor_service_present() {
   monitor_service_loaded
 }
 
+watchdog_service_loaded() {
+  local state
+  if ! state="$("${SYSTEMCTL_BIN}" show "${WATCHDOG_SERVICE}" --property=LoadState --value 2>/dev/null)"; then
+    return 0
+  fi
+  [[ -n "${state}" && "${state}" != "not-found" ]]
+}
+
+watchdog_service_present() {
+  local unit_path
+  unit_path="$(path_for /etc/systemd/system/${WATCHDOG_SERVICE})"
+  [[ -e "${unit_path}" ]] && return 0
+  "${SYSTEMCTL_BIN}" is-active --quiet "${WATCHDOG_SERVICE}" >/dev/null 2>&1 && return 0
+  "${SYSTEMCTL_BIN}" is-enabled --quiet "${WATCHDOG_SERVICE}" >/dev/null 2>&1 && return 0
+  watchdog_service_loaded
+}
+
 capture_monitor_config() {
   local config_path value
   config_path="$(path_for /etc/gost-manager/monitoring.env)"
@@ -177,6 +203,12 @@ validate_dependencies() {
   if [[ "${REMOVE_MONITOR_CODE}" == "1" || "${REMOVE_MONITOR_CONFIG}" == "1" ]]; then
     if [[ "${REMOVE_MONITOR_SERVICE}" != "1" ]] && monitor_service_present; then
       die "monitoring code/config cannot be removed while the collector service is active, enabled, or loaded."
+      return 1
+    fi
+  fi
+  if [[ "${REMOVE_WATCHDOG_CODE}" == "1" || "${REMOVE_WATCHDOG_DATA}" == "1" ]]; then
+    if [[ "${REMOVE_WATCHDOG_SERVICE}" != "1" ]] && watchdog_service_present; then
+      die "Watchdog code/config/history cannot be removed while its central service is active, enabled, or loaded."
       return 1
     fi
   fi
@@ -209,6 +241,9 @@ Monitoring service/unit:       $(yes_no "${REMOVE_MONITOR_SERVICE}")
 Monitoring code/launchers:     $(yes_no "${REMOVE_MONITOR_CODE}")
 Monitoring config:             $(yes_no "${REMOVE_MONITOR_CONFIG}")
 Monitoring history:            $(yes_no "${REMOVE_MONITOR_HISTORY}")
+Watchdog central service/unit: $(yes_no "${REMOVE_WATCHDOG_SERVICE}")
+Watchdog code/launchers:       $(yes_no "${REMOVE_WATCHDOG_CODE}")
+Watchdog config/history purge: $(yes_no "${REMOVE_WATCHDOG_DATA}")
 Managed traffic services:      $(yes_no "${REMOVE_TRAFFIC}")
 /etc/gost credentials/backups: $(yes_no "${REMOVE_CREDENTIALS}")
 GOST binary:                   $(yes_no "${REMOVE_GOST_BINARY}")
@@ -222,6 +257,16 @@ collect_plan() {
   confirm "Remove monitoring launchers and Python code?" && REMOVE_MONITOR_CODE=1
   confirm "Remove monitoring config under /etc/gost-manager?" && REMOVE_MONITOR_CONFIG=1
   confirm "Delete monitoring history from the configured database?" && REMOVE_MONITOR_HISTORY=1
+  confirm "Stop and remove only the central Upstream Watchdog service/unit?" && REMOVE_WATCHDOG_SERVICE=1
+  confirm "Remove Upstream Watchdog launchers and Python code?" && REMOVE_WATCHDOG_CODE=1
+  if confirm "Purge Upstream Watchdog operator config and 24-hour history?"; then
+    read -r -p "Type DELETE WATCHDOG DATA to confirm: " phrase
+    if [[ "${phrase}" == "DELETE WATCHDOG DATA" ]]; then
+      REMOVE_WATCHDOG_DATA=1
+    else
+      info "Watchdog data purge cancelled."
+    fi
+  fi
   confirm "Stop and remove exact managed traffic tunnel services?" && REMOVE_TRAFFIC=1
   if confirm "Delete /etc/gost env files, credentials, and backups?"; then
     read -r -p "Type DELETE GOST CREDENTIALS to confirm: " phrase
@@ -233,6 +278,68 @@ collect_plan() {
   fi
   confirm "Delete /usr/local/bin/gost?" && REMOVE_GOST_BINARY=1
   return 0
+}
+
+preserve_watchdog_dependencies() {
+  REMOVE_WATCHDOG_CODE=0
+  REMOVE_WATCHDOG_DATA=0
+  info "Watchdog service removal failed; its code, configuration, and history were preserved."
+}
+
+remove_watchdog_service() {
+  local unit_path
+  unit_path="$(path_for /etc/systemd/system/${WATCHDOG_SERVICE})"
+  if ! watchdog_service_present; then
+    return 0
+  fi
+  if ! "${SYSTEMCTL_BIN}" disable --now "${WATCHDOG_SERVICE}"; then
+    preserve_watchdog_dependencies
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  if "${SYSTEMCTL_BIN}" is-active --quiet "${WATCHDOG_SERVICE}" >/dev/null 2>&1 || \
+     "${SYSTEMCTL_BIN}" is-enabled --quiet "${WATCHDOG_SERVICE}" >/dev/null 2>&1; then
+    preserve_watchdog_dependencies
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  if [[ -e "${unit_path}" ]]; then
+    remove_file "${unit_path}" || {
+      preserve_watchdog_dependencies
+      FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+      return 0
+    }
+    UNIT_CHANGED=1
+  fi
+}
+
+remove_watchdog_code() {
+  if watchdog_service_present; then
+    info "Watchdog service still exists; its code and launchers were preserved."
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  remove_file "$(path_for /usr/local/sbin/gost-upstream-watchdog)" || return 1
+  remove_file "$(path_for /usr/local/sbin/gost-watchdog-admin)" || return 1
+  remove_exact_tree "$(path_for /usr/local/lib/gost-manager/gost_watchdog)" || return 1
+}
+
+remove_watchdog_data() {
+  local config_root state_root
+  if watchdog_service_present; then
+    info "Watchdog service still exists; its configuration and history were preserved."
+    FAILED_ACTIONS=$((FAILED_ACTIONS + 1))
+    return 0
+  fi
+  remove_file "$(path_for /etc/gost-manager/watchdog.conf)" || return 1
+  remove_exact_tree "$(path_for /etc/gost-manager/watchdog.d)" || return 1
+  remove_exact_tree "$(path_for /var/lib/gost-manager/watchdog)" || return 1
+  config_root="$(path_for /etc/gost-manager)"
+  [[ ! -d "${config_root}" || -L "${config_root}" ]] || \
+    "${RMDIR_BIN}" "${config_root}" >/dev/null 2>&1 || true
+  state_root="$(path_for /var/lib/gost-manager)"
+  [[ ! -d "${state_root}" || -L "${state_root}" ]] || \
+    "${RMDIR_BIN}" "${state_root}" >/dev/null 2>&1 || true
 }
 
 preserve_monitoring_dependencies() {
@@ -420,6 +527,9 @@ apply_plan() {
     remove_file "$(path_for /usr/local/sbin/gost-manager)" || return 1
     remove_file "$(path_for /usr/local/lib/gost-manager/VERSION)" || return 1
   fi
+  if [[ "${REMOVE_WATCHDOG_SERVICE}" == "1" ]]; then
+    remove_watchdog_service || return 1
+  fi
   if [[ "${REMOVE_MONITOR_SERVICE}" == "1" ]]; then
     remove_monitor_service || return 1
   fi
@@ -437,6 +547,12 @@ apply_plan() {
   fi
   if [[ "${REMOVE_MONITOR_CONFIG}" == "1" ]]; then
     remove_monitor_config || return 1
+  fi
+  if [[ "${REMOVE_WATCHDOG_CODE}" == "1" ]]; then
+    remove_watchdog_code || return 1
+  fi
+  if [[ "${REMOVE_WATCHDOG_DATA}" == "1" ]]; then
+    remove_watchdog_data || return 1
   fi
   if [[ "${REMOVE_TRAFFIC}" == "1" ]]; then
     remove_traffic_services || return 1
@@ -458,6 +574,12 @@ apply_plan() {
   if [[ "${REMOVE_MONITOR_CONFIG}" != "1" && -d "$(path_for /etc/gost-manager)" ]]; then
     info "Monitoring config retained at $(path_for /etc/gost-manager)."
   fi
+  if [[ "${REMOVE_WATCHDOG_DATA}" != "1" ]]; then
+    [[ ! -d "$(path_for /etc/gost-manager/watchdog.d)" ]] || \
+      info "Watchdog operator config retained at $(path_for /etc/gost-manager)."
+    [[ ! -d "$(path_for /var/lib/gost-manager/watchdog)" ]] || \
+      info "Watchdog history retained at $(path_for /var/lib/gost-manager/watchdog)."
+  fi
   if [[ "${FAILED_ACTIONS}" -ne 0 ]]; then
     info "Uninstall completed with ${FAILED_ACTIONS} failed action(s)."
     return 1
@@ -469,7 +591,7 @@ main() {
   require_safe_root
   collect_plan
   show_plan
-  if [[ "${REMOVE_MANAGER}${REMOVE_MONITOR_SERVICE}${REMOVE_MONITOR_CODE}${REMOVE_MONITOR_CONFIG}${REMOVE_MONITOR_HISTORY}${REMOVE_TRAFFIC}${REMOVE_CREDENTIALS}${REMOVE_GOST_BINARY}" == "00000000" ]]; then
+  if [[ "${REMOVE_MANAGER}${REMOVE_MONITOR_SERVICE}${REMOVE_MONITOR_CODE}${REMOVE_MONITOR_CONFIG}${REMOVE_MONITOR_HISTORY}${REMOVE_WATCHDOG_SERVICE}${REMOVE_WATCHDOG_CODE}${REMOVE_WATCHDOG_DATA}${REMOVE_TRAFFIC}${REMOVE_CREDENTIALS}${REMOVE_GOST_BINARY}" == "00000000000" ]]; then
     info "No components selected; nothing changed."
     return 0
   fi

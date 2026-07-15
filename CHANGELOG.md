@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Added the central per-profile Iran Upstream Watchdog v1 with exact 2-second
+  ICMP defaults, concurrent deduplicated checks, stop ownership, manual and
+  maintenance protection, bounded 24-hour SQLite transition history, hardened
+  systemd packaging, menu/install/uninstall integration, and deterministic
+  tests. Installation leaves every profile Disabled and performs no GOST
+  traffic service action.
+
 ## 2.0.1 - 2026-07-14
 
 - Fixed public setup compatibility with the standard Ubuntu

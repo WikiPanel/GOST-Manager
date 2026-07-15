@@ -104,6 +104,8 @@ assert_contains "archive types are validated" 'tar -tvzf "${ARCHIVE}"' "${WORKFL
 assert_contains "archive must include setup" "setup.sh install.sh gost-manager.sh" "${WORKFLOW}"
 assert_contains "archive must include VERSION" "for required in VERSION" "${WORKFLOW}"
 assert_contains "archive must include monitoring init" "monitoring/__init__.py" "${WORKFLOW}"
+assert_contains "archive must include Watchdog init" "gost_watchdog/__init__.py" "${WORKFLOW}"
+assert_contains "archive must include Watchdog manifest" "packaging/watchdog-runtime-manifest.txt" "${WORKFLOW}"
 assert_contains "existing release blocks publication" 'gh release view "${TAG}"' "${WORKFLOW}"
 assert_contains "workflow uses GitHub CLI" 'gh release create "${TAG}"' "${WORKFLOW}"
 assert_contains "release uses exact existing tag" "--verify-tag" "${WORKFLOW}"

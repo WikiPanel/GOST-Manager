@@ -2,7 +2,8 @@
 
 ## Product boundary
 
-GOST Manager v2.0.1 is Direct Mode plus optional local Monitoring Lite. NGINX Gateway and
+GOST Manager v2.0.1 is Direct Mode plus optional local Monitoring Lite and the
+explicitly enabled Upstream Watchdog safety controller. NGINX Gateway and
 Native GOST Gateway are cancelled. Do not add placeholders, hidden commands,
 Gateway packages, NGINX discovery, or a second traffic runtime.
 
@@ -30,10 +31,10 @@ binary.
 
 ## Local checks
 
-Compile and run Monitoring tests:
+Compile and run Python tests:
 
-    python3 -m py_compile monitoring/*.py tests/test_monitoring*.py
-    python3 -m unittest discover -s tests -p 'test_monitoring*.py'
+    python3 -m py_compile monitoring/*.py gost_watchdog/*.py tests/test_*.py
+    python3 -m unittest discover -s tests
 
 Run supported Bash suites:
 
@@ -55,7 +56,7 @@ Run the complete gate:
     git diff --check
 
 ShellCheck covers the manager, installer, uninstaller, both Direct Mode
-runners, Monitoring launchers, and supported Bash test suites. Local
+runners, Monitoring/Watchdog launchers, and supported Bash test suites. Local
 ShellCheck instructions and make check support are intentionally retained.
 
 ## Test isolation
@@ -65,7 +66,8 @@ real /etc, /usr/local, /var/lib, systemd, firewall, or GOST services.
 Temporary-root suites use command stubs and fixture paths.
 
 tests/test-systemd-linux.sh skips clearly on non-Linux hosts. On Linux it uses
-the real systemd-analyze to validate the supported Monitoring unit and runs
+the real systemd-analyze to validate the supported Monitoring and central
+Watchdog units and runs
 the temporary-root installer verification. The Ubuntu 22.04/24.04 matrix is
 defined in .github/workflows/monitoring-integration.yml.
 
@@ -96,6 +98,9 @@ must prove:
 - Server Stability discovers only exact numbered GOST units, performs no
   service restart, preserves env/unit bytes, and is idempotent after its first
   successful run.
+- Watchdog defaults to Disabled per profile, validates exact Iran unit names,
+  checks unique IPs concurrently, persists stop ownership, bounds events to 24
+  hours, and never controls a Kharej or arbitrary service.
 
 ## Release
 

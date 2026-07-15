@@ -1,0 +1,43 @@
+[Unit]
+Description=GOST Manager Upstream Watchdog
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/gost-manager/watchdog
+ExecStartPre=/usr/local/sbin/gost-watchdog-admin validate-config
+ExecStart=/usr/local/sbin/gost-upstream-watchdog
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+UMask=0077
+LimitNOFILE=4096
+TasksMax=128
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StateDirectory=gost-manager
+StateDirectoryMode=0700
+ReadOnlyPaths=/etc/gost /etc/gost-manager/watchdog.conf /etc/gost-manager/watchdog.d /etc/systemd/system
+ReadWritePaths=/var/lib/gost-manager/watchdog
+
+[Install]
+WantedBy=multi-user.target

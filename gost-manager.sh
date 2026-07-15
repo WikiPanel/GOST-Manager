@@ -15,6 +15,8 @@ MONITOR_EXPORT_DIR="/root"
 MONITOR_BIN="/usr/local/sbin/gost-monitor"
 MONITOR_COLLECTOR_BIN="/usr/local/sbin/gost-monitor-collector"
 MONITOR_ADMIN_BIN="/usr/local/sbin/gost-monitor-admin"
+WATCHDOG_SERVICE="gost-upstream-watchdog.service"
+WATCHDOG_ADMIN_BIN="/usr/local/sbin/gost-watchdog-admin"
 STABILITY_SYSCTL_FILE="/etc/sysctl.d/99-gost-stability.conf"
 STABILITY_MANAGED_MARKER="# Managed by GOST Manager: Server Stability"
 
@@ -30,6 +32,7 @@ if [[ "${GOST_MANAGER_TESTING:-0}" == "1" ]]; then
   MONITOR_BIN="${GOST_MONITOR_BIN_TEST:-${MONITOR_BIN}}"
   MONITOR_COLLECTOR_BIN="${GOST_MONITOR_COLLECTOR_BIN_TEST:-${MONITOR_COLLECTOR_BIN}}"
   MONITOR_ADMIN_BIN="${GOST_MONITOR_ADMIN_BIN_TEST:-${MONITOR_ADMIN_BIN}}"
+  WATCHDOG_ADMIN_BIN="${GOST_WATCHDOG_ADMIN_BIN_TEST:-${WATCHDOG_ADMIN_BIN}}"
   STABILITY_SYSCTL_FILE="${GOST_STABILITY_SYSCTL_FILE_TEST:-${STABILITY_SYSCTL_FILE}}"
 fi
 
@@ -73,6 +76,7 @@ STABILITY_SYSCTL_APPLY_COUNT=0
 STABILITY_DAEMON_RELOAD_COUNT=0
 STABILITY_OPTIMIZED_COUNT=0
 STABILITY_FAILURE_COUNT=0
+WATCHDOG_SELECTED_PROFILE=""
 
 die() {
   printf 'Error: %s\n' "$*" >&2
@@ -3882,6 +3886,230 @@ monitoring_menu() {
   done
 }
 
+run_watchdog_command() {
+  local status
+  if "${WATCHDOG_ADMIN_BIN}" "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  info "Watchdog command failed safely with exit code ${status}."
+  return 0
+}
+
+watchdog_select_profile() {
+  local profile_id
+  run_watchdog_command profiles
+  read -r -p "Iran profile ID (iran-N, empty to return): " profile_id
+  [[ -n "${profile_id}" ]] || return 1
+  if [[ ! "${profile_id}" =~ ^iran-[1-9][0-9]*$ ]]; then
+    info "Invalid Iran profile ID."
+    return 1
+  fi
+  WATCHDOG_SELECTED_PROFILE="${profile_id}"
+}
+
+watchdog_change_mode() {
+  local profile_id choice mode
+  watchdog_select_profile || return 0
+  profile_id="${WATCHDOG_SELECTED_PROFILE}"
+  run_watchdog_command effective "${profile_id}"
+  cat <<'MENU'
+1) Monitor Only
+2) Auto Protect
+3) Disabled
+MENU
+  read -r -p "Choose Watchdog mode: " choice
+  case "${choice}" in
+    1) mode=monitor ;;
+    2) mode=auto ;;
+    3) mode=disabled ;;
+    *) info "Invalid Watchdog mode."; return 0 ;;
+  esac
+  if [[ "${mode}" == "auto" ]]; then
+    info "Auto Protect may stop and later start only ${profile_id} after the configured thresholds."
+  fi
+  confirm "Set ${profile_id} Watchdog mode to ${mode}?" || { info "Mode change cancelled."; return 0; }
+  run_watchdog_command set-mode "${profile_id}" "${mode}"
+}
+
+watchdog_disable_profile() {
+  local profile_id
+  watchdog_select_profile || return 0
+  profile_id="${WATCHDOG_SELECTED_PROFILE}"
+  confirm "Disable all Watchdog checks and actions for ${profile_id}?" || { info "Disable cancelled."; return 0; }
+  run_watchdog_command set-mode "${profile_id}" disabled
+}
+
+watchdog_integer() {
+  local label="$1"
+  local default="$2"
+  local minimum="$3"
+  local maximum="$4"
+  local value
+  value="$(prompt_default "${label}" "${default}")"
+  if [[ ! "${value}" =~ ^[0-9]+$ ]] || ((10#${value} < minimum || 10#${value} > maximum)); then
+    info "${label} must be between ${minimum} and ${maximum}." >&2
+    return 1
+  fi
+  printf '%s\n' "${value}"
+}
+
+watchdog_configure_profile() {
+  local profile_id interval timeout failures successes hold jitter
+  watchdog_select_profile || return 0
+  profile_id="${WATCHDOG_SELECTED_PROFILE}"
+  run_watchdog_command effective "${profile_id}"
+  interval="$(watchdog_integer "Check interval seconds" 2 1 300)" || return 0
+  timeout="$(watchdog_integer "Ping timeout seconds" 1 1 60)" || return 0
+  if ((10#${timeout} > 10#${interval})); then
+    info "Ping timeout must not exceed the check interval."
+    return 0
+  fi
+  failures="$(watchdog_integer "Failure threshold" 10 1 1000)" || return 0
+  successes="$(watchdog_integer "Success threshold" 10 1 1000)" || return 0
+  hold="$(watchdog_integer "Recovery hold seconds" 10 0 3600)" || return 0
+  jitter="$(watchdog_integer "Recovery jitter maximum seconds" 10 0 300)" || return 0
+  info "Effective candidate: interval=${interval}s timeout=${timeout}s failures=${failures} successes=${successes} hold=${hold}s jitter=0-${jitter}s"
+  confirm "Save these overrides for ${profile_id}?" || { info "Override change cancelled."; return 0; }
+  run_watchdog_command configure-profile "${profile_id}" \
+    --check-interval "${interval}" --ping-timeout "${timeout}" \
+    --failure-threshold "${failures}" --success-threshold "${successes}" \
+    --recovery-hold "${hold}" --recovery-jitter "${jitter}"
+}
+
+watchdog_reset_profile() {
+  local profile_id
+  watchdog_select_profile || return 0
+  profile_id="${WATCHDOG_SELECTED_PROFILE}"
+  confirm "Reset ${profile_id} timing overrides and return its mode to Disabled?" || { info "Reset cancelled."; return 0; }
+  run_watchdog_command reset-profile "${profile_id}"
+}
+
+watchdog_test_ping() {
+  local profile_id
+  watchdog_select_profile || return 0
+  profile_id="${WATCHDOG_SELECTED_PROFILE}"
+  run_watchdog_command ping "${profile_id}"
+}
+
+watchdog_maintenance_menu() {
+  local profile_id choice action
+  watchdog_select_profile || return 0
+  profile_id="${WATCHDOG_SELECTED_PROFILE}"
+  cat <<'MENU'
+1) Enter maintenance and keep current service state
+2) Enter maintenance and stop service now
+3) Exit maintenance without starting
+4) Exit maintenance and start when upstream is healthy
+MENU
+  read -r -p "Choose maintenance action: " choice
+  case "${choice}" in
+    1) action=enter-keep ;;
+    2) action=enter-stop ;;
+    3) action=exit-no-start ;;
+    4) action=exit-start ;;
+    *) info "Invalid maintenance action."; return 0 ;;
+  esac
+  if [[ "${action}" == "enter-stop" || "${action}" == "exit-start" ]]; then
+    confirm "This action may change only gost-${profile_id}.service. Continue?" || { info "Maintenance action cancelled."; return 0; }
+  fi
+  run_watchdog_command maintenance "${profile_id}" "${action}"
+}
+
+watchdog_configure_global() {
+  local interval timeout failures successes hold jitter
+  run_watchdog_command effective-global
+  interval="$(watchdog_integer "Global check interval seconds" 2 1 300)" || return 0
+  timeout="$(watchdog_integer "Global Ping timeout seconds" 1 1 60)" || return 0
+  if ((10#${timeout} > 10#${interval})); then
+    info "Ping timeout must not exceed the check interval."
+    return 0
+  fi
+  failures="$(watchdog_integer "Global failure threshold" 10 1 1000)" || return 0
+  successes="$(watchdog_integer "Global success threshold" 10 1 1000)" || return 0
+  hold="$(watchdog_integer "Global recovery hold seconds" 10 0 3600)" || return 0
+  jitter="$(watchdog_integer "Global recovery jitter maximum seconds" 10 0 300)" || return 0
+  info "Global candidate: Ping every ${interval}s, timeout ${timeout}s, down after ${failures}, recover after ${successes} + ${hold}s + 0-${jitter}s."
+  confirm "Save these global Watchdog defaults?" || { info "Global change cancelled."; return 0; }
+  run_watchdog_command set-global \
+    --check-interval "${interval}" --ping-timeout "${timeout}" \
+    --failure-threshold "${failures}" --success-threshold "${successes}" \
+    --recovery-hold "${hold}" --recovery-jitter "${jitter}"
+}
+
+watchdog_service_status() {
+  systemctl --no-pager status "${WATCHDOG_SERVICE}" || true
+  run_watchdog_command status
+}
+
+watchdog_restart_service() {
+  confirm "Restart only ${WATCHDOG_SERVICE}?" || { info "Watchdog restart cancelled."; return 0; }
+  if systemctl restart "${WATCHDOG_SERVICE}"; then
+    info "Upstream Watchdog restarted. No GOST traffic service was restarted."
+  else
+    info "Upstream Watchdog restart failed."
+  fi
+}
+
+watchdog_rearm_profile() {
+  local profile_id
+  watchdog_select_profile || return 0
+  profile_id="${WATCHDOG_SELECTED_PROFILE}"
+  confirm "Clear manual override and re-arm Auto Protect for ${profile_id}?" || { info "Re-arm cancelled."; return 0; }
+  run_watchdog_command rearm "${profile_id}"
+}
+
+show_watchdog_menu() {
+  cat <<'MENU'
+Upstream Watchdog
+=================
+
+Default Ping interval: 2 seconds
+
+1) Show all profile status
+2) Enable or change profile mode
+3) Disable watchdog for profile
+4) Configure profile overrides
+5) Reset profile overrides to global defaults
+6) Test profile ping
+7) Maintenance mode
+8) Show last 24-hour events
+9) Show 24-hour outage summary
+10) Configure global defaults
+11) Show watchdog service status
+12) Restart watchdog service
+13) Re-arm manual override
+14) Back
+MENU
+}
+
+watchdog_menu() {
+  local choice
+  while true; do
+    show_watchdog_menu
+    read -r -p "Choose an Upstream Watchdog option: " choice
+    case "${choice}" in
+      1) run_watchdog_command status ;;
+      2) watchdog_change_mode ;;
+      3) watchdog_disable_profile ;;
+      4) watchdog_configure_profile ;;
+      5) watchdog_reset_profile ;;
+      6) watchdog_test_ping ;;
+      7) watchdog_maintenance_menu ;;
+      8) run_watchdog_command events --limit 200 ;;
+      9) run_watchdog_command summary ;;
+      10) watchdog_configure_global ;;
+      11) watchdog_service_status ;;
+      12) watchdog_restart_service ;;
+      13) watchdog_rearm_profile ;;
+      14) return 0 ;;
+      *) info "Invalid Upstream Watchdog option." ;;
+    esac
+    printf '\n'
+  done
+}
+
 show_menu() {
   manager_banner
   cat <<'MENU'
@@ -3898,6 +4126,7 @@ show_menu() {
 9) Clean old/broken GOST configs
 10) Monitoring
 11) Server Stability
+12) Upstream Watchdog
 0) Exit
 MENU
 }
@@ -3919,6 +4148,7 @@ main_menu() {
       9) clean_old_broken_configs ;;
       10) monitoring_menu ;;
       11) server_stability_wizard ;;
+      12) watchdog_menu ;;
       0) exit 0 ;;
       *) info "Invalid option." ;;
     esac

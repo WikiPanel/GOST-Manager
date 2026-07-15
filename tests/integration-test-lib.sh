@@ -118,8 +118,29 @@ for argument in "$@"; do
   unit="${argument}"
   break
 done
-if [[ "${STUB_REMOVE_UNIT_BEFORE_DISABLE:-0}" == "1" && "${action}" == "disable" && -n "${STUB_UNIT_PATH:-}" ]]; then
-  rm -f "${STUB_UNIT_PATH}"
+state_active=""
+state_enabled=""
+unit_path=""
+case "${unit}" in
+  gost-monitor-collector.service)
+    state_active="${STUB_STATE_DIR}/active"
+    state_enabled="${STUB_STATE_DIR}/enabled"
+    unit_path="${STUB_UNIT_PATH:-}"
+    if [[ -z "${unit_path}" && -n "${GOST_MANAGER_ROOT:-}" ]]; then
+      unit_path="${GOST_MANAGER_ROOT%/}/etc/systemd/system/${unit}"
+    fi
+    ;;
+  gost-upstream-watchdog.service)
+    state_active="${STUB_STATE_DIR}/watchdog-active"
+    state_enabled="${STUB_STATE_DIR}/watchdog-enabled"
+    unit_path="${STUB_WATCHDOG_UNIT_PATH:-}"
+    if [[ -z "${unit_path}" && -n "${GOST_MANAGER_ROOT:-}" ]]; then
+      unit_path="${GOST_MANAGER_ROOT%/}/etc/systemd/system/${unit}"
+    fi
+    ;;
+esac
+if [[ "${STUB_REMOVE_UNIT_BEFORE_DISABLE:-0}" == "1" && "${action}" == "disable" && -n "${unit_path}" ]]; then
+  rm -f "${unit_path}"
 fi
 if [[ "${STUB_FAIL_SYSTEMCTL_ACTION:-}" == "${action}" && ( -z "${STUB_FAIL_SYSTEMCTL_UNIT:-}" || "${STUB_FAIL_SYSTEMCTL_UNIT}" == "${unit}" ) ]]; then
   exit 1
@@ -127,52 +148,55 @@ fi
 case "${action}" in
   list-units|list-unit-files) ;;
   is-enabled)
-    if [[ "${unit}" == "gost-monitor-collector.service" && -f "${STUB_STATE_DIR}/enabled" ]]; then
+    if [[ -n "${state_enabled}" && -f "${state_enabled}" ]]; then
       result=0
     else
       result=1
     fi
     ;;
   is-active)
-    if [[ "${unit}" == "gost-monitor-collector.service" && -f "${STUB_STATE_DIR}/active" ]]; then
+    if [[ -n "${state_active}" && -f "${state_active}" ]]; then
       result=0
     else
       result=1
     fi
     ;;
   enable)
-    if [[ "${unit}" == "gost-monitor-collector.service" ]]; then
-      touch "${STUB_STATE_DIR}/enabled"
+    if [[ -n "${state_enabled}" ]]; then
+      touch "${state_enabled}"
       mkdir -p "${STUB_STATE_DIR}/wants"
-      ln -sfn "${STUB_UNIT_PATH:-${unit}}" "${STUB_STATE_DIR}/wants/${unit}"
+      ln -sfn "${unit_path:-${unit}}" "${STUB_STATE_DIR}/wants/${unit}"
       if [[ " ${*} " == *" --now "* ]]; then
-        touch "${STUB_STATE_DIR}/active"
+        touch "${state_active}"
       fi
     fi
     ;;
   disable)
-    if [[ "${unit}" == "gost-monitor-collector.service" ]]; then
-      rm -f "${STUB_STATE_DIR}/enabled"
+    if [[ -n "${state_enabled}" ]]; then
+      rm -f "${state_enabled}"
       rm -f "${STUB_STATE_DIR}/wants/${unit}"
       if [[ " ${*} " == *" --now "* ]]; then
-        rm -f "${STUB_STATE_DIR}/active"
+        rm -f "${state_active}"
       fi
     fi
     ;;
   start|restart)
-    [[ "${unit}" != "gost-monitor-collector.service" ]] || touch "${STUB_STATE_DIR}/active"
+    [[ -z "${state_active}" ]] || touch "${state_active}"
     ;;
   stop)
-    [[ "${unit}" != "gost-monitor-collector.service" ]] || rm -f "${STUB_STATE_DIR}/active"
+    [[ -z "${state_active}" ]] || rm -f "${state_active}"
     ;;
   status)
-    if [[ "${unit}" != "gost-monitor-collector.service" || ! -f "${STUB_STATE_DIR}/active" ]]; then
+    if [[ -z "${state_active}" || ! -f "${state_active}" ]]; then
       result=1
     fi
     ;;
   daemon-reload) ;;
   show)
-    if [[ "${unit}" == "gost-monitor-collector.service" && ( "${STUB_FORCE_MONITOR_LOADED:-0}" == "1" || -e "${STUB_UNIT_PATH:-/nonexistent}" || -f "${STUB_STATE_DIR}/active" || -f "${STUB_STATE_DIR}/enabled" ) ]]; then
+    force_loaded=0
+    [[ "${unit}" != "gost-monitor-collector.service" || "${STUB_FORCE_MONITOR_LOADED:-0}" != "1" ]] || force_loaded=1
+    [[ "${unit}" != "gost-upstream-watchdog.service" || "${STUB_FORCE_WATCHDOG_LOADED:-0}" != "1" ]] || force_loaded=1
+    if [[ -n "${state_active}" && ( "${force_loaded}" == "1" || -e "${unit_path:-/nonexistent}" || -f "${state_active}" || -f "${state_enabled}" ) ]]; then
       printf 'loaded\n'
     else
       printf 'not-found\n'

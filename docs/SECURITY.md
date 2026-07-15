@@ -36,6 +36,12 @@ The systemd service uses `EnvironmentFile` so secrets are not embedded directly 
 
 The monitoring collector parses only the Direct Mode fields needed for topology and listener checks. It may store a remote `host:port` endpoint, but it never stores env usernames, passwords, tokens, or other credentials in metrics, events, entity metadata, collector state, or exports.
 
+The Upstream Watchdog parses only `KHAREJ_IP` from exact managed Iran env files.
+It does not load credential fields. Its argv-based Ping executor never invokes
+a shell, its systemd controller accepts only exact `gost-iran-N.service` names,
+and its dedicated 24-hour event store has fixed safe columns. Config/state
+paths are private and reject symlinks.
+
 ## Firewall Design
 
 The Kharej service exposes a SOCKS5 listener. That listener must be restricted to the Iran server IP.

@@ -79,7 +79,8 @@ create_release_tree() {
   local version="$2"
   local omit="${3:-}"
   local release_root="${directory}/GOST-Manager-${version}"
-  mkdir -p "${release_root}/lib" "${release_root}/monitoring" "${release_root}/packaging"
+  mkdir -p "${release_root}/lib" "${release_root}/monitoring" \
+    "${release_root}/gost_watchdog" "${release_root}/packaging"
   printf '%s\n' "${version}" > "${release_root}/VERSION"
   cp "${ROOT_DIR}/setup.sh" "${release_root}/setup.sh"
   cp "${ROOT_DIR}/gost-manager.sh" "${release_root}/gost-manager.sh"
@@ -88,6 +89,9 @@ create_release_tree() {
   cp "${ROOT_DIR}/packaging/monitoring-runtime-manifest.txt" \
     "${release_root}/packaging/monitoring-runtime-manifest.txt"
   printf '# release fixture\n' > "${release_root}/monitoring/__init__.py"
+  cp "${ROOT_DIR}/packaging/watchdog-runtime-manifest.txt" \
+    "${release_root}/packaging/watchdog-runtime-manifest.txt"
+  printf '# release fixture\n' > "${release_root}/gost_watchdog/__init__.py"
   cat > "${release_root}/install.sh" <<'INSTALLER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -132,8 +136,8 @@ create_transactional_release_assets() {
   mkdir -p "${release_root}"
   cp "${ROOT_DIR}/VERSION" "${ROOT_DIR}/setup.sh" "${ROOT_DIR}/install.sh" \
     "${ROOT_DIR}/gost-manager.sh" "${release_root}/"
-  cp -R "${ROOT_DIR}/lib" "${ROOT_DIR}/monitoring" "${ROOT_DIR}/packaging" \
-    "${release_root}/"
+  cp -R "${ROOT_DIR}/lib" "${ROOT_DIR}/monitoring" \
+    "${ROOT_DIR}/gost_watchdog" "${ROOT_DIR}/packaging" "${release_root}/"
   printf '%s\n' "${version}" > "${release_root}/VERSION"
   chmod 755 "${release_root}/setup.sh" "${release_root}/install.sh" \
     "${release_root}/gost-manager.sh" "${release_root}/lib/gost-run-iran.sh" \

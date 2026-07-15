@@ -70,11 +70,12 @@ GOST protocol behavior is not changed by this project.
     9) Clean old/broken GOST configs
     10) Monitoring
     11) Server Stability
+    12) Upstream Watchdog
     0) Exit
 
-Options 1 through 10 retain their established labels and behavior. Option 11
-is an operational stability wizard only. There is no option 12 or
-native-gateway placeholder.
+Options 1 through 11 retain their established labels and behavior. Option 12
+is the central per-profile Iran Upstream Watchdog. There is no native-gateway
+placeholder.
 
 Option 8 renders all profiles and opens a profile submenu for list, detail,
 edit, clone, restart-selected, and restart-all. Identity is the immutable pair
@@ -109,6 +110,16 @@ Historical generic rows already present in a monitoring database remain
 subject to the existing retention policy. This scope reset does not change the
 schema version and does not erase history.
 
+## Watchdog boundary
+
+The Upstream Watchdog is an explicit operator-enabled safety controller, not a
+traffic runtime or Monitoring action. One central daemon discovers only exact
+numbered Iran profiles and may call stop/start only for the corresponding
+validated `gost-iran-N.service`. All profiles default to Disabled. It shares no
+unit lifecycle relation with traffic services and installation performs no
+traffic action. Manual ownership and maintenance rules are documented in
+`docs/WATCHDOG-V1.md`.
+
 ## Managed paths
 
     /etc/gost/
@@ -117,19 +128,26 @@ schema version and does not erase history.
 
     /etc/gost-manager/
       monitoring.env
+      watchdog.conf
+      watchdog.d/iran-<number>.conf
 
     /var/lib/gost-manager/
       metrics.sqlite3
+      watchdog/watchdog.sqlite3
 
     /usr/local/lib/gost-manager/
       VERSION
       gost-run-iran.sh
       gost-run-kharej.sh
       monitoring/
+      gost_watchdog/
 
 Monitoring state is separate from Direct Mode configuration. Removing
 Monitoring Lite does not remove or alter tunnel env files, units, runners, or
 the official GOST binary.
+
+Watchdog state is also separate. Its component-aware removal preserves config
+and history by default and never changes a traffic service.
 
 The optional Server Stability wizard owns only:
 
@@ -147,6 +165,8 @@ independent of this helper.
 - A monitoring failure never changes the traffic path.
 - Installer file replacement is staged and rolled back on validation failure.
 - Existing collector active/enabled state is restored on failed upgrade.
+- Existing central Watchdog state is restored on failed upgrade, while every
+  profile remains Disabled unless an operator previously opted in.
 - Uninstall uses exact managed service matching and independent confirmations.
 - Surviving Direct Mode units preserve both runners, /etc/gost, and the GOST
   binary.
