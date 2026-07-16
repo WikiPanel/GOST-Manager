@@ -147,6 +147,7 @@ package_for_command() {
     python3) printf 'python3\n' ;;
     systemctl|systemd-analyze) printf 'systemd\n' ;;
     ss) printf 'iproute2\n' ;;
+    ping) printf 'iputils-ping\n' ;;
     cmp) printf 'diffutils\n' ;;
     grep) printf 'grep\n' ;;
     install|cp|mv|rm|chmod|chown|sync|mktemp|stat) printf 'coreutils\n' ;;
@@ -166,7 +167,7 @@ command_available() {
 
 validate_dependencies() {
   local command_name package existing
-  local -a required=(bash python3 systemctl systemd-analyze ss grep install cp mv rm chmod chown sync cmp mktemp stat)
+  local -a required=(bash python3 systemctl systemd-analyze ss ping grep install cp mv rm chmod chown sync cmp mktemp stat)
   local -a missing=()
   local -a packages=()
   for command_name in "${required[@]}"; do
@@ -199,6 +200,14 @@ validate_dependencies() {
   for command_name in "${missing[@]}"; do
     command_available "${command_name}" || die "dependency installation did not provide: ${command_name}"
   done
+}
+
+validate_ping_capability() {
+  local ping_binary
+  ping_binary="$(command -v ping)" || die "ping is required after dependency validation."
+  if ! "${ping_binary}" -n -c 1 -W 1 -- 127.0.0.1 >/dev/null 2>&1; then
+    die "installed ping cannot execute the supported local capability probe."
+  fi
 }
 
 manifest_contains() {
@@ -1193,6 +1202,8 @@ main() {
   inject_failure preflight
   validate_dependencies
   inject_failure dependency_validation
+  validate_ping_capability
+  inject_failure ping_validation
   validate_source_manifest
   inject_failure manifest_validation
   stage_sources

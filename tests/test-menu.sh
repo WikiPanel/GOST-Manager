@@ -50,6 +50,12 @@ set -Eeuo pipefail
 printf 'watchdog-admin %s\n' "$*" >> "${COMMAND_LOG}"
 if [[ "${1:-}" == "profiles" ]]; then
   printf 'iran-1\t203.0.113.10\tdisabled\n'
+elif [[ "${1:-}" == "effective" && "${3:-}" == "--json" ]]; then
+  printf '%s\n' "${STUB_WATCHDOG_PROFILE_JSON:-}"
+elif [[ "${1:-}" == "effective-global" && "${2:-}" == "--json" ]]; then
+  printf '%s\n' "${STUB_WATCHDOG_GLOBAL_JSON:-}"
+elif [[ "${1:-}" == "status" && "${2:-}" == "--profile" ]]; then
+  printf '%s\n' "${STUB_WATCHDOG_STATUS_JSON:-}"
 fi
 exit "${STUB_WATCHDOG_EXIT:-0}"
 STUB
@@ -65,6 +71,9 @@ export GOST_WATCHDOG_ADMIN_BIN_TEST="${STUB_BIN}/gost-watchdog-admin"
 export GOST_MONITOR_CONFIG_TEST="${TEST_HOME}/monitoring.env"
 export GOST_MONITOR_EXPORT_DIR_TEST="${TEST_HOME}"
 export STUB_CONFIG_DB="/var/lib/gost-manager/custom.sqlite3"
+export STUB_WATCHDOG_PROFILE_JSON='{"mode":"monitor","check_interval_seconds":7,"ping_timeout_seconds":3,"failure_threshold":17,"success_threshold":19,"recovery_hold_seconds":23,"recovery_jitter_max_seconds":29}'
+export STUB_WATCHDOG_GLOBAL_JSON='{"check_mode":"ping","check_interval_seconds":11,"ping_timeout_seconds":4,"failure_threshold":31,"success_threshold":37,"recovery_hold_seconds":41,"recovery_jitter_max_seconds":43}'
+export STUB_WATCHDOG_STATUS_JSON='{"errors":[],"profiles":[{"mode":"monitor","stopped_by_watchdog":false,"watchdog_state":"healthy","check_status":"success"}]}'
 
 # shellcheck source=../gost-manager.sh
 source "${ROOT_DIR}/gost-manager.sh"
@@ -243,6 +252,67 @@ for label in \
   assert_contains "Watchdog menu ${label}" "${label}" "${watchdog_menu_file}"
 done
 assert_contains "Watchdog menu displays exact default interval" "Default Ping interval: 2 seconds" "${watchdog_menu_file}"
+
+: > "${COMMAND_LOG}"
+watchdog_configure_profile <<< $'iran-1\n\n\n\n\n\n\n' >/dev/null
+assert_contains "profile menu reads machine-readable current values" \
+  "watchdog-admin effective iran-1 --json" "${COMMAND_LOG}"
+assert_not_contains "Enter preserves all custom profile values without a write" \
+  "configure-profile" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_configure_profile <<< $'iran-1\n8\n\n\n\n\n\ny' >/dev/null
+assert_contains "changing one profile value writes only that override" \
+  "watchdog-admin configure-profile iran-1 --check-interval 8" "${COMMAND_LOG}"
+assert_not_contains "single profile change does not expand inherited timeout" \
+  "--ping-timeout" "${COMMAND_LOG}"
+assert_not_contains "single profile change does not reset custom threshold" \
+  "--failure-threshold" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_configure_global <<< $'\n\n\n\n\n\n' >/dev/null
+assert_contains "global menu reads machine-readable current values" \
+  "watchdog-admin effective-global --json" "${COMMAND_LOG}"
+assert_not_contains "Enter preserves all custom global values without a write" \
+  "set-global" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_configure_global <<< $'\n\n32\n\n\n\ny' >/dev/null
+assert_contains "changing one global value writes only that field" \
+  "watchdog-admin set-global --failure-threshold 32" "${COMMAND_LOG}"
+assert_not_contains "single global change does not reset custom interval" \
+  "--check-interval" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+export STUB_WATCHDOG_PROFILE_JSON='{'
+watchdog_configure_profile <<< $'iran-1' >/dev/null 2>&1 || true
+assert_not_contains "invalid profile JSON causes no configuration write" \
+  "configure-profile" "${COMMAND_LOG}"
+export STUB_WATCHDOG_PROFILE_JSON='{"mode":"monitor","check_interval_seconds":7,"ping_timeout_seconds":3,"failure_threshold":17,"success_threshold":19,"recovery_hold_seconds":23,"recovery_jitter_max_seconds":29}'
+
+: > "${COMMAND_LOG}"
+export STUB_WATCHDOG_GLOBAL_JSON='{"check_mode":"ping"}'
+watchdog_configure_global </dev/null >/dev/null 2>&1 || true
+assert_not_contains "incomplete global JSON causes no configuration write" \
+  "set-global" "${COMMAND_LOG}"
+export STUB_WATCHDOG_GLOBAL_JSON='{"check_mode":"ping","check_interval_seconds":11,"ping_timeout_seconds":4,"failure_threshold":31,"success_threshold":37,"recovery_hold_seconds":41,"recovery_jitter_max_seconds":43}'
+
+: > "${COMMAND_LOG}"
+export STUB_WATCHDOG_STATUS_JSON='{"errors":[],"profiles":[{"mode":"auto","stopped_by_watchdog":true,"watchdog_state":"healthy","check_status":"success"}]}'
+watchdog_apply_mode_change iran-1 monitor <<< $'1\ny' >/dev/null
+assert_contains "mode change can explicitly keep Watchdog-owned stop" \
+  "watchdog-admin set-mode iran-1 monitor --owned-action keep-stopped" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_apply_mode_change iran-1 disabled <<< $'2\ny' >/dev/null
+assert_contains "mode change can explicitly start a healthy owned stop" \
+  "watchdog-admin set-mode iran-1 disabled --owned-action start-if-healthy" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_apply_mode_change iran-1 disabled <<< $'3' >/dev/null
+assert_not_contains "mode-change cancellation performs no write or service action" \
+  "set-mode" "${COMMAND_LOG}"
+export STUB_WATCHDOG_STATUS_JSON='{"errors":[],"profiles":[{"mode":"monitor","stopped_by_watchdog":false,"watchdog_state":"healthy","check_status":"success"}]}'
 
 watchdog_dispatch_stubs="${TEST_HOME}/watchdog-dispatch-stubs.sh"
 cat > "${watchdog_dispatch_stubs}" <<'STUB'

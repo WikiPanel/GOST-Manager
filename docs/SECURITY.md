@@ -39,8 +39,12 @@ The monitoring collector parses only the Direct Mode fields needed for topology 
 The Upstream Watchdog parses only `KHAREJ_IP` from exact managed Iran env files.
 It does not load credential fields. Its argv-based Ping executor never invokes
 a shell, its systemd controller accepts only exact `gost-iran-N.service` names,
-and its dedicated 24-hour event store has fixed safe columns. Config/state
-paths are private and reject symlinks.
+and local execution failures are stored only as fixed safe categories without
+stderr, commands, or paths. Durable action intents prevent an interrupted
+ownership write from leaving a silently unowned stop. Its dedicated 24-hour
+event store has fixed safe columns. Config/state paths are private; ordinary
+writes reject symlinks, while the explicit reset command replaces only the
+validated profile config path without following a hostile final symlink.
 
 ## Firewall Design
 

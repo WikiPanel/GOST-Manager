@@ -17,7 +17,13 @@ from gost_watchdog.config import (
     rooted_path,
 )
 from gost_watchdog.engine import WatchdogEngine
-from gost_watchdog.models import Clock, EVENT_RETENTION_SECONDS, ManagedProfile, WatchdogEvent
+from gost_watchdog.models import (
+    Clock,
+    EVENT_RETENTION_SECONDS,
+    ManagedProfile,
+    ProbeResult,
+    WatchdogEvent,
+)
 from gost_watchdog.profiles import discover_profiles
 from gost_watchdog.storage import DEFAULT_DB_PATH, WatchdogStore
 
@@ -77,7 +83,7 @@ class WatchdogDaemon:
         loader: RuntimeLoader,
         *,
         engine: WatchdogEngine | None = None,
-        ping_executor: Callable[[str, int], bool] | None = None,
+        ping_executor: Callable[[str, int], ProbeResult | bool] | None = None,
         clock: Clock = Clock(),
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:

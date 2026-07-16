@@ -603,6 +603,33 @@ fi
 assert_eq "missing dependency causes no mutation" "${missing_before}" "$(tree_digest "${missing_root}")"
 mv "${STUB_BIN}/ss.disabled" "${STUB_BIN}/ss"
 
+missing_ping_root="${TEST_HOME}/missing-ping"
+mkdir -p "${missing_ping_root}"
+mv "${STUB_BIN}/ping" "${STUB_BIN}/ping.disabled"
+missing_ping_before="$(tree_digest "${missing_ping_root}")"
+if GOST_MANAGER_TEST_MISSING_COMMANDS=ping \
+  GOST_MANAGER_TEST_DEP_BIN="${STUB_BIN}" \
+  run_installer "${missing_ping_root}" >/dev/null 2>&1; then
+  fail "missing ping without dependency opt-in fails"
+else
+  pass "missing ping without dependency opt-in fails"
+fi
+assert_eq "missing ping causes no mutation" "${missing_ping_before}" \
+  "$(tree_digest "${missing_ping_root}")"
+mv "${STUB_BIN}/ping.disabled" "${STUB_BIN}/ping"
+
+unsupported_ping_root="${TEST_HOME}/unsupported-ping"
+mkdir -p "${unsupported_ping_root}"
+unsupported_ping_before="$(tree_digest "${unsupported_ping_root}")"
+if STUB_PING_CAPABILITY=unsupported \
+  run_installer "${unsupported_ping_root}" >/dev/null 2>&1; then
+  fail "unsupported ping invocation fails preflight"
+else
+  pass "unsupported ping invocation fails preflight"
+fi
+assert_eq "unsupported ping causes no mutation" "${unsupported_ping_before}" \
+  "$(tree_digest "${unsupported_ping_root}")"
+
 cat > "${STUB_BIN}/apt-get" <<'STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -613,6 +640,7 @@ if [[ "${1:-}" == "install" ]]; then
   for command_name in "${provided[@]}"; do
     case "${command_name}" in
       ss) target="${STUB_TRUE_BIN}" ;;
+      ping) target="${STUB_TRUE_BIN}" ;;
       cmp) target="${STUB_REAL_CMP_BIN}" ;;
       stat) target="${STUB_REAL_STAT_BIN}" ;;
       *) exit 2 ;;
@@ -642,6 +670,27 @@ assert_contains "dependency opt-in runs apt update" "apt-get update" "${COMMAND_
 assert_contains "dependency opt-in installs only expected package" "apt-get install -y iproute2" "${COMMAND_LOG}"
 assert_file "dependency opt-in completes installation" "${dependency_root}/usr/local/sbin/gost-monitor"
 rm -f "${STUB_BIN}/ss.disabled"
+
+ping_dependency_root="${TEST_HOME}/dependency-ping"
+mkdir -p "${ping_dependency_root}"
+mv "${STUB_BIN}/ping" "${STUB_BIN}/ping.disabled"
+: > "${COMMAND_LOG}"
+GOST_MANAGER_ALLOW_TEST_PACKAGE_STUB=1 \
+STUB_PROVIDE_COMMANDS=ping \
+STUB_BIN_PATH="${STUB_BIN}" \
+STUB_TRUE_BIN="${TRUE_BIN}" \
+STUB_REAL_CMP_BIN="${REAL_CMP_BIN}" \
+STUB_REAL_STAT_BIN="${REAL_STAT_BIN}" \
+GOST_MANAGER_TEST_MISSING_COMMANDS=ping \
+GOST_MANAGER_TEST_DEP_BIN="${STUB_BIN}" \
+APT_GET_BIN="${STUB_BIN}/apt-get" \
+run_installer "${ping_dependency_root}" --install-dependencies >/dev/null
+assert_contains "missing ping installs only iputils-ping" \
+  "apt-get install -y iputils-ping" "${COMMAND_LOG}"
+assert_file "ping dependency install completes safely" \
+  "${ping_dependency_root}/usr/local/sbin/gost-watchdog-admin"
+rm -f "${STUB_BIN}/ping"
+mv "${STUB_BIN}/ping.disabled" "${STUB_BIN}/ping"
 
 cmp_dependency_root="${TEST_HOME}/dependency-cmp"
 mkdir -p "${cmp_dependency_root}"

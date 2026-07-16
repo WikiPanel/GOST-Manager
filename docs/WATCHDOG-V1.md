@@ -28,8 +28,18 @@ RECOVERY_JITTER_MAX_SECONDS=10
 These defaults detect an outage after approximately 20 seconds of consecutive
 failures. Recovery requires approximately 20 seconds of consecutive successes,
 then a 10-second hold and a random 0-10-second jitter. Checks use a monotonic,
-non-overlapping scheduler. Unique IPs are checked concurrently with at most 32
-workers, and profiles sharing an IP reuse the same result for that cycle.
+non-overlapping scheduler. Probe keys are `(KHAREJ_IP, PING_TIMEOUT_SECONDS)`:
+profiles sharing both values reuse one result, while profiles sharing an IP
+with different timeout overrides run independent checks. At most 32 checks run
+concurrently.
+
+Probe results are typed as `success`, `unreachable`, or `probe_error`. Ping
+return code `1` is a normal unreachable result. A missing or non-executable
+Ping, permission failure, local execution timeout, unsupported invocation, or
+other unexpected local return code is `probe_error`. Probe errors do not change
+success/failure counters and can never stop or start traffic. Persistent errors
+produce one safe event per error transition and one recovery event, without
+command lines, paths, stderr, or credentials.
 
 ## Modes and state machine
 
@@ -39,9 +49,13 @@ workers, and profiles sharing an IP reuse the same result for that cycle.
 
 States are `unknown`, `healthy`, `degraded`, `down`, `recovering`, and
 `maintenance`. A success resets failures; a failure resets recovery progress.
-Auto Protect stops an active profile once at the failure threshold and records
-ownership only after systemd verifies the stop. An already inactive profile is
-never claimed or started later.
+Auto Protect stops an active profile once at the failure threshold. It first
+persists a durable action intent, queries the exact service immediately before
+the action, verifies the result, and then finalizes ownership. A restart
+reconciles unfinished intents. If the final ownership write fails after a stop,
+Watchdog attempts one safe compensating start; a failed compensation leaves the
+durable intent available for deterministic restart reconciliation. An already
+inactive profile is never newly claimed or started later.
 
 A Watchdog-owned stop continues to receive checks. It is started once only
 after the success threshold, full hold, bounded jitter, and a final healthy
@@ -53,7 +67,14 @@ exists. A failed start or stop does not enter a retry loop.
 Service-state mismatches are treated as operator actions. The daemon records a
 safe `watchdog_manual_override` transition and suspends automatic actions until
 the operator explicitly uses `Re-arm manual override`. It never auto-starts an
-operator-stopped profile.
+operator-stopped profile. Manual start/stop reconciliation runs on a separate
+10-second cadence rather than spawning one `systemctl is-active` process per
+profile on every two-second Ping cycle. Every actual start/stop still uses a
+fresh exact-unit query.
+
+Leaving Auto mode while a service is Watchdog-owned and stopped requires an
+explicit choice: keep it stopped, start it now only if upstream is healthy, or
+cancel. The ordinary mode-change path never silently changes service state.
 
 Per-profile maintenance supports:
 
@@ -81,7 +102,12 @@ separately.
 Profile files may override mode, interval, timeout, thresholds, hold, and
 jitter; omitted values inherit the global config. Parsing uses a strict
 allowlist and never sources env files. Writes are private, atomic, fsynced, and
-reject symlinks. Invalid config fails closed without changing traffic.
+reject symlinks. Invalid config fails closed without changing traffic. The
+reset/recovery command validates only the exact managed Iran env/unit identity,
+ignores the broken profile config, and atomically replaces only that profile
+file with `MODE=disabled`. This safely recovers malformed content, unsafe
+permissions, symlinked profile files, and overrides made incompatible by a
+later global timing change.
 
 SQLite stores persistent state and transition/action events only. WAL, busy
 timeout, fixed safe columns, indexed bounded queries, and batched pruning are
@@ -97,9 +123,18 @@ the central service, or re-arm a manual override.
 
 The status view includes the effective settings, service state, health state,
 maintenance/manual-override ownership, counters, timestamps, and current outage
-duration. Detailed history is newest first and bounded. The 24-hour summary
-shows outage count, total and longest downtime, last outage, automatic actions,
-and failed actions.
+duration. Menu prompts use those machine-readable current effective values;
+pressing Enter preserves them and changing one field writes only that override.
+Detailed history is newest first and bounded. The 24-hour summary intersects
+each completed or ongoing outage with the exact 24-hour window, so total and
+longest downtime can never exceed 86,400 seconds.
+
+`ping` is an installer runtime dependency mapped to Ubuntu's `iputils-ping`.
+Before staging or replacing any file, installation runs the supported argv form
+against `127.0.0.1`; missing authorization, missing Ping, insufficient
+permission, or an incompatible implementation fails without mutation. This
+local capability check never enables Auto Protect and never depends on a public
+host.
 
 ## ICMP limitation
 

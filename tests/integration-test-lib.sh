@@ -214,6 +214,15 @@ STUB
 set -Eeuo pipefail
 printf 'ss %s\n' "$*" >> "${COMMAND_LOG}"
 STUB
+  cat > "${bin_dir}/ping" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'ping %s\n' "$*" >> "${COMMAND_LOG}"
+[[ "$#" -eq 7 ]]
+[[ "$1" == "-n" && "$2" == "-c" && "$3" == "1" ]]
+[[ "$4" == "-W" && "$5" == "1" && "$6" == "--" && "$7" == "127.0.0.1" ]]
+[[ "${STUB_PING_CAPABILITY:-success}" == "success" ]]
+STUB
   cat > "${bin_dir}/chown" <<'STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -226,7 +235,8 @@ printf 'systemd-analyze %s\n' "$*" >> "${COMMAND_LOG}"
 [[ -z "${STUB_SYSTEMD_ANALYZE_OUTPUT:-}" ]] || printf '%s\n' "${STUB_SYSTEMD_ANALYZE_OUTPUT}" >&2
 [[ "${STUB_FAIL_SYSTEMD_ANALYZE:-0}" != "1" ]]
 STUB
-  chmod 755 "${bin_dir}/systemctl" "${bin_dir}/ss" "${bin_dir}/chown" "${bin_dir}/systemd-analyze"
+  chmod 755 "${bin_dir}/systemctl" "${bin_dir}/ss" "${bin_dir}/ping" \
+    "${bin_dir}/chown" "${bin_dir}/systemd-analyze"
 }
 
 finish_suite() {

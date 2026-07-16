@@ -346,8 +346,12 @@ service and auto-starts only a service whose stop it previously verified and
 owned. Manual stops, manual overrides, and maintenance are never silently
 reversed.
 
-One central daemon checks unique Kharej IPs concurrently and retains only
-state-transition/action history for 24 hours in a dedicated SQLite database.
+One central daemon shares checks only for profiles with the same Kharej IP and
+Ping timeout, and retains only state-transition/action history for 24 hours in
+a dedicated SQLite database. Local Ping execution failures are reported as
+deduplicated `probe_error` transitions; they never count as upstream failures
+or cause a traffic action. Manual service reconciliation runs every 10 seconds,
+while each actual action uses a fresh exact-unit query and durable action intent.
 Installation and update enable that daemon but leave all profiles Disabled and
 never restart, stop, or start a GOST traffic service. A successful Ping proves
 host reachability, not that the remote SOCKS5 service itself is healthy. See
@@ -364,7 +368,11 @@ Removal decisions are rechecked against actual post-action state. If any exact m
 
 ## Linux systemd verification
 
-`tests/test-systemd-linux.sh` uses the host's real `systemd-analyze verify` environment and temporary executable/config paths; it does not use an incomplete synthetic `--root`. It skips only off Linux or when the real binary is unavailable. `.github/workflows/monitoring-integration.yml` runs `make check`, the temporary-root installer, and real systemd verification on Ubuntu 22.04 and 24.04.
+`tests/test-systemd-linux.sh` uses the host's real `systemd-analyze verify`
+environment and temporary executable/config paths. `tests/test-watchdog-linux.sh`
+also runs a hardened transient Watchdog unit, local Ping and AF_UNIX checks, and
+a ten-profile process-rate benchmark without enabling Auto Protect for a real
+traffic service. The Ubuntu 22.04/24.04 workflow runs both validations.
 
 If installer service-state rollback cannot be verified, it retains collision-resistant backup directories and prints exact `rm`, `cp -a`, `systemctl daemon-reload`, enable/disable, start/stop, and status commands for restoring the recorded collector state. Do not delete those backups until the printed status check succeeds.
 

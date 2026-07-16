@@ -391,6 +391,8 @@ for curl_flag in "--fail" "--silent" "--show-error" "--location" "--proto" "=htt
   assert_contains "curl uses ${curl_flag}" "${curl_flag}" "${latest_case}/commands.log"
 done
 assert_contains "local installer receives dependency option" "installer --install-dependencies" "${latest_case}/commands.log"
+assert_contains "setup-delivered installer maps Ping to Ubuntu package" \
+  "ping) printf 'iputils-ping" "${ROOT_DIR}/install.sh"
 assert_contains "success prints exact version" "GOST Manager v${CURRENT_VERSION} installed successfully." "${latest_case}/setup.out"
 assert_contains "noninteractive setup prints launch command" "Run: gost-manager" "${latest_case}/setup.out"
 assert_not_contains "noninteractive setup does not launch manager" "launched" "${latest_case}/commands.log"

@@ -3909,6 +3909,125 @@ watchdog_select_profile() {
   WATCHDOG_SELECTED_PROFILE="${profile_id}"
 }
 
+watchdog_effective_values() {
+  local profile_id="$1"
+  local payload parsed
+  if ! payload="$("${WATCHDOG_ADMIN_BIN}" effective "${profile_id}" --json)"; then
+    info "Unable to read current Watchdog profile values."
+    return 1
+  fi
+  if ! parsed="$(printf '%s' "${payload}" | python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+    keys = ("check_interval_seconds", "ping_timeout_seconds", "failure_threshold", "success_threshold", "recovery_hold_seconds", "recovery_jitter_max_seconds")
+    mode = value["mode"]
+    items = [value[key] for key in keys]
+    if mode not in ("disabled", "monitor", "auto") or any(type(item) is not int for item in items):
+        raise ValueError
+    print("\t".join([mode] + [str(item) for item in items]))
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+')"; then
+    info "Watchdog returned invalid profile JSON; no configuration was changed."
+    return 1
+  fi
+  printf '%s\n' "${parsed}"
+}
+
+watchdog_global_values() {
+  local payload parsed
+  if ! payload="$("${WATCHDOG_ADMIN_BIN}" effective-global --json)"; then
+    info "Unable to read current global Watchdog values."
+    return 1
+  fi
+  if ! parsed="$(printf '%s' "${payload}" | python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+    keys = ("check_interval_seconds", "ping_timeout_seconds", "failure_threshold", "success_threshold", "recovery_hold_seconds", "recovery_jitter_max_seconds")
+    items = [value[key] for key in keys]
+    if value.get("check_mode") != "ping" or any(type(item) is not int for item in items):
+        raise ValueError
+    print("\t".join(str(item) for item in items))
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+')"; then
+    info "Watchdog returned invalid global JSON; no configuration was changed."
+    return 1
+  fi
+  printf '%s\n' "${parsed}"
+}
+
+watchdog_mode_state() {
+  local profile_id="$1"
+  local payload parsed
+  if ! payload="$("${WATCHDOG_ADMIN_BIN}" status --profile "${profile_id}" --json)"; then
+    info "Unable to read current Watchdog ownership state."
+    return 1
+  fi
+  if ! parsed="$(printf '%s' "${payload}" | python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+    profiles = value["profiles"]
+    if not isinstance(profiles, list) or len(profiles) != 1:
+        raise ValueError
+    item = profiles[0]
+    mode = item["mode"]
+    owned = item["stopped_by_watchdog"]
+    health = item["watchdog_state"]
+    check = item["check_status"]
+    if mode not in ("disabled", "monitor", "auto") or type(owned) is not bool or not isinstance(health, str) or check not in ("unknown", "success", "unreachable", "probe_error"):
+        raise ValueError
+    if check != "success":
+        health = check
+    print("\t".join((mode, "true" if owned else "false", health)))
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+')"; then
+    info "Watchdog returned invalid status JSON; no mode was changed."
+    return 1
+  fi
+  printf '%s\n' "${parsed}"
+}
+
+watchdog_apply_mode_change() {
+  local profile_id="$1"
+  local mode="$2"
+  local current_mode owned health parsed choice
+  local -a arguments=(set-mode "${profile_id}" "${mode}")
+  parsed="$(watchdog_mode_state "${profile_id}")" || return 0
+  IFS=$'\t' read -r current_mode owned health <<< "${parsed}"
+  if [[ "${current_mode}" == "auto" && "${mode}" != "auto" && "${owned}" == "true" ]]; then
+    info "${profile_id} is currently stopped by Watchdog."
+    info "Leaving Auto mode also disables automatic recovery."
+    cat <<'MENU'
+1) Change mode and keep the service stopped
+2) Start now if upstream is healthy, then change mode
+3) Cancel
+MENU
+    read -r -p "Choose how to handle the stopped service: " choice
+    case "${choice}" in
+      1) arguments+=(--owned-action keep-stopped) ;;
+      2)
+        if [[ "${health}" != "healthy" ]]; then
+          info "Upstream is not healthy; the service was not started and mode was not changed."
+          return 0
+        fi
+        arguments+=(--owned-action start-if-healthy)
+        ;;
+      3) info "Mode change cancelled."; return 0 ;;
+      *) info "Invalid ownership choice."; return 0 ;;
+    esac
+  fi
+  if [[ "${mode}" == "auto" ]]; then
+    info "Auto Protect may stop and later start only ${profile_id} after the configured thresholds."
+  fi
+  confirm "Set ${profile_id} Watchdog mode to ${mode}?" || { info "Mode change cancelled."; return 0; }
+  run_watchdog_command "${arguments[@]}"
+}
+
 watchdog_change_mode() {
   local profile_id choice mode
   watchdog_select_profile || return 0
@@ -3926,19 +4045,14 @@ MENU
     3) mode=disabled ;;
     *) info "Invalid Watchdog mode."; return 0 ;;
   esac
-  if [[ "${mode}" == "auto" ]]; then
-    info "Auto Protect may stop and later start only ${profile_id} after the configured thresholds."
-  fi
-  confirm "Set ${profile_id} Watchdog mode to ${mode}?" || { info "Mode change cancelled."; return 0; }
-  run_watchdog_command set-mode "${profile_id}" "${mode}"
+  watchdog_apply_mode_change "${profile_id}" "${mode}"
 }
 
 watchdog_disable_profile() {
   local profile_id
   watchdog_select_profile || return 0
   profile_id="${WATCHDOG_SELECTED_PROFILE}"
-  confirm "Disable all Watchdog checks and actions for ${profile_id}?" || { info "Disable cancelled."; return 0; }
-  run_watchdog_command set-mode "${profile_id}" disabled
+  watchdog_apply_mode_change "${profile_id}" disabled
 }
 
 watchdog_integer() {
@@ -3956,26 +4070,39 @@ watchdog_integer() {
 }
 
 watchdog_configure_profile() {
-  local profile_id interval timeout failures successes hold jitter
+  local profile_id current_mode current_interval current_timeout current_failures
+  local current_successes current_hold current_jitter parsed
+  local interval timeout failures successes hold jitter
+  local -a arguments
   watchdog_select_profile || return 0
   profile_id="${WATCHDOG_SELECTED_PROFILE}"
-  run_watchdog_command effective "${profile_id}"
-  interval="$(watchdog_integer "Check interval seconds" 2 1 300)" || return 0
-  timeout="$(watchdog_integer "Ping timeout seconds" 1 1 60)" || return 0
+  parsed="$(watchdog_effective_values "${profile_id}")" || return 0
+  IFS=$'\t' read -r current_mode current_interval current_timeout current_failures \
+    current_successes current_hold current_jitter <<< "${parsed}"
+  interval="$(watchdog_integer "Check interval seconds" "${current_interval}" 1 300)" || return 0
+  timeout="$(watchdog_integer "Ping timeout seconds" "${current_timeout}" 1 60)" || return 0
   if ((10#${timeout} > 10#${interval})); then
     info "Ping timeout must not exceed the check interval."
     return 0
   fi
-  failures="$(watchdog_integer "Failure threshold" 10 1 1000)" || return 0
-  successes="$(watchdog_integer "Success threshold" 10 1 1000)" || return 0
-  hold="$(watchdog_integer "Recovery hold seconds" 10 0 3600)" || return 0
-  jitter="$(watchdog_integer "Recovery jitter maximum seconds" 10 0 300)" || return 0
+  failures="$(watchdog_integer "Failure threshold" "${current_failures}" 1 1000)" || return 0
+  successes="$(watchdog_integer "Success threshold" "${current_successes}" 1 1000)" || return 0
+  hold="$(watchdog_integer "Recovery hold seconds" "${current_hold}" 0 3600)" || return 0
+  jitter="$(watchdog_integer "Recovery jitter maximum seconds" "${current_jitter}" 0 300)" || return 0
+  arguments=(configure-profile "${profile_id}")
+  [[ "${interval}" == "${current_interval}" ]] || arguments+=(--check-interval "${interval}")
+  [[ "${timeout}" == "${current_timeout}" ]] || arguments+=(--ping-timeout "${timeout}")
+  [[ "${failures}" == "${current_failures}" ]] || arguments+=(--failure-threshold "${failures}")
+  [[ "${successes}" == "${current_successes}" ]] || arguments+=(--success-threshold "${successes}")
+  [[ "${hold}" == "${current_hold}" ]] || arguments+=(--recovery-hold "${hold}")
+  [[ "${jitter}" == "${current_jitter}" ]] || arguments+=(--recovery-jitter "${jitter}")
+  if [[ "${#arguments[@]}" -eq 2 ]]; then
+    info "No profile values changed."
+    return 0
+  fi
   info "Effective candidate: interval=${interval}s timeout=${timeout}s failures=${failures} successes=${successes} hold=${hold}s jitter=0-${jitter}s"
   confirm "Save these overrides for ${profile_id}?" || { info "Override change cancelled."; return 0; }
-  run_watchdog_command configure-profile "${profile_id}" \
-    --check-interval "${interval}" --ping-timeout "${timeout}" \
-    --failure-threshold "${failures}" --success-threshold "${successes}" \
-    --recovery-hold "${hold}" --recovery-jitter "${jitter}"
+  run_watchdog_command "${arguments[@]}"
 }
 
 watchdog_reset_profile() {
@@ -4018,24 +4145,36 @@ MENU
 }
 
 watchdog_configure_global() {
+  local current_interval current_timeout current_failures current_successes current_hold current_jitter parsed
   local interval timeout failures successes hold jitter
-  run_watchdog_command effective-global
-  interval="$(watchdog_integer "Global check interval seconds" 2 1 300)" || return 0
-  timeout="$(watchdog_integer "Global Ping timeout seconds" 1 1 60)" || return 0
+  local -a arguments
+  parsed="$(watchdog_global_values)" || return 0
+  IFS=$'\t' read -r current_interval current_timeout current_failures \
+    current_successes current_hold current_jitter <<< "${parsed}"
+  interval="$(watchdog_integer "Global check interval seconds" "${current_interval}" 1 300)" || return 0
+  timeout="$(watchdog_integer "Global Ping timeout seconds" "${current_timeout}" 1 60)" || return 0
   if ((10#${timeout} > 10#${interval})); then
     info "Ping timeout must not exceed the check interval."
     return 0
   fi
-  failures="$(watchdog_integer "Global failure threshold" 10 1 1000)" || return 0
-  successes="$(watchdog_integer "Global success threshold" 10 1 1000)" || return 0
-  hold="$(watchdog_integer "Global recovery hold seconds" 10 0 3600)" || return 0
-  jitter="$(watchdog_integer "Global recovery jitter maximum seconds" 10 0 300)" || return 0
+  failures="$(watchdog_integer "Global failure threshold" "${current_failures}" 1 1000)" || return 0
+  successes="$(watchdog_integer "Global success threshold" "${current_successes}" 1 1000)" || return 0
+  hold="$(watchdog_integer "Global recovery hold seconds" "${current_hold}" 0 3600)" || return 0
+  jitter="$(watchdog_integer "Global recovery jitter maximum seconds" "${current_jitter}" 0 300)" || return 0
+  arguments=(set-global)
+  [[ "${interval}" == "${current_interval}" ]] || arguments+=(--check-interval "${interval}")
+  [[ "${timeout}" == "${current_timeout}" ]] || arguments+=(--ping-timeout "${timeout}")
+  [[ "${failures}" == "${current_failures}" ]] || arguments+=(--failure-threshold "${failures}")
+  [[ "${successes}" == "${current_successes}" ]] || arguments+=(--success-threshold "${successes}")
+  [[ "${hold}" == "${current_hold}" ]] || arguments+=(--recovery-hold "${hold}")
+  [[ "${jitter}" == "${current_jitter}" ]] || arguments+=(--recovery-jitter "${jitter}")
+  if [[ "${#arguments[@]}" -eq 1 ]]; then
+    info "No global values changed."
+    return 0
+  fi
   info "Global candidate: Ping every ${interval}s, timeout ${timeout}s, down after ${failures}, recover after ${successes} + ${hold}s + 0-${jitter}s."
   confirm "Save these global Watchdog defaults?" || { info "Global change cancelled."; return 0; }
-  run_watchdog_command set-global \
-    --check-interval "${interval}" --ping-timeout "${timeout}" \
-    --failure-threshold "${failures}" --success-threshold "${successes}" \
-    --recovery-hold "${hold}" --recovery-jitter "${jitter}"
+  run_watchdog_command "${arguments[@]}"
 }
 
 watchdog_service_status() {

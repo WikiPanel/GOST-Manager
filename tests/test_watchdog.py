@@ -270,7 +270,10 @@ class WatchdogPingTests(unittest.TestCase):
         profiles = [profile(profile_id="iran-1"), profile(profile_id="iran-2")]
         results = run_ping_checks(profiles, lambda ip, _timeout: calls.append(ip) is None)
         self.assertEqual(calls, ["203.0.113.10"])
-        self.assertEqual(results, {"iran-1": True, "iran-2": True})
+        self.assertEqual(
+            {key: value.status for key, value in results.items()},
+            {"iran-1": "success", "iran-2": "success"},
+        )
 
     def test_disabled_profile_performs_no_check(self) -> None:
         calls: list[str] = []

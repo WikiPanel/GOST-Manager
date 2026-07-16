@@ -240,8 +240,10 @@ def render_global_config(config: GlobalConfig) -> str:
     return "".join(f"{key}={values[key]}\n" for key in GLOBAL_KEYS)
 
 
-def render_profile_values(values: Mapping[str, str]) -> str:
-    profile_config_from_mapping(values, GlobalConfig())
+def render_profile_values(
+    values: Mapping[str, str], global_config: GlobalConfig
+) -> str:
+    profile_config_from_mapping(values, global_config)
     return "".join(f"{key}={values[key]}\n" for key in PROFILE_KEYS if key in values)
 
 
@@ -252,6 +254,7 @@ def atomic_write_config(
     owner_uid: int | None = None,
     owner_gid: int | None = None,
     boundary: Path | None = None,
+    recovery_replace: bool = False,
 ) -> None:
     destination = Path(path)
     parent = destination.parent
@@ -259,7 +262,12 @@ def atomic_write_config(
     if not parent.is_dir() or parent.is_symlink():
         raise ConfigError("config parent must be a real directory")
     if destination.exists() or destination.is_symlink():
-        validate_file_security(destination, expected_uid=owner_uid, boundary=boundary)
+        if recovery_replace:
+            metadata = destination.lstat()
+            if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+                raise ConfigError("recovery target must be a regular file or symlink")
+        else:
+            validate_file_security(destination, expected_uid=owner_uid, boundary=boundary)
     descriptor = -1
     temporary: Path | None = None
     try:

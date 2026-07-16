@@ -6,7 +6,7 @@ import re
 import stat
 from pathlib import Path
 
-from gost_watchdog.config import ConfigError, load_profile_config
+from gost_watchdog.config import ConfigError, load_profile_config, profile_config_from_mapping
 from gost_watchdog.models import GlobalConfig, ManagedProfile
 
 
@@ -71,6 +71,43 @@ def _validate_managed_file(path: Path, *, expected_uid: int | None) -> None:
         raise ProfileError("managed file may not be group/world writable")
     if expected_uid is not None and metadata.st_uid != expected_uid:
         raise ProfileError("managed file must be owned by the trusted user")
+
+
+def load_managed_profile_identity(
+    profile_id: str,
+    env_dir: str | Path,
+    unit_dir: str | Path,
+    config_dir: str | Path,
+    global_config: GlobalConfig,
+    *,
+    expected_uid: int | None = None,
+) -> ManagedProfile:
+    validate_profile_id(profile_id)
+    number = profile_id.removeprefix("iran-")
+    service_name = validate_service_name(f"gost-iran-{number}.service")
+    env_root = Path(env_dir)
+    unit_root = Path(unit_dir)
+    config_root = Path(config_dir)
+    for directory in (env_root, unit_root, config_root):
+        if directory.is_symlink() or not directory.is_dir():
+            raise ProfileError("managed directory must be real and non-symlink")
+    env_path = env_root / f"{profile_id}.env"
+    unit_path = unit_root / service_name
+    _validate_managed_file(env_path, expected_uid=expected_uid)
+    _validate_managed_file(unit_path, expected_uid=expected_uid)
+    try:
+        kharej_ip = parse_kharej_ip_text(env_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        raise ProfileError("cannot read managed profile identity") from exc
+    return ManagedProfile(
+        profile_id=profile_id,
+        service_name=service_name,
+        kharej_ip=kharej_ip,
+        env_path=str(env_path),
+        unit_path=str(unit_path),
+        config_path=str(config_root / f"{profile_id}.conf"),
+        config=profile_config_from_mapping({"MODE": "disabled"}, global_config),
+    )
 
 
 def discover_profiles(

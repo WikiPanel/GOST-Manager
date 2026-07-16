@@ -6,7 +6,7 @@ import subprocess
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from gost_watchdog.models import MAX_PING_WORKERS, ManagedProfile
+from gost_watchdog.models import MAX_PING_WORKERS, ManagedProfile, ProbeResult
 from gost_watchdog.profiles import validate_kharej_ip, validate_service_name
 
 
@@ -23,7 +23,7 @@ class SubprocessPingExecutor:
         self.runner = runner
         self.ping_binary = ping_binary
 
-    def __call__(self, destination: str, timeout_seconds: int) -> bool:
+    def __call__(self, destination: str, timeout_seconds: int) -> ProbeResult:
         validate_kharej_ip(destination)
         argv = [
             self.ping_binary,
@@ -46,42 +46,61 @@ class SubprocessPingExecutor:
                 timeout=float(timeout_seconds) + 1.0,
                 check=False,
             )
+        except FileNotFoundError:
+            return ProbeResult("probe_error", "ping_binary_missing")
+        except PermissionError:
+            return ProbeResult("probe_error", "ping_permission_denied")
+        except subprocess.TimeoutExpired:
+            return ProbeResult("probe_error", "ping_execution_timeout")
         except (OSError, subprocess.SubprocessError):
-            return False
-        return result.returncode == 0
+            return ProbeResult("probe_error", "ping_execution_failed")
+        if result.returncode == 0:
+            return ProbeResult("success")
+        if result.returncode == 1:
+            return ProbeResult("unreachable")
+        return ProbeResult("probe_error", "ping_execution_failed")
+
+
+def _normalize_probe_result(result: object) -> ProbeResult:
+    if isinstance(result, ProbeResult):
+        return result
+    if isinstance(result, bool):
+        return ProbeResult("success" if result else "unreachable")
+    return ProbeResult("probe_error", "ping_execution_failed")
 
 
 def run_ping_checks(
     profiles: Iterable[ManagedProfile],
-    executor: Callable[[str, int], bool],
+    executor: Callable[[str, int], ProbeResult | bool],
     *,
     max_workers: int = MAX_PING_WORKERS,
-) -> dict[str, bool]:
+) -> dict[str, ProbeResult]:
     active = [profile for profile in profiles if profile.config.mode != "disabled"]
-    by_destination: dict[str, list[ManagedProfile]] = {}
+    by_probe: dict[tuple[str, int], list[ManagedProfile]] = {}
     for profile in active:
-        by_destination.setdefault(profile.kharej_ip, []).append(profile)
-    if not by_destination:
+        key = (profile.kharej_ip, profile.config.ping_timeout_seconds)
+        by_probe.setdefault(key, []).append(profile)
+    if not by_probe:
         return {}
-    workers = max(1, min(max_workers, MAX_PING_WORKERS, len(by_destination)))
-    destination_results: dict[str, bool] = {}
+    workers = max(1, min(max_workers, MAX_PING_WORKERS, len(by_probe)))
+    probe_results: dict[tuple[str, int], ProbeResult] = {}
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gost-watchdog-ping") as pool:
         futures = {
-            pool.submit(
-                executor,
-                destination,
-                min(profile.config.ping_timeout_seconds for profile in members),
-            ): destination
-            for destination, members in by_destination.items()
+            pool.submit(executor, destination, timeout): (destination, timeout)
+            for destination, timeout in by_probe
         }
         for future in as_completed(futures):
-            destination = futures[future]
+            key = futures[future]
             try:
-                destination_results[destination] = bool(future.result())
+                probe_results[key] = _normalize_probe_result(future.result())
             except Exception:
-                destination_results[destination] = False
+                probe_results[key] = ProbeResult(
+                    "probe_error", "ping_execution_failed"
+                )
     return {
-        profile.profile_id: destination_results[profile.kharej_ip]
+        profile.profile_id: probe_results[
+            (profile.kharej_ip, profile.config.ping_timeout_seconds)
+        ]
         for profile in active
     }
 

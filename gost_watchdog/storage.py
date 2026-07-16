@@ -10,13 +10,15 @@ from pathlib import Path
 
 from gost_watchdog.models import (
     EVENT_RETENTION_SECONDS,
+    CHECK_STATUSES,
     HEALTH_STATES,
+    PENDING_ACTIONS,
     ProfileState,
     WatchdogEvent,
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_DB_PATH = "/var/lib/gost-manager/watchdog/watchdog.sqlite3"
 EVENT_CODES = {
     "watchdog_degraded",
@@ -33,6 +35,10 @@ EVENT_CODES = {
     "watchdog_config_error",
     "watchdog_daemon_started",
     "watchdog_daemon_stopped",
+    "watchdog_probe_error",
+    "watchdog_probe_recovered",
+    "watchdog_action_error",
+    "watchdog_mode_change_start",
 }
 SAFE_ACTION_RESULTS = {
     None,
@@ -47,6 +53,9 @@ SAFE_ACTION_RESULTS = {
     "maintenance_exit_start",
     "rearmed",
     "failed",
+    "intent_reconciled",
+    "compensated",
+    "operator_start",
 }
 SAFE_ERROR_CATEGORIES = {
     None,
@@ -57,6 +66,12 @@ SAFE_ERROR_CATEGORIES = {
     "stop_failed",
     "start_failed",
     "runtime_error",
+    "ping_binary_missing",
+    "ping_permission_denied",
+    "ping_execution_failed",
+    "ping_execution_timeout",
+    "persistence_failed",
+    "compensation_failed",
 }
 
 
@@ -103,8 +118,23 @@ def migrate_database(path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             "failure_count INTEGER NOT NULL DEFAULT 0,success_count INTEGER NOT NULL DEFAULT 0,"
             "last_check_at INTEGER,last_transition_at INTEGER,outage_started_at INTEGER,"
             "recovery_started_at INTEGER,recovery_ready_at INTEGER,recovery_jitter_seconds INTEGER NOT NULL DEFAULT 0,"
-            "last_service_active INTEGER,updated_at INTEGER NOT NULL)"
+            "last_service_active INTEGER,check_status TEXT NOT NULL DEFAULT 'unknown',"
+            "last_probe_error_category TEXT,pending_action TEXT,pending_action_at INTEGER,"
+            "last_service_check_at INTEGER,updated_at INTEGER NOT NULL)"
         )
+        existing_columns = {
+            str(item[1]) for item in conn.execute("PRAGMA table_info(profile_state)")
+        }
+        additions = {
+            "check_status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "last_probe_error_category": "TEXT",
+            "pending_action": "TEXT",
+            "pending_action_at": "INTEGER",
+            "last_service_check_at": "INTEGER",
+        }
+        for name, declaration in additions.items():
+            if name not in existing_columns:
+                conn.execute(f"ALTER TABLE profile_state ADD COLUMN {name} {declaration}")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS events("
             "event_id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER NOT NULL,code TEXT NOT NULL,"
@@ -149,6 +179,11 @@ def _state_from_row(row: sqlite3.Row) -> ProfileState:
         recovery_ready_at=row["recovery_ready_at"],
         recovery_jitter_seconds=int(row["recovery_jitter_seconds"]),
         last_service_active=None if active is None else bool(active),
+        check_status=str(row["check_status"]),
+        last_probe_error_category=row["last_probe_error_category"],
+        pending_action=row["pending_action"],
+        pending_action_at=row["pending_action_at"],
+        last_service_check_at=row["last_service_check_at"],
     )
 
 
@@ -180,13 +215,18 @@ class WatchdogStore:
     def _save_state(self, state: ProfileState, now: int) -> None:
         if state.health_state not in HEALTH_STATES:
             raise ValueError("invalid Watchdog health state")
+        if state.check_status not in CHECK_STATUSES:
+            raise ValueError("invalid Watchdog check status")
+        if state.pending_action is not None and state.pending_action not in PENDING_ACTIONS:
+            raise ValueError("invalid Watchdog pending action")
         self.conn.execute(
             "INSERT INTO profile_state("
             "profile_id,service_name,kharej_ip,health_state,maintenance,stopped_by_watchdog,"
             "stopped_by_maintenance,manual_override,failure_count,success_count,last_check_at,"
             "last_transition_at,outage_started_at,recovery_started_at,recovery_ready_at,"
-            "recovery_jitter_seconds,last_service_active,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "recovery_jitter_seconds,last_service_active,check_status,last_probe_error_category,"
+            "pending_action,pending_action_at,last_service_check_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(profile_id) DO UPDATE SET service_name=excluded.service_name,"
             "kharej_ip=excluded.kharej_ip,health_state=excluded.health_state,"
             "maintenance=excluded.maintenance,stopped_by_watchdog=excluded.stopped_by_watchdog,"
@@ -195,7 +235,10 @@ class WatchdogStore:
             "last_check_at=excluded.last_check_at,last_transition_at=excluded.last_transition_at,"
             "outage_started_at=excluded.outage_started_at,recovery_started_at=excluded.recovery_started_at,"
             "recovery_ready_at=excluded.recovery_ready_at,recovery_jitter_seconds=excluded.recovery_jitter_seconds,"
-            "last_service_active=excluded.last_service_active,updated_at=excluded.updated_at",
+            "last_service_active=excluded.last_service_active,check_status=excluded.check_status,"
+            "last_probe_error_category=excluded.last_probe_error_category,"
+            "pending_action=excluded.pending_action,pending_action_at=excluded.pending_action_at,"
+            "last_service_check_at=excluded.last_service_check_at,updated_at=excluded.updated_at",
             (
                 state.profile_id,
                 state.service_name,
@@ -214,6 +257,11 @@ class WatchdogStore:
                 state.recovery_ready_at,
                 state.recovery_jitter_seconds,
                 None if state.last_service_active is None else int(state.last_service_active),
+                state.check_status,
+                state.last_probe_error_category,
+                state.pending_action,
+                state.pending_action_at,
+                state.last_service_check_at,
                 now,
             ),
         )
@@ -326,25 +374,34 @@ class WatchdogStore:
             "ORDER BY ts",
             (profile_id, cutoff),
         ).fetchall()
-        completed = [
-            int(row["outage_duration"])
-            for row in rows
-            if row["code"] == "watchdog_upstream_healthy"
-            and row["outage_duration"] is not None
-        ]
+        completed_rows = self.conn.execute(
+            "SELECT ts,outage_duration FROM events WHERE profile_id=? "
+            "AND code='watchdog_upstream_healthy' AND outage_duration IS NOT NULL "
+            "AND ts>=? ORDER BY ts",
+            (profile_id, cutoff),
+        ).fetchall()
+        outages: list[tuple[int, int]] = []
+        for row in completed_rows:
+            end = min(int(now), int(row["ts"]))
+            start = int(row["ts"]) - max(0, int(row["outage_duration"]))
+            overlap_start = max(cutoff, start)
+            if end > overlap_start:
+                outages.append((overlap_start, end))
         state_row = self.conn.execute(
             "SELECT outage_started_at FROM profile_state WHERE profile_id=?", (profile_id,)
         ).fetchone()
-        ongoing = 0
         if state_row is not None and state_row[0] is not None:
-            ongoing = max(0, int(now) - int(state_row[0]))
-        durations = completed + ([ongoing] if ongoing else [])
-        down_events = [row for row in rows if row["code"] == "watchdog_upstream_down"]
+            start = max(cutoff, int(state_row[0]))
+            if int(now) > start:
+                outages.append((start, int(now)))
+        durations = [max(0, end - start) for start, end in outages]
+        total = min(EVENT_RETENTION_SECONDS, sum(durations))
+        longest = min(EVENT_RETENTION_SECONDS, max(durations, default=0))
         return {
-            "outage_count": len(down_events),
-            "total_downtime_seconds": sum(durations),
-            "longest_outage_seconds": max(durations, default=0),
-            "last_outage_at": int(down_events[-1]["ts"]) if down_events else None,
+            "outage_count": len(outages),
+            "total_downtime_seconds": total,
+            "longest_outage_seconds": longest,
+            "last_outage_at": outages[-1][0] if outages else None,
             "automatic_stop_count": sum(row["code"] == "watchdog_profile_stopped" for row in rows),
             "automatic_start_count": sum(row["code"] == "watchdog_profile_started" for row in rows),
             "failed_action_count": sum(

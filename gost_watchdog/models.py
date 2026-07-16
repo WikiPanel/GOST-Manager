@@ -16,10 +16,20 @@ RECOVERY_HOLD_SECONDS = 10
 RECOVERY_JITTER_MAX_SECONDS = 10
 EVENT_RETENTION_SECONDS = 24 * 60 * 60
 MAX_PING_WORKERS = 32
+SERVICE_RECONCILIATION_INTERVAL_SECONDS = 10
 
 MODES = ("disabled", "monitor", "auto")
 HEALTH_STATES = ("unknown", "healthy", "degraded", "down", "recovering")
 DISPLAY_STATES = HEALTH_STATES + ("maintenance",)
+PROBE_STATUSES = ("success", "unreachable", "probe_error")
+CHECK_STATUSES = ("unknown",) + PROBE_STATUSES
+PENDING_ACTIONS = (
+    "stop_watchdog",
+    "stop_maintenance",
+    "start_watchdog",
+    "start_maintenance",
+    "start_operator",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,6 +71,20 @@ class ManagedProfile:
     config: ProfileConfig
 
 
+@dataclasses.dataclass(frozen=True)
+class ProbeResult:
+    status: str
+    error_category: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in PROBE_STATUSES:
+            raise ValueError("invalid Watchdog probe status")
+        if self.status == "probe_error" and self.error_category is None:
+            raise ValueError("probe errors require a safe category")
+        if self.status != "probe_error" and self.error_category is not None:
+            raise ValueError("only probe errors may include a category")
+
+
 @dataclasses.dataclass
 class ProfileState:
     profile_id: str
@@ -80,6 +104,11 @@ class ProfileState:
     recovery_ready_at: int | None = None
     recovery_jitter_seconds: int = 0
     last_service_active: bool | None = None
+    check_status: str = "unknown"
+    last_probe_error_category: str | None = None
+    pending_action: str | None = None
+    pending_action_at: int | None = None
+    last_service_check_at: int | None = None
 
     @property
     def display_state(self) -> str:

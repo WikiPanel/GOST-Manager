@@ -27,8 +27,18 @@ from gost_watchdog.config import (
 from gost_watchdog.daemon import DEFAULT_ENV_DIR, DEFAULT_UNIT_DIR
 from gost_watchdog.engine import MaintenanceController
 from gost_watchdog.models import GlobalConfig, ManagedProfile, ProfileState
-from gost_watchdog.profiles import ProfileError, discover_profiles, validate_profile_id
-from gost_watchdog.storage import DEFAULT_DB_PATH, EVENT_RETENTION_SECONDS, WatchdogStore
+from gost_watchdog.profiles import (
+    ProfileError,
+    discover_profiles,
+    load_managed_profile_identity,
+    validate_profile_id,
+)
+from gost_watchdog.storage import (
+    DEFAULT_DB_PATH,
+    EVENT_RETENTION_SECONDS,
+    SCHEMA_VERSION,
+    WatchdogStore,
+)
 
 
 EXIT_INVALID = 2
@@ -130,10 +140,11 @@ def _write_profile_values(
     profile: ManagedProfile,
     values: dict[str, str],
 ) -> None:
-    profile_config_from_mapping(values, _global(context))
+    global_config = _global(context)
+    profile_config_from_mapping(values, global_config)
     atomic_write_config(
         context.profile_config_dir / f"{profile.profile_id}.conf",
-        render_profile_values(values),
+        render_profile_values(values, global_config),
         owner_uid=context.owner_uid,
         owner_gid=0 if context.owner_uid == 0 else os.getegid(),
         boundary=context.boundary,
@@ -162,6 +173,9 @@ def _state_dict(
         "stopped_by_maintenance": state.stopped_by_maintenance,
         "failure_count": state.failure_count,
         "success_count": state.success_count,
+        "check_status": state.check_status,
+        "probe_error_category": state.last_probe_error_category,
+        "pending_action": state.pending_action,
         "check_interval_seconds": profile.config.check_interval_seconds,
         "ping_timeout_seconds": profile.config.ping_timeout_seconds,
         "failure_threshold": profile.config.failure_threshold,
@@ -203,7 +217,7 @@ def command_migrate(context: Context) -> int:
             )
     except OSError as exc:
         raise AdminRuntimeError("Watchdog database permissions could not be enforced") from exc
-    print("Watchdog schema version: 1")
+    print(f"Watchdog schema version: {SCHEMA_VERSION}")
     return 0
 
 
@@ -279,9 +293,14 @@ def command_status(context: Context, profile_id: str | None, as_json: bool) -> i
         service = "unknown" if item["service_active"] is None else (
             "active" if item["service_active"] else "inactive"
         )
+        display_state = (
+            item["check_status"]
+            if item["check_status"] == "probe_error"
+            else item["watchdog_state"]
+        )
         print(
             f"{item['profile_id']:<8} {item['kharej_ip']:<10} {item['mode']:<9} "
-            f"{item['watchdog_state']:<12} {service:<9} "
+            f"{display_state:<12} {service:<9} "
             f"{str(item['maintenance']).lower():<6} {str(item['manual_override']).lower():<9} "
             f"{str(item['stopped_by_watchdog']).lower():<6} "
             f"{item['failure_count']}/{item['success_count']}"
@@ -289,17 +308,57 @@ def command_status(context: Context, profile_id: str | None, as_json: bool) -> i
     return 0
 
 
-def command_set_mode(context: Context, profile_id: str, mode: str) -> int:
+def command_set_mode(
+    context: Context,
+    profile_id: str,
+    mode: str,
+    owned_action: str | None,
+) -> int:
     profile = _profile(context, profile_id)
+    if owned_action is not None and not (
+        profile.config.mode == "auto" and mode in {"monitor", "disabled"}
+    ):
+        raise AdminInputError("owned service action is only valid when leaving Auto mode")
+    store = _open_store(context)
+    try:
+        state = store.get_state(
+            profile.profile_id, profile.service_name, profile.kharej_ip
+        )
+        needs_choice = (
+            profile.config.mode == "auto"
+            and mode in {"monitor", "disabled"}
+            and state.stopped_by_watchdog
+        )
+        if needs_choice and owned_action is None:
+            raise AdminInputError(
+                "service is stopped by Watchdog; disabling Auto recovery requires "
+                "--owned-action keep-stopped or start-if-healthy"
+            )
+        if needs_choice and owned_action == "start-if-healthy":
+            MaintenanceController(store, SystemdController()).start_owned_for_mode_change(
+                profile
+            )
+    except (ValueError, CommandError) as exc:
+        raise AdminRuntimeError(str(exc)) from exc
+    finally:
+        store.close()
     values = _existing_profile_values(context, profile_id)
     values["MODE"] = mode
     _write_profile_values(context, profile, values)
+    if needs_choice and owned_action == "keep-stopped":
+        print(
+            "Warning: service remains stopped and automatic recovery is now disabled."
+        )
     print(f"{profile_id} mode set to {mode}")
     return 0
 
 
 def command_configure_profile(context: Context, args: argparse.Namespace) -> int:
     profile = _profile(context, args.profile_id)
+    if args.mode is not None and args.mode != profile.config.mode:
+        raise AdminInputError(
+            "mode changes must use set-mode so stopped-service ownership is handled"
+        )
     values = _existing_profile_values(context, args.profile_id)
     option_map = {
         "mode": "MODE",
@@ -323,8 +382,26 @@ def command_configure_profile(context: Context, args: argparse.Namespace) -> int
 
 
 def command_reset_profile(context: Context, profile_id: str) -> int:
-    profile = _profile(context, profile_id)
-    _write_profile_values(context, profile, {"MODE": "disabled"})
+    try:
+        profile = load_managed_profile_identity(
+            profile_id,
+            context.env_dir,
+            context.unit_dir,
+            context.profile_config_dir,
+            _global(context),
+            expected_uid=context.expected_uid,
+        )
+    except ProfileError as exc:
+        raise AdminInputError(str(exc)) from exc
+    global_config = _global(context)
+    atomic_write_config(
+        context.profile_config_dir / f"{profile.profile_id}.conf",
+        render_profile_values({"MODE": "disabled"}, global_config),
+        owner_uid=context.owner_uid,
+        owner_gid=0 if context.owner_uid == 0 else os.getegid(),
+        boundary=context.boundary,
+        recovery_replace=True,
+    )
     print(f"{profile_id} overrides reset; mode is disabled")
     return 0
 
@@ -370,11 +447,11 @@ def command_set_global(context: Context, args: argparse.Namespace) -> int:
 
 def command_ping(context: Context, profile_id: str) -> int:
     profile = _profile(context, profile_id)
-    success = SubprocessPingExecutor()(
+    result = SubprocessPingExecutor()(
         profile.kharej_ip, profile.config.ping_timeout_seconds
     )
-    print(f"{profile.profile_id} ping: {'success' if success else 'failed'}")
-    return 0 if success else 1
+    print(f"{profile.profile_id} ping: {result.status}")
+    return 0 if result.status == "success" else 1
 
 
 def command_events(
@@ -492,6 +569,9 @@ def build_parser() -> argparse.ArgumentParser:
     set_mode = subparsers.add_parser("set-mode")
     set_mode.add_argument("profile_id")
     set_mode.add_argument("mode", choices=("disabled", "monitor", "auto"))
+    set_mode.add_argument(
+        "--owned-action", choices=("keep-stopped", "start-if-healthy")
+    )
     configure = subparsers.add_parser("configure-profile")
     configure.add_argument("profile_id")
     configure.add_argument("--mode", choices=("disabled", "monitor", "auto"))
@@ -534,7 +614,9 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "status":
         return command_status(context, args.profile, args.json)
     if args.command == "set-mode":
-        return command_set_mode(context, args.profile_id, args.mode)
+        return command_set_mode(
+            context, args.profile_id, args.mode, args.owned_action
+        )
     if args.command == "configure-profile":
         return command_configure_profile(context, args)
     if args.command == "reset-profile":

@@ -99,8 +99,13 @@ must prove:
   service restart, preserves env/unit bytes, and is idempotent after its first
   successful run.
 - Watchdog defaults to Disabled per profile, validates exact Iran unit names,
-  checks unique IPs concurrently, persists stop ownership, bounds events to 24
-  hours, and never controls a Kharej or arbitrary service.
+  deduplicates checks by `(KHAREJ_IP, PING_TIMEOUT_SECONDS)`, distinguishes
+  upstream unreachability from local probe errors, persists action intent
+  before systemd, reconciles service state on a 10-second cadence, bounds
+  events to 24 hours, and never controls a Kharej or arbitrary service.
+- `tests/test-watchdog-linux.sh` runs the supported hardened runtime probe and
+  reports CPU, RSS, task count, Ping/systemctl process rates, overlap, scheduler
+  stability, Disabled startup, and zero traffic actions for ten profiles.
 
 ## Release
 
