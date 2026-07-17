@@ -15,7 +15,6 @@ lint:
 	shellcheck -x -P SCRIPTDIR $(BASH_SCRIPTS)
 
 test:
-	@printf 'GIT_TREE_SHA=%s\n' "$$(git rev-parse HEAD^{tree})"
 	bash tests/run-tests.sh
 	bash tests/test-install.sh
 	bash tests/test-menu.sh

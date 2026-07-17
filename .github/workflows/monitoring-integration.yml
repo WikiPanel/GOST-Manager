@@ -35,23 +35,6 @@ jobs:
       - name: Validate real Ubuntu OS metadata preflight
         run: bash -c 'source ./setup.sh; read_os_release'
       - name: Full local gate
-        run: |
-          log="${RUNNER_TEMP}/make-check.log"
-          if ! make check >"${log}" 2>&1; then
-            tail -n 220 "${log}"
-            exit 1
-          fi
-          tail -n 40 "${log}"
-      - name: Upload failed gate diagnostics
-        if: failure()
-        # actions/upload-artifact v4.6.2
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: make-check-${{ matrix.os }}
-          path: |
-            ${{ runner.temp }}/make-check.log
-            tests/test-setup.sh
-          if-no-files-found: error
-          retention-days: 1
+        run: make check
       - name: Real Linux systemd verification
         run: bash tests/test-systemd-linux.sh

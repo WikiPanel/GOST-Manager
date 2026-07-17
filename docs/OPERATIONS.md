@@ -19,7 +19,7 @@ gost-manager
 4. Choose `1) Install / Update GOST`.
 
 Rerun the same setup command for an upgrade. Use
-`GOST_MANAGER_VERSION=v2.0.0` before the command when an exact release must be
+`GOST_MANAGER_VERSION=v2.0.2` before the command when an exact release must be
 pinned. The verified release source remains at `/opt/GOST-Manager`; manual Git
 clone plus `bash install.sh --install-dependencies` remains the offline/local
 fallback.

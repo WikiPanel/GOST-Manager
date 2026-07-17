@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CURRENT_VERSION="$(< "${ROOT_DIR}/VERSION")"
-PREVIOUS_VERSION="2.0.0"
+PREVIOUS_VERSION="2.0.1"
 # shellcheck source=integration-test-lib.sh
 source "${ROOT_DIR}/tests/integration-test-lib.sh"
 
@@ -768,7 +768,7 @@ assert_setup_failure "archive missing required file is rejected" "${missing_case
 assert_contains "missing required file is reported" "missing install.sh" "${missing_case}/setup.out"
 
 mismatch_case="$(new_case version-mismatch)"
-create_release_assets "${mismatch_case}/assets" 2.0.2
+create_release_assets "${mismatch_case}/assets" "${PREVIOUS_VERSION}"
 SETUP_VERSION_TEST="${CURRENT_VERSION}" assert_setup_failure "pinned release mismatch is rejected" "${mismatch_case}"
 assert_contains "pinned mismatch is reported" "does not match requested" "${mismatch_case}/setup.out"
 
