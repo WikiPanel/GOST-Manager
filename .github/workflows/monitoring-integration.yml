@@ -48,7 +48,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: make-check-${{ matrix.os }}
-          path: ${{ runner.temp }}/make-check.log
+          path: |
+            ${{ runner.temp }}/make-check.log
+            tests/test-setup.sh
           if-no-files-found: error
           retention-days: 1
       - name: Real Linux systemd verification
