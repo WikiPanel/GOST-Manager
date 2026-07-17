@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly GOST_MANAGER_LIBRARY_DIR="/usr/local/lib/gost-manager"
+export PYTHONPATH="${GOST_MANAGER_LIBRARY_DIR}"
+for argument in "$@"; do
+  case "${argument}" in
+    --policy|--policy=*|--path-root|--path-root=*|--config|--config=*|--profile-config-dir|--profile-config-dir=*|--env-dir|--env-dir=*|--unit-dir|--unit-dir=*|--db|--db=*)
+      printf 'Error: installed Watchdog paths and policy cannot be overridden.\n' >&2
+      exit 2
+      ;;
+  esac
+done
+exec python3 -m gost_watchdog.admin_cli --policy installed "$@"

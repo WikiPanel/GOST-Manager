@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Added the central per-profile Iran Upstream Watchdog v1 with exact 2-second
+  ICMP defaults, concurrent deduplicated checks, stop ownership, manual and
+  maintenance protection, bounded 24-hour SQLite transition history, hardened
+  systemd packaging, menu/install/uninstall integration, and deterministic
+  tests. Installation leaves every profile Disabled and performs no GOST
+  traffic service action.
+- Hardened Watchdog production safety with typed probe results, local Ping
+  dependency preflight, IP-plus-timeout probe sharing, durable systemd action
+  intents, bounded service reconciliation, safe invalid-config recovery,
+  current-value menu defaults, exact 24-hour outage intersections, explicit
+  owned-stop mode changes, re-arm auditing, and hardened Ubuntu runtime/soak
+  validation.
+- Completed durable Watchdog crash recovery so persisted stop and start intents
+  execute and finalize exactly once after restart for Auto, Monitor, and
+  Disabled profiles, with bounded failure handling and no Ping in Disabled mode.
+
 ## 2.0.1 - 2026-07-14
 
 - Fixed public setup compatibility with the standard Ubuntu

@@ -43,6 +43,7 @@ create_source_fixture() {
   cp "${ROOT_DIR}/lib/gost-run-iran.sh" "${ROOT_DIR}/lib/gost-run-kharej.sh" \
     "${destination}/lib/"
   cp -R "${ROOT_DIR}/monitoring" "${destination}/monitoring"
+  cp -R "${ROOT_DIR}/gost_watchdog" "${destination}/gost_watchdog"
   cp "${ROOT_DIR}"/packaging/* "${destination}/packaging/"
 }
 
@@ -75,6 +76,9 @@ assert_file "fresh query launcher installed" "${fresh_root}/usr/local/sbin/gost-
 assert_file "fresh collector launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor-collector"
 assert_file "fresh admin launcher installed" "${fresh_root}/usr/local/sbin/gost-monitor-admin"
 assert_file "complete package includes init" "${fresh_root}/usr/local/lib/gost-manager/monitoring/__init__.py"
+assert_file "Watchdog daemon launcher installed" "${fresh_root}/usr/local/sbin/gost-upstream-watchdog"
+assert_file "Watchdog admin launcher installed" "${fresh_root}/usr/local/sbin/gost-watchdog-admin"
+assert_file "Watchdog package includes init" "${fresh_root}/usr/local/lib/gost-manager/gost_watchdog/__init__.py"
 assert_absent "fresh install has no gost-gateway launcher" "${fresh_root}/usr/local/sbin/gost-gateway"
 assert_absent "fresh install has no gost-gateway runtime launcher" "${fresh_root}/usr/local/sbin/gost-gateway-runtime"
 assert_absent "fresh install has no Gateway package" "${fresh_root}/usr/local/lib/gost-manager/gateway"
@@ -89,14 +93,24 @@ assert_eq "fresh install has no Gateway systemd unit" "" "${gateway_units}"
 assert_file "fresh default config installed" "${fresh_root}/etc/gost-manager/monitoring.env"
 assert_file "fresh systemd unit installed" "${fresh_root}/etc/systemd/system/gost-monitor-collector.service"
 assert_file "fresh schema migrated" "${fresh_root}/var/lib/gost-manager/metrics.sqlite3"
+assert_file "fresh Watchdog global config installed" "${fresh_root}/etc/gost-manager/watchdog.conf"
+assert_file "fresh Watchdog unit installed" "${fresh_root}/etc/systemd/system/gost-upstream-watchdog.service"
+assert_file "fresh Watchdog schema migrated" "${fresh_root}/var/lib/gost-manager/watchdog/watchdog.sqlite3"
+assert_absent "fresh install creates no enabled profile config" "${fresh_root}/etc/gost-manager/watchdog.d/iran-1.conf"
 assert_eq "launcher mode" "755" "$(mode_of "${fresh_root}/usr/local/sbin/gost-monitor")"
 assert_eq "config mode" "600" "$(mode_of "${fresh_root}/etc/gost-manager/monitoring.env")"
 assert_eq "state directory mode" "700" "$(mode_of "${fresh_root}/var/lib/gost-manager")"
 assert_eq "config directory mode" "700" "$(mode_of "${fresh_root}/etc/gost-manager")"
 assert_eq "private library directory mode" "755" "$(mode_of "${fresh_root}/usr/local/lib/gost-manager")"
 assert_eq "database mode" "600" "$(mode_of "${fresh_root}/var/lib/gost-manager/metrics.sqlite3")"
+assert_eq "Watchdog config mode" "600" "$(mode_of "${fresh_root}/etc/gost-manager/watchdog.conf")"
+assert_eq "Watchdog profile config directory mode" "700" "$(mode_of "${fresh_root}/etc/gost-manager/watchdog.d")"
+assert_eq "Watchdog state directory mode" "700" "$(mode_of "${fresh_root}/var/lib/gost-manager/watchdog")"
+assert_eq "Watchdog database mode" "600" "$(mode_of "${fresh_root}/var/lib/gost-manager/watchdog/watchdog.sqlite3")"
 assert_contains "fresh collector enabled" "systemctl enable gost-monitor-collector.service" "${COMMAND_LOG}"
 assert_contains "fresh collector started" "systemctl start gost-monitor-collector.service" "${COMMAND_LOG}"
+assert_contains "fresh Watchdog enabled" "systemctl enable gost-upstream-watchdog.service" "${COMMAND_LOG}"
+assert_contains "fresh Watchdog started" "systemctl start gost-upstream-watchdog.service" "${COMMAND_LOG}"
 assert_not_contains "fresh install never targets Iran traffic" "gost-iran-" "${COMMAND_LOG}"
 assert_not_contains "fresh install never targets Kharej traffic" "gost-kharej-" "${COMMAND_LOG}"
 assert_not_contains "fresh install starts no Gateway service" "gost-gateway-exit-" "${COMMAND_LOG}"
@@ -130,6 +144,11 @@ PYTHONPATH="${installed_library}" python3 -m monitoring.admin_cli \
   --policy installed --path-root "${fresh_root}" --lock-path "${fresh_root}/run/collector.lock" \
   purge-history --yes --config "${installed_config}" >/dev/null
 assert_file "installed admin validate/status/maintenance/purge smoke" "${installed_db}"
+PYTHONPATH="${installed_library}" python3 -m gost_watchdog.admin_cli \
+  --policy installed --path-root "${fresh_root}" validate-config --all >/dev/null
+PYTHONPATH="${installed_library}" python3 -m gost_watchdog.admin_cli \
+  --policy installed --path-root "${fresh_root}" profiles >/dev/null
+assert_file "installed Watchdog admin validate/profiles smoke" "${fresh_root}/var/lib/gost-manager/watchdog/watchdog.sqlite3"
 
 direct_root="${TEST_HOME}/direct"
 mkdir -p "${direct_root}/etc/gost" "${direct_root}/etc/systemd/system" "${direct_root}/usr/local/sbin"
@@ -584,6 +603,33 @@ fi
 assert_eq "missing dependency causes no mutation" "${missing_before}" "$(tree_digest "${missing_root}")"
 mv "${STUB_BIN}/ss.disabled" "${STUB_BIN}/ss"
 
+missing_ping_root="${TEST_HOME}/missing-ping"
+mkdir -p "${missing_ping_root}"
+mv "${STUB_BIN}/ping" "${STUB_BIN}/ping.disabled"
+missing_ping_before="$(tree_digest "${missing_ping_root}")"
+if GOST_MANAGER_TEST_MISSING_COMMANDS=ping \
+  GOST_MANAGER_TEST_DEP_BIN="${STUB_BIN}" \
+  run_installer "${missing_ping_root}" >/dev/null 2>&1; then
+  fail "missing ping without dependency opt-in fails"
+else
+  pass "missing ping without dependency opt-in fails"
+fi
+assert_eq "missing ping causes no mutation" "${missing_ping_before}" \
+  "$(tree_digest "${missing_ping_root}")"
+mv "${STUB_BIN}/ping.disabled" "${STUB_BIN}/ping"
+
+unsupported_ping_root="${TEST_HOME}/unsupported-ping"
+mkdir -p "${unsupported_ping_root}"
+unsupported_ping_before="$(tree_digest "${unsupported_ping_root}")"
+if STUB_PING_CAPABILITY=unsupported \
+  run_installer "${unsupported_ping_root}" >/dev/null 2>&1; then
+  fail "unsupported ping invocation fails preflight"
+else
+  pass "unsupported ping invocation fails preflight"
+fi
+assert_eq "unsupported ping causes no mutation" "${unsupported_ping_before}" \
+  "$(tree_digest "${unsupported_ping_root}")"
+
 cat > "${STUB_BIN}/apt-get" <<'STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -594,6 +640,7 @@ if [[ "${1:-}" == "install" ]]; then
   for command_name in "${provided[@]}"; do
     case "${command_name}" in
       ss) target="${STUB_TRUE_BIN}" ;;
+      ping) target="${STUB_TRUE_BIN}" ;;
       cmp) target="${STUB_REAL_CMP_BIN}" ;;
       stat) target="${STUB_REAL_STAT_BIN}" ;;
       *) exit 2 ;;
@@ -623,6 +670,27 @@ assert_contains "dependency opt-in runs apt update" "apt-get update" "${COMMAND_
 assert_contains "dependency opt-in installs only expected package" "apt-get install -y iproute2" "${COMMAND_LOG}"
 assert_file "dependency opt-in completes installation" "${dependency_root}/usr/local/sbin/gost-monitor"
 rm -f "${STUB_BIN}/ss.disabled"
+
+ping_dependency_root="${TEST_HOME}/dependency-ping"
+mkdir -p "${ping_dependency_root}"
+mv "${STUB_BIN}/ping" "${STUB_BIN}/ping.disabled"
+: > "${COMMAND_LOG}"
+GOST_MANAGER_ALLOW_TEST_PACKAGE_STUB=1 \
+STUB_PROVIDE_COMMANDS=ping \
+STUB_BIN_PATH="${STUB_BIN}" \
+STUB_TRUE_BIN="${TRUE_BIN}" \
+STUB_REAL_CMP_BIN="${REAL_CMP_BIN}" \
+STUB_REAL_STAT_BIN="${REAL_STAT_BIN}" \
+GOST_MANAGER_TEST_MISSING_COMMANDS=ping \
+GOST_MANAGER_TEST_DEP_BIN="${STUB_BIN}" \
+APT_GET_BIN="${STUB_BIN}/apt-get" \
+run_installer "${ping_dependency_root}" --install-dependencies >/dev/null
+assert_contains "missing ping installs only iputils-ping" \
+  "apt-get install -y iputils-ping" "${COMMAND_LOG}"
+assert_file "ping dependency install completes safely" \
+  "${ping_dependency_root}/usr/local/sbin/gost-watchdog-admin"
+rm -f "${STUB_BIN}/ping"
+mv "${STUB_BIN}/ping.disabled" "${STUB_BIN}/ping"
 
 cmp_dependency_root="${TEST_HOME}/dependency-cmp"
 mkdir -p "${cmp_dependency_root}"

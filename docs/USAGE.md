@@ -29,6 +29,7 @@ GOST Manager v2.0.0
 9) Clean old/broken GOST configs
 10) Monitoring
 11) Server Stability
+12) Upstream Watchdog
 0) Exit
 ```
 
@@ -153,3 +154,10 @@ separate `stability.conf` drop-in with the recommended file, task, OOM, and
 restart limits. The wizard runs `daemon-reload` only when a drop-in changes;
 it never restarts a service or reads an env file. The final report lists any
 services whose new limits require a later operator-scheduled restart.
+
+## 12) Upstream Watchdog
+
+Opens status, per-profile Disabled/Monitor Only/Auto Protect modes, safe
+overrides, Ping testing, maintenance, 24-hour events/summary, global defaults,
+central service controls, and manual-override re-arming. All profiles default
+to Disabled. See `docs/WATCHDOG-V1.md` before enabling Auto Protect.

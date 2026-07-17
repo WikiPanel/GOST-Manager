@@ -44,7 +44,22 @@ if [[ "${1:-}" == "config" ]]; then
 fi
 exit "${STUB_ADMIN_EXIT:-0}"
 STUB
-chmod 755 "${STUB_BIN}/gost-monitor" "${STUB_BIN}/gost-monitor-collector" "${STUB_BIN}/gost-monitor-admin"
+cat > "${STUB_BIN}/gost-watchdog-admin" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'watchdog-admin %s\n' "$*" >> "${COMMAND_LOG}"
+if [[ "${1:-}" == "profiles" ]]; then
+  printf 'iran-1\t203.0.113.10\tdisabled\n'
+elif [[ "${1:-}" == "effective" && "${3:-}" == "--json" ]]; then
+  printf '%s\n' "${STUB_WATCHDOG_PROFILE_JSON:-}"
+elif [[ "${1:-}" == "effective-global" && "${2:-}" == "--json" ]]; then
+  printf '%s\n' "${STUB_WATCHDOG_GLOBAL_JSON:-}"
+elif [[ "${1:-}" == "status" && "${2:-}" == "--profile" ]]; then
+  printf '%s\n' "${STUB_WATCHDOG_STATUS_JSON:-}"
+fi
+exit "${STUB_WATCHDOG_EXIT:-0}"
+STUB
+chmod 755 "${STUB_BIN}/gost-monitor" "${STUB_BIN}/gost-monitor-collector" "${STUB_BIN}/gost-monitor-admin" "${STUB_BIN}/gost-watchdog-admin"
 
 export COMMAND_LOG STUB_STATE_DIR
 export PATH="${STUB_BIN}:${PATH}"
@@ -52,9 +67,13 @@ export GOST_MANAGER_TESTING=1
 export GOST_MONITOR_BIN_TEST="${STUB_BIN}/gost-monitor"
 export GOST_MONITOR_COLLECTOR_BIN_TEST="${STUB_BIN}/gost-monitor-collector"
 export GOST_MONITOR_ADMIN_BIN_TEST="${STUB_BIN}/gost-monitor-admin"
+export GOST_WATCHDOG_ADMIN_BIN_TEST="${STUB_BIN}/gost-watchdog-admin"
 export GOST_MONITOR_CONFIG_TEST="${TEST_HOME}/monitoring.env"
 export GOST_MONITOR_EXPORT_DIR_TEST="${TEST_HOME}"
 export STUB_CONFIG_DB="/var/lib/gost-manager/custom.sqlite3"
+export STUB_WATCHDOG_PROFILE_JSON='{"mode":"monitor","check_interval_seconds":7,"ping_timeout_seconds":3,"failure_threshold":17,"success_threshold":19,"recovery_hold_seconds":23,"recovery_jitter_max_seconds":29}'
+export STUB_WATCHDOG_GLOBAL_JSON='{"check_mode":"ping","check_interval_seconds":11,"ping_timeout_seconds":4,"failure_threshold":31,"success_threshold":37,"recovery_hold_seconds":41,"recovery_jitter_max_seconds":43}'
+export STUB_WATCHDOG_STATUS_JSON='{"errors":[],"profiles":[{"mode":"monitor","stopped_by_watchdog":false,"watchdog_state":"healthy","check_status":"success"}]}'
 
 # shellcheck source=../gost-manager.sh
 source "${ROOT_DIR}/gost-manager.sh"
@@ -79,7 +98,7 @@ for label in \
 done
 assert_contains "Monitoring appended as option 10" "10) Monitoring" "${menu_file}"
 assert_contains "Server Stability appended as option 11" "11) Server Stability" "${menu_file}"
-assert_not_contains "main menu has no option 12" "12)" "${menu_file}"
+assert_contains "Upstream Watchdog appended as option 12" "12) Upstream Watchdog" "${menu_file}"
 assert_not_contains "Native Gateway placeholder removed" "Coming soon" "${menu_file}"
 
 profile_menu_file="${TEST_HOME}/profile-menu.txt"
@@ -195,11 +214,13 @@ STUB
 source "${dispatch_stubs}"
 (
   monitoring_menu() { printf 'monitoring\n' >> "${DISPATCH_LOG}"; }
-  main_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n0' >/dev/null
+  watchdog_menu() { printf 'watchdog\n' >> "${DISPATCH_LOG}"; }
+  main_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n0' >/dev/null
 )
-assert_eq "main dispatch order 1 through 11 exact" $'install\nkharej\niran\ndelete\nstatus\nlogs\nrestart\nlist\ncleanup\nmonitoring\nstability' "$(sed -n '1,11p' "${DISPATCH_LOG}")"
+assert_eq "main dispatch order 1 through 12 exact" $'install\nkharej\niran\ndelete\nstatus\nlogs\nrestart\nlist\ncleanup\nmonitoring\nstability\nwatchdog' "$(sed -n '1,12p' "${DISPATCH_LOG}")"
 assert_contains "main option 10 dispatches Monitoring" '10) monitoring_menu ;;' "${ROOT_DIR}/gost-manager.sh"
 assert_contains "main option 11 dispatches Server Stability" '11) server_stability_wizard ;;' "${ROOT_DIR}/gost-manager.sh"
+assert_contains "main option 12 dispatches Upstream Watchdog" '12) watchdog_menu ;;' "${ROOT_DIR}/gost-manager.sh"
 assert_not_contains "main dispatch has no Native option" 'native_gost_gateway_coming_soon' "${ROOT_DIR}/gost-manager.sh"
 
 : > "${DISPATCH_LOG}"
@@ -210,6 +231,116 @@ stability_return_output="${TEST_HOME}/stability-return.out"
 assert_eq "Server Stability returns to the main menu" "2" \
   "$(grep -c "^GOST Manager v${CURRENT_VERSION}$" "${stability_return_output}")"
 assert_contains "Server Stability dispatch completes before return" "stability" "${DISPATCH_LOG}"
+
+watchdog_menu_file="${TEST_HOME}/watchdog-menu.txt"
+show_watchdog_menu > "${watchdog_menu_file}"
+for label in \
+  "1) Show all profile status" \
+  "2) Enable or change profile mode" \
+  "3) Disable watchdog for profile" \
+  "4) Configure profile overrides" \
+  "5) Reset profile overrides to global defaults" \
+  "6) Test profile ping" \
+  "7) Maintenance mode" \
+  "8) Show last 24-hour events" \
+  "9) Show 24-hour outage summary" \
+  "10) Configure global defaults" \
+  "11) Show watchdog service status" \
+  "12) Restart watchdog service" \
+  "13) Re-arm manual override" \
+  "14) Back"; do
+  assert_contains "Watchdog menu ${label}" "${label}" "${watchdog_menu_file}"
+done
+assert_contains "Watchdog menu displays exact default interval" "Default Ping interval: 2 seconds" "${watchdog_menu_file}"
+
+: > "${COMMAND_LOG}"
+watchdog_configure_profile <<< $'iran-1\n\n\n\n\n\n\n' >/dev/null
+assert_contains "profile menu reads machine-readable current values" \
+  "watchdog-admin effective iran-1 --json" "${COMMAND_LOG}"
+assert_not_contains "Enter preserves all custom profile values without a write" \
+  "configure-profile" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_configure_profile <<< $'iran-1\n8\n\n\n\n\n\ny' >/dev/null
+assert_contains "changing one profile value writes only that override" \
+  "watchdog-admin configure-profile iran-1 --check-interval 8" "${COMMAND_LOG}"
+assert_not_contains "single profile change does not expand inherited timeout" \
+  "--ping-timeout" "${COMMAND_LOG}"
+assert_not_contains "single profile change does not reset custom threshold" \
+  "--failure-threshold" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_configure_global <<< $'\n\n\n\n\n\n' >/dev/null
+assert_contains "global menu reads machine-readable current values" \
+  "watchdog-admin effective-global --json" "${COMMAND_LOG}"
+assert_not_contains "Enter preserves all custom global values without a write" \
+  "set-global" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_configure_global <<< $'\n\n32\n\n\n\ny' >/dev/null
+assert_contains "changing one global value writes only that field" \
+  "watchdog-admin set-global --failure-threshold 32" "${COMMAND_LOG}"
+assert_not_contains "single global change does not reset custom interval" \
+  "--check-interval" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+export STUB_WATCHDOG_PROFILE_JSON='{'
+watchdog_configure_profile <<< $'iran-1' >/dev/null 2>&1 || true
+assert_not_contains "invalid profile JSON causes no configuration write" \
+  "configure-profile" "${COMMAND_LOG}"
+export STUB_WATCHDOG_PROFILE_JSON='{"mode":"monitor","check_interval_seconds":7,"ping_timeout_seconds":3,"failure_threshold":17,"success_threshold":19,"recovery_hold_seconds":23,"recovery_jitter_max_seconds":29}'
+
+: > "${COMMAND_LOG}"
+export STUB_WATCHDOG_GLOBAL_JSON='{"check_mode":"ping"}'
+watchdog_configure_global </dev/null >/dev/null 2>&1 || true
+assert_not_contains "incomplete global JSON causes no configuration write" \
+  "set-global" "${COMMAND_LOG}"
+export STUB_WATCHDOG_GLOBAL_JSON='{"check_mode":"ping","check_interval_seconds":11,"ping_timeout_seconds":4,"failure_threshold":31,"success_threshold":37,"recovery_hold_seconds":41,"recovery_jitter_max_seconds":43}'
+
+: > "${COMMAND_LOG}"
+export STUB_WATCHDOG_STATUS_JSON='{"errors":[],"profiles":[{"mode":"auto","stopped_by_watchdog":true,"watchdog_state":"healthy","check_status":"success"}]}'
+watchdog_apply_mode_change iran-1 monitor <<< $'1\ny' >/dev/null
+assert_contains "mode change can explicitly keep Watchdog-owned stop" \
+  "watchdog-admin set-mode iran-1 monitor --owned-action keep-stopped" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_apply_mode_change iran-1 disabled <<< $'2\ny' >/dev/null
+assert_contains "mode change can explicitly start a healthy owned stop" \
+  "watchdog-admin set-mode iran-1 disabled --owned-action start-if-healthy" "${COMMAND_LOG}"
+
+: > "${COMMAND_LOG}"
+watchdog_apply_mode_change iran-1 disabled <<< $'3' >/dev/null
+assert_not_contains "mode-change cancellation performs no write or service action" \
+  "set-mode" "${COMMAND_LOG}"
+export STUB_WATCHDOG_STATUS_JSON='{"errors":[],"profiles":[{"mode":"monitor","stopped_by_watchdog":false,"watchdog_state":"healthy","check_status":"success"}]}'
+
+watchdog_dispatch_stubs="${TEST_HOME}/watchdog-dispatch-stubs.sh"
+cat > "${watchdog_dispatch_stubs}" <<'STUB'
+run_watchdog_command() { printf 'watchdog-command %s\n' "$*" >> "${DISPATCH_LOG}"; }
+watchdog_change_mode() { printf 'watchdog-mode\n' >> "${DISPATCH_LOG}"; }
+watchdog_disable_profile() { printf 'watchdog-disable\n' >> "${DISPATCH_LOG}"; }
+watchdog_configure_profile() { printf 'watchdog-profile-config\n' >> "${DISPATCH_LOG}"; }
+watchdog_reset_profile() { printf 'watchdog-reset\n' >> "${DISPATCH_LOG}"; }
+watchdog_test_ping() { printf 'watchdog-ping\n' >> "${DISPATCH_LOG}"; }
+watchdog_maintenance_menu() { printf 'watchdog-maintenance\n' >> "${DISPATCH_LOG}"; }
+watchdog_configure_global() { printf 'watchdog-global-config\n' >> "${DISPATCH_LOG}"; }
+watchdog_service_status() { printf 'watchdog-service-status\n' >> "${DISPATCH_LOG}"; }
+watchdog_restart_service() { printf 'watchdog-restart\n' >> "${DISPATCH_LOG}"; }
+watchdog_rearm_profile() { printf 'watchdog-rearm\n' >> "${DISPATCH_LOG}"; }
+STUB
+# shellcheck source=/dev/null
+source "${watchdog_dispatch_stubs}"
+: > "${DISPATCH_LOG}"
+watchdog_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14' >/dev/null
+assert_eq "Watchdog submenu dispatch count" "13" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
+for marker in \
+  "watchdog-command status" "watchdog-mode" "watchdog-disable" \
+  "watchdog-profile-config" "watchdog-reset" "watchdog-ping" \
+  "watchdog-maintenance" "watchdog-command events --limit 200" \
+  "watchdog-command summary" "watchdog-global-config" \
+  "watchdog-service-status" "watchdog-restart" "watchdog-rearm"; do
+  assert_contains "Watchdog dispatch ${marker}" "${marker}" "${DISPATCH_LOG}"
+done
 
 lite_menu_file="${TEST_HOME}/monitoring-lite-menu.txt"
 show_monitoring_menu > "${lite_menu_file}"

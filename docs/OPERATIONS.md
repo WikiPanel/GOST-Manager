@@ -149,6 +149,19 @@ already correct, it performs no file replacement, sysctl apply, or daemon
 reload. If it reports a symlink or unmanaged-file conflict, inspect that exact
 path manually; the wizard will not overwrite it.
 
+## Upstream Watchdog
+
+Choose `12) Upstream Watchdog`. Confirm every profile is `Disabled` after
+install, then follow the Monitor Only canary and controlled rollout in
+`docs/WATCHDOG-V1.md`. Auto Protect uses the exact 2-second default interval,
+stops one affected Iran profile only after 10 consecutive failures, and starts
+only a verified Watchdog-owned stop after recovery qualification.
+
+Use maintenance before an operator-planned service action. A manual state
+mismatch suspends automatic actions until `Re-arm manual override`; do not
+re-arm until the operator's intended service state is confirmed. History and
+the outage summary cover the last 24 hours only.
+
 ## Recovery If Service Fails
 
 1. Use menu option `5) Show status` and select the tunnel from the numbered list.

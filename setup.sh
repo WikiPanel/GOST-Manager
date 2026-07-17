@@ -529,6 +529,8 @@ validate_archive() {
     lib/gost-run-kharej.sh
     packaging/monitoring-runtime-manifest.txt
     monitoring/__init__.py
+    packaging/watchdog-runtime-manifest.txt
+    gost_watchdog/__init__.py
   )
 
   tar -tzf "${archive}" > "${listing}" || die "release archive cannot be listed."
@@ -572,7 +574,8 @@ extract_and_verify_release() {
   local required_path
   for required_path in VERSION setup.sh install.sh gost-manager.sh \
     lib/gost-run-iran.sh lib/gost-run-kharej.sh \
-    packaging/monitoring-runtime-manifest.txt monitoring/__init__.py; do
+    packaging/monitoring-runtime-manifest.txt monitoring/__init__.py \
+    packaging/watchdog-runtime-manifest.txt gost_watchdog/__init__.py; do
     [[ -f "${release_root}/${required_path}" && ! -L "${release_root}/${required_path}" ]] || die "extracted release file is missing or unsafe: ${required_path}"
   done
   version="$(< "${release_root}/VERSION")"

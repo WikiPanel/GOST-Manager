@@ -88,6 +88,49 @@ if [[ -s "${VERIFY_OUTPUT}" ]]; then
     "$(wc -l < "${VERIFY_OUTPUT}" | tr -d ' ')"
 fi
 
+WATCHDOG_VERIFY_UNIT="${VERIFY_DIR}/gost-upstream-watchdog.service"
+cp "${ROOT_DIR}/packaging/gost-upstream-watchdog.service" "${WATCHDOG_VERIFY_UNIT}"
+cp "${ROOT_DIR}/packaging/watchdog.conf" "${VERIFY_DIR}/watchdog.conf"
+mkdir -p "${VERIFY_DIR}/watchdog-state" "${VERIFY_DIR}/watchdog.d" \
+  "${VERIFY_DIR}/gost" "${VERIFY_DIR}/systemd"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${VERIFY_DIR}/gost-watchdog-admin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${VERIFY_DIR}/gost-upstream-watchdog"
+chmod 755 "${VERIFY_DIR}/gost-watchdog-admin" "${VERIFY_DIR}/gost-upstream-watchdog"
+python3 -c \
+  'import functools, sys; from pathlib import Path; p=Path(sys.argv[1]); s=p.read_text(); pairs=zip(sys.argv[2::2],sys.argv[3::2]); p.write_text(functools.reduce(lambda value, pair: value.replace(*pair), pairs, s))' \
+  "${WATCHDOG_VERIFY_UNIT}" \
+  /usr/local/sbin/gost-watchdog-admin "${VERIFY_DIR}/gost-watchdog-admin" \
+  /usr/local/sbin/gost-upstream-watchdog "${VERIFY_DIR}/gost-upstream-watchdog" \
+  /var/lib/gost-manager/watchdog "${VERIFY_DIR}/watchdog-state" \
+  /etc/gost-manager/watchdog.conf "${VERIFY_DIR}/watchdog.conf" \
+  /etc/gost-manager/watchdog.d "${VERIFY_DIR}/watchdog.d" \
+  /etc/gost "${VERIFY_DIR}/gost" \
+  /etc/systemd/system "${VERIFY_DIR}/systemd"
+
+for forbidden in \
+  'Requires=' 'PartOf=' 'BindsTo=' \
+  'ExecStartPost=' 'ExecStop=' 'ExecStopPost=' 'ExecReload=' \
+  'gost-iran-' 'gost-kharej-'; do
+  if grep -Fq "${forbidden}" "${ROOT_DIR}/packaging/gost-upstream-watchdog.service"; then
+    printf 'FAIL: Watchdog unit contains traffic dependency/lifecycle token: %s\n' "${forbidden}" >&2
+    exit 1
+  fi
+done
+
+WATCHDOG_VERIFY_OUTPUT="${TEST_HOME}/watchdog-verify.out"
+if ! "${SYSTEMD_ANALYZE_REAL}" verify "${WATCHDOG_VERIFY_UNIT}" > "${WATCHDOG_VERIFY_OUTPUT}" 2>&1; then
+  cat "${WATCHDOG_VERIFY_OUTPUT}" >&2
+  exit 1
+fi
+if [[ -s "${WATCHDOG_VERIFY_OUTPUT}" ]] && \
+   { grep -Fq "${WATCHDOG_VERIFY_UNIT}" "${WATCHDOG_VERIFY_OUTPUT}" || \
+     grep -Fq "${WATCHDOG_VERIFY_UNIT##*/}" "${WATCHDOG_VERIFY_OUTPUT}" || \
+     grep -Fq "${VERIFY_DIR}" "${WATCHDOG_VERIFY_OUTPUT}"; }; then
+  cat "${WATCHDOG_VERIFY_OUTPUT}" >&2
+  printf 'FAIL: Watchdog unit emitted a systemd diagnostic\n' >&2
+  exit 1
+fi
+
 STABILITY_VERIFY_UNIT="${VERIFY_DIR}/gost-iran-1.service"
 cat > "${STABILITY_VERIFY_UNIT}" <<'UNIT'
 [Unit]
@@ -160,6 +203,11 @@ bash "${ROOT_DIR}/install.sh" >/dev/null
 [[ -x "${INSTALL_ROOT}/usr/local/sbin/gost-monitor-admin" ]]
 [[ -f "${INSTALL_ROOT}/etc/gost-manager/monitoring.env" ]]
 [[ -f "${INSTALL_ROOT}/etc/systemd/system/gost-monitor-collector.service" ]]
+[[ -x "${INSTALL_ROOT}/usr/local/sbin/gost-upstream-watchdog" ]]
+[[ -x "${INSTALL_ROOT}/usr/local/sbin/gost-watchdog-admin" ]]
+[[ -f "${INSTALL_ROOT}/etc/gost-manager/watchdog.conf" ]]
+[[ -f "${INSTALL_ROOT}/etc/systemd/system/gost-upstream-watchdog.service" ]]
+[[ -f "${INSTALL_ROOT}/var/lib/gost-manager/watchdog/watchdog.sqlite3" ]]
 
 distribution="unknown"
 if [[ -r /etc/os-release ]]; then
@@ -167,6 +215,7 @@ if [[ -r /etc/os-release ]]; then
   distribution="$(. /etc/os-release && printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-unknown}")"
 fi
 printf 'PASS: real systemd-analyze host verification\n'
+printf 'PASS: Watchdog unit verified by real systemd-analyze\n'
 printf 'PASS: Server Stability override verified by real systemd-analyze\n'
 printf 'PASS: malformed staged unit rejected by systemd-analyze\n'
 printf 'PASS: temporary-root install with real systemd-analyze\n'

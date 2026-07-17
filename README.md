@@ -77,6 +77,9 @@ The local installer copies:
 - `/etc/gost-manager/monitoring.env`
 - `/etc/systemd/system/gost-monitor-collector.service`
 - monitoring history to `/var/lib/gost-manager/metrics.sqlite3`
+- the central Upstream Watchdog runtime and admin launchers to `/usr/local/sbin`
+- `/etc/gost-manager/watchdog.conf`, `/etc/gost-manager/watchdog.d/`, and `/var/lib/gost-manager/watchdog/`
+- `/etc/systemd/system/gost-upstream-watchdog.service`
 
 The monitoring collector is enabled and started on a fresh install. Upgrades
 preserve a valid operator-modified monitoring config, monitoring history, and
@@ -206,6 +209,7 @@ Use the menu:
 9) Clean old/broken GOST configs
 10) Monitoring
 11) Server Stability
+12) Upstream Watchdog
 0) Exit
 ```
 
@@ -331,9 +335,32 @@ The daemon, one-shot collector, and destructive history purge share the private 
 
 The collector service has bounded restart behavior, low CPU/I/O priority, private state permissions, and no `Requires=`, `PartOf=`, `BindsTo=`, stop, restart, or reload relationship with GOST tunnel services. Collector failure, corrupt history, maintenance failure, or monitoring removal cannot stop Direct Mode traffic.
 
+## Upstream Watchdog
+
+Option `12` opens the central per-profile Iran Upstream Watchdog. Every profile
+starts in `Disabled`; operators can select `Monitor Only` or `Auto Protect`
+independently. The exact defaults are a 2-second ICMP interval, 1-second Ping
+timeout, 10 failures before stop, 10 successes before recovery, a 10-second
+hold, and 0-10 seconds of jitter. Auto Protect stops only its exact active Iran
+service and auto-starts only a service whose stop it previously verified and
+owned. Manual stops, manual overrides, and maintenance are never silently
+reversed.
+
+One central daemon shares checks only for profiles with the same Kharej IP and
+Ping timeout, and retains only state-transition/action history for 24 hours in
+a dedicated SQLite database. Local Ping execution failures are reported as
+deduplicated `probe_error` transitions; they never count as upstream failures
+or cause a traffic action. Manual service reconciliation runs every 10 seconds,
+while each actual action uses a fresh exact-unit query and durable action intent.
+Installation and update enable that daemon but leave all profiles Disabled and
+never restart, stop, or start a GOST traffic service. A successful Ping proves
+host reachability, not that the remote SOCKS5 service itself is healthy. See
+[Upstream Watchdog v1](docs/WATCHDOG-V1.md) for configuration, rollout,
+maintenance, recovery ownership, limitations, and rollback.
+
 ## Safe Uninstall
 
-Run `sudo bash uninstall.sh`. Every component defaults to No and is confirmed independently: manager CLI, monitoring service, monitoring code, monitoring config, monitoring history, managed traffic services, `/etc/gost` credentials/backups, and the GOST binary. A final plan is shown before changes.
+Run `sudo bash uninstall.sh`. Every component defaults to No and is confirmed independently: manager CLI, monitoring components, Watchdog service/runtime/data, managed traffic services, `/etc/gost` credentials/backups, and the GOST binary. Watchdog configuration and history are preserved unless the operator confirms their explicit purge. A final plan is shown before changes.
 
 Removing monitoring only leaves tunnel units, active traffic, runners, `/etc/gost`, the GOST binary, firewall state, and unrelated host services unchanged. History and config are separate choices. Monitoring code cannot be removed while its service remains; runners are retained while managed traffic units remain. If history/config are retained, a later `sudo bash install.sh` restores the monitoring code and validates/migrates the retained database.
 
@@ -341,7 +368,11 @@ Removal decisions are rechecked against actual post-action state. If any exact m
 
 ## Linux systemd verification
 
-`tests/test-systemd-linux.sh` uses the host's real `systemd-analyze verify` environment and temporary executable/config paths; it does not use an incomplete synthetic `--root`. It skips only off Linux or when the real binary is unavailable. `.github/workflows/monitoring-integration.yml` runs `make check`, the temporary-root installer, and real systemd verification on Ubuntu 22.04 and 24.04.
+`tests/test-systemd-linux.sh` uses the host's real `systemd-analyze verify`
+environment and temporary executable/config paths. `tests/test-watchdog-linux.sh`
+also runs a hardened transient Watchdog unit, local Ping and AF_UNIX checks, and
+a ten-profile process-rate benchmark without enabling Auto Protect for a real
+traffic service. The Ubuntu 22.04/24.04 workflow runs both validations.
 
 If installer service-state rollback cannot be verified, it retains collision-resistant backup directories and prints exact `rm`, `cp -a`, `systemctl daemon-reload`, enable/disable, start/stop, and status commands for restoring the recorded collector state. Do not delete those backups until the printed status check succeeds.
 
