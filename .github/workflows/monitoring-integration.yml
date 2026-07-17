@@ -35,6 +35,12 @@ jobs:
       - name: Validate real Ubuntu OS metadata preflight
         run: bash -c 'source ./setup.sh; read_os_release'
       - name: Full local gate
-        run: make check
+        run: |
+          log="${RUNNER_TEMP}/make-check.log"
+          if ! make check >"${log}" 2>&1; then
+            tail -n 220 "${log}"
+            exit 1
+          fi
+          tail -n 40 "${log}"
       - name: Real Linux systemd verification
         run: bash tests/test-systemd-linux.sh
