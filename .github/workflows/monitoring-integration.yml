@@ -42,5 +42,14 @@ jobs:
             exit 1
           fi
           tail -n 40 "${log}"
+      - name: Upload failed gate diagnostics
+        if: failure()
+        # actions/upload-artifact v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: make-check-${{ matrix.os }}
+          path: ${{ runner.temp }}/make-check.log
+          if-no-files-found: error
+          retention-days: 1
       - name: Real Linux systemd verification
         run: bash tests/test-systemd-linux.sh
