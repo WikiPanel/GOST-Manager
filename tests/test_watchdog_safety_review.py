@@ -33,7 +33,12 @@ from gost_watchdog.config import (
     render_profile_values,
     render_global_config,
 )
-from gost_watchdog.engine import DurableServiceActions, MaintenanceController, WatchdogEngine
+from gost_watchdog.daemon import WatchdogDaemon
+from gost_watchdog.engine import (
+    DurableServiceActions,
+    MaintenanceController,
+    WatchdogEngine,
+)
 from gost_watchdog.models import (
     EVENT_RETENTION_SECONDS,
     MAX_PING_WORKERS,
@@ -496,20 +501,265 @@ class DurableOwnershipTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
-    def test_stop_pending_before_action_is_cleared_without_service_action(self) -> None:
-        current = managed_profile()
-        state = self.store.get_state(current.profile_id, current.service_name, current.kharej_ip)
-        state.pending_action = "stop_watchdog"
-        state.pending_action_at = self.clock.value
-        self.store.persist(state, [], self.clock.value)
-        systemd = FakeSystemd(True)
-        WatchdogEngine(self.store, systemd, clock=self.clock.model()).process(
-            current, ProbeResult("success")
+    def _persist_pending(
+        self,
+        current: ManagedProfile,
+        action: str,
+        *,
+        watchdog_owned: bool = False,
+        maintenance_owned: bool = False,
+        maintenance: bool = False,
+    ) -> None:
+        state = self.store.get_state(
+            current.profile_id, current.service_name, current.kharej_ip
         )
+        state.pending_action = action
+        state.pending_action_at = self.clock.value
+        state.stopped_by_watchdog = watchdog_owned
+        state.stopped_by_maintenance = maintenance_owned
+        state.maintenance = maintenance
+        self.store.persist(state, [], self.clock.value)
+
+    def _action_errors(self) -> list[sqlite3.Row]:
+        return [
+            row
+            for row in self.store.events(self.clock.value, limit=100)
+            if row["code"] == "watchdog_action_error"
+        ]
+
+    def test_crash_before_watchdog_stop_executes_once_and_finalizes_owner(self) -> None:
+        current = managed_profile()
+        self._persist_pending(current, "stop_watchdog")
+        systemd = FakeSystemd(True)
+        engine = WatchdogEngine(self.store, systemd, clock=self.clock.model())
+        engine.reconcile_pending(current)
+        engine.reconcile_pending(current)
         restored = self.store.get_state(current.profile_id, current.service_name, current.kharej_ip)
         self.assertIsNone(restored.pending_action)
+        self.assertTrue(restored.stopped_by_watchdog)
+        self.assertFalse(restored.stopped_by_maintenance)
+        self.assertFalse(systemd.active)
+        self.assertEqual(len([call for call in systemd.calls if call[0] == "stop"]), 1)
+
+    def test_crash_before_maintenance_stop_executes_once_and_finalizes_owner(self) -> None:
+        current = managed_profile(mode="monitor")
+        self._persist_pending(current, "stop_maintenance", maintenance=True)
+        systemd = FakeSystemd(True)
+        engine = WatchdogEngine(self.store, systemd, clock=self.clock.model())
+        engine.reconcile_pending(current)
+        engine.reconcile_pending(current)
+        restored = self.store.get_state(
+            current.profile_id, current.service_name, current.kharej_ip
+        )
+        self.assertTrue(restored.maintenance)
+        self.assertTrue(restored.stopped_by_maintenance)
         self.assertFalse(restored.stopped_by_watchdog)
-        self.assertFalse(any(call[0] in {"stop", "start"} for call in systemd.calls))
+        self.assertIsNone(restored.pending_action)
+        self.assertEqual(len([call for call in systemd.calls if call[0] == "stop"]), 1)
+
+    def test_pending_stops_already_inactive_finalize_without_repeating_stop(self) -> None:
+        cases = (
+            (managed_profile("iran-1"), "stop_watchdog", True, False),
+            (managed_profile("iran-2", mode="monitor"), "stop_maintenance", False, True),
+        )
+        for current, action, watchdog_owned, maintenance_owned in cases:
+            with self.subTest(action=action):
+                self._persist_pending(current, action, maintenance=maintenance_owned)
+                systemd = FakeSystemd(False)
+                engine = WatchdogEngine(self.store, systemd, clock=self.clock.model())
+                engine.reconcile_pending(current)
+                engine.reconcile_pending(current)
+                restored = self.store.all_states()[current.profile_id]
+                self.assertEqual(restored.stopped_by_watchdog, watchdog_owned)
+                self.assertEqual(restored.stopped_by_maintenance, maintenance_owned)
+                self.assertIsNone(restored.pending_action)
+                self.assertFalse(any(call[0] == "stop" for call in systemd.calls))
+
+    def _assert_resumed_start(
+        self,
+        action: str,
+        *,
+        watchdog_owned: bool = False,
+        maintenance_owned: bool = False,
+        maintenance: bool = False,
+    ) -> None:
+        current = managed_profile(mode="disabled")
+        self._persist_pending(
+            current,
+            action,
+            watchdog_owned=watchdog_owned,
+            maintenance_owned=maintenance_owned,
+            maintenance=maintenance,
+        )
+        systemd = FakeSystemd(False)
+        engine = WatchdogEngine(self.store, systemd, clock=self.clock.model())
+        engine.reconcile_pending(current)
+        engine.reconcile_pending(current)
+        restored = self.store.get_state(
+            current.profile_id, current.service_name, current.kharej_ip
+        )
+        self.assertTrue(systemd.active)
+        self.assertFalse(restored.stopped_by_watchdog)
+        self.assertFalse(restored.stopped_by_maintenance)
+        self.assertFalse(restored.manual_override)
+        self.assertIsNone(restored.pending_action)
+        self.assertEqual(len([call for call in systemd.calls if call[0] == "start"]), 1)
+
+    def test_crash_before_watchdog_start_executes_once_and_clears_owner(self) -> None:
+        self._assert_resumed_start("start_watchdog", watchdog_owned=True)
+
+    def test_crash_before_maintenance_start_executes_once_and_exits_maintenance(self) -> None:
+        self._assert_resumed_start(
+            "start_maintenance", maintenance_owned=True, maintenance=True
+        )
+        restored = self.store.all_states()["iran-1"]
+        self.assertFalse(restored.maintenance)
+
+    def test_crash_before_operator_start_executes_once_and_clears_owner(self) -> None:
+        self._assert_resumed_start("start_operator", watchdog_owned=True)
+
+    def test_pending_starts_already_active_finalize_without_repeating_start(self) -> None:
+        cases = (
+            (managed_profile("iran-1"), "start_watchdog", True, False, False),
+            (managed_profile("iran-2", mode="monitor"), "start_maintenance", False, True, True),
+            (managed_profile("iran-3", mode="disabled"), "start_operator", True, False, False),
+        )
+        for current, action, watchdog_owned, maintenance_owned, maintenance in cases:
+            with self.subTest(action=action):
+                self._persist_pending(
+                    current,
+                    action,
+                    watchdog_owned=watchdog_owned,
+                    maintenance_owned=maintenance_owned,
+                    maintenance=maintenance,
+                )
+                systemd = FakeSystemd(True)
+                engine = WatchdogEngine(self.store, systemd, clock=self.clock.model())
+                engine.reconcile_pending(current)
+                engine.reconcile_pending(current)
+                restored = self.store.all_states()[current.profile_id]
+                self.assertFalse(restored.stopped_by_watchdog)
+                self.assertFalse(restored.stopped_by_maintenance)
+                self.assertIsNone(restored.pending_action)
+                self.assertFalse(any(call[0] == "start" for call in systemd.calls))
+
+    def test_failed_resumed_start_is_not_retried(self) -> None:
+        current = managed_profile()
+        self._persist_pending(current, "start_watchdog", watchdog_owned=True)
+        systemd = FakeSystemd(False)
+        systemd.start_success = False
+        engine = WatchdogEngine(self.store, systemd, clock=self.clock.model())
+        engine.reconcile_pending(current)
+        engine.reconcile_pending(current)
+        restored = self.store.all_states()["iran-1"]
+        self.assertTrue(restored.manual_override)
+        self.assertTrue(restored.stopped_by_watchdog)
+        self.assertIsNone(restored.pending_action)
+        self.assertEqual(len([call for call in systemd.calls if call[0] == "start"]), 1)
+        self.assertEqual(len(self._action_errors()), 1)
+        self.assertEqual(self._action_errors()[0]["error_category"], "start_failed")
+
+    def test_failed_resumed_stop_is_not_retried(self) -> None:
+        current = managed_profile()
+        self._persist_pending(current, "stop_watchdog")
+        systemd = FakeSystemd(True)
+        systemd.stop_success = False
+        engine = WatchdogEngine(self.store, systemd, clock=self.clock.model())
+        engine.reconcile_pending(current)
+        engine.reconcile_pending(current)
+        restored = self.store.all_states()["iran-1"]
+        self.assertTrue(restored.manual_override)
+        self.assertFalse(restored.stopped_by_watchdog)
+        self.assertIsNone(restored.pending_action)
+        self.assertEqual(len([call for call in systemd.calls if call[0] == "stop"]), 1)
+        self.assertEqual(len(self._action_errors()), 1)
+        self.assertEqual(self._action_errors()[0]["error_category"], "stop_failed")
+
+    def test_pending_action_rejects_non_iran_units_before_systemd(self) -> None:
+        current = managed_profile()
+        self._persist_pending(current, "start_watchdog", watchdog_owned=True)
+        for service_name in (
+            "gost-kharej-1.service",
+            "ssh.service",
+            "gost-iran-0.service",
+            "gost-iran-2.service",
+        ):
+            invalid = ManagedProfile(
+                profile_id=current.profile_id,
+                service_name=service_name,
+                kharej_ip=current.kharej_ip,
+                env_path=current.env_path,
+                unit_path=current.unit_path,
+                config_path=current.config_path,
+                config=current.config,
+            )
+            systemd = FakeSystemd(False)
+            with self.subTest(service_name=service_name), self.assertRaises(ValueError):
+                WatchdogEngine(
+                    self.store, systemd, clock=self.clock.model()
+                ).reconcile_pending(invalid)
+            self.assertEqual(systemd.calls, [])
+
+    def test_monitor_and_disabled_modes_reconcile_before_ping_selection(self) -> None:
+        monitor = managed_profile(mode="monitor")
+        disabled = managed_profile("iran-2", mode="disabled")
+        self._persist_pending(monitor, "stop_maintenance", maintenance=True)
+        self._persist_pending(disabled, "start_operator", watchdog_owned=True)
+        systemd = FakeSystemd(True)
+        service_active = {
+            monitor.service_name: True,
+            disabled.service_name: False,
+        }
+
+        def is_active(service: str) -> bool:
+            validate_service_name(service)
+            systemd.calls.append(("is-active", service))
+            return service_active[service]
+
+        def stop(service: str) -> bool:
+            validate_service_name(service)
+            systemd.calls.append(("stop", service))
+            service_active[service] = False
+            return True
+
+        def start(service: str) -> bool:
+            validate_service_name(service)
+            systemd.calls.append(("start", service))
+            service_active[service] = True
+            return True
+
+        systemd.is_active = is_active  # type: ignore[method-assign]
+        systemd.stop = stop  # type: ignore[method-assign]
+        systemd.start = start  # type: ignore[method-assign]
+        ping_calls: list[str] = []
+
+        class Loader:
+            def load(
+                self,
+            ) -> tuple[list[ManagedProfile], list[tuple[str | None, str]], int]:
+                return [monitor, disabled], [], 2
+
+        daemon = WatchdogDaemon(
+            self.store,
+            Loader(),  # type: ignore[arg-type]
+            engine=WatchdogEngine(self.store, systemd, clock=self.clock.model()),
+            ping_executor=lambda ip, _timeout: ping_calls.append(ip) is None,
+            clock=self.clock.model(),
+        )
+        daemon.run_cycle()
+        self.assertEqual(ping_calls, [monitor.kharej_ip])
+        self.assertEqual(
+            [call for call in systemd.calls if call[0] in {"start", "stop"}],
+            [
+                ("stop", monitor.service_name),
+                ("start", disabled.service_name),
+            ],
+        )
+        states = self.store.all_states()
+        self.assertTrue(states[monitor.profile_id].stopped_by_maintenance)
+        self.assertIsNone(states[monitor.profile_id].pending_action)
+        self.assertFalse(states[disabled.profile_id].stopped_by_watchdog)
+        self.assertIsNone(states[disabled.profile_id].pending_action)
 
     def test_successful_stop_with_failed_final_persist_is_compensated(self) -> None:
         systemd = FakeSystemd(True)

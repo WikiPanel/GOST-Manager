@@ -52,10 +52,17 @@ States are `unknown`, `healthy`, `degraded`, `down`, `recovering`, and
 Auto Protect stops an active profile once at the failure threshold. It first
 persists a durable action intent, queries the exact service immediately before
 the action, verifies the result, and then finalizes ownership. A restart
-reconciles unfinished intents. If the final ownership write fails after a stop,
-Watchdog attempts one safe compensating start; a failed compensation leaves the
-durable intent available for deterministic restart reconciliation. An already
-inactive profile is never newly claimed or started later.
+reconciles unfinished stop and start intents for every valid profile before Ping
+scheduling, including Monitor and Disabled profiles. Reconciliation either
+observes that the exact intended state already exists or executes the persisted
+action once, verifies the result, finalizes matching ownership, and clears the
+intent. A failed resumed action records one safe bounded event, enters manual
+override, clears the intent, and is not retried each cycle. Disabled profiles
+never run Ping; only a previously authorized durable action may be completed.
+If the final ownership write fails after a stop, Watchdog attempts one safe
+compensating start; a failed compensation leaves the durable intent available
+for deterministic restart reconciliation. No Kharej or arbitrary unit can be
+targeted.
 
 A Watchdog-owned stop continues to receive checks. It is started once only
 after the success threshold, full hold, bounded jitter, and a final healthy
@@ -154,6 +161,13 @@ validation, ownership, scheduling, or secret-handling rules.
 6. Perform a controlled Kharej shutdown.
 7. Confirm the profile stops after about 20 seconds, Iran host sockets remain bounded, checks continue while stopped, recovery starts the profile after qualification, and no server reboot is required.
 8. Roll out gradually to remaining profiles.
+
+During the 24-hour one-profile Monitor Only observation, record the Watchdog
+database and WAL sizes, disk write rate, daemon CPU and RSS, Ping subprocess
+rate, and systemctl subprocess rate. With ten profiles at the two-second
+default, the current per-profile state write can reach five SQLite transactions
+per second. That write rate is not a correctness blocker for the one-profile
+staging observation, but it must be measured before enabling all profiles.
 
 ## Rollback
 

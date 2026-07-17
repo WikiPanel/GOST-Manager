@@ -120,7 +120,19 @@ class WatchdogDaemon:
             self._record_errors([(None, "invalid_global_config")], wall_now)
             return monotonic_now + 2.0
         cycle_errors = list(errors)
-        active = [profile for profile in profiles if profile.config.mode != "disabled"]
+        reconciliation_failed: set[str] = set()
+        for profile in profiles:
+            try:
+                self.engine.reconcile_pending(profile)
+            except Exception:
+                reconciliation_failed.add(profile.profile_id)
+                cycle_errors.append((profile.profile_id, "runtime_error"))
+        active = [
+            profile
+            for profile in profiles
+            if profile.config.mode != "disabled"
+            and profile.profile_id not in reconciliation_failed
+        ]
         active_ids = {profile.profile_id for profile in active}
         self.next_due = {
             profile_id: deadline

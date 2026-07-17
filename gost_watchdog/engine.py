@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 from gost_watchdog.commands import CommandError, SystemdController
 from gost_watchdog.models import (
+    PENDING_ACTIONS,
     SERVICE_RECONCILIATION_INTERVAL_SECONDS,
     Clock,
     ManagedProfile,
@@ -14,6 +15,7 @@ from gost_watchdog.models import (
     ProfileState,
     WatchdogEvent,
 )
+from gost_watchdog.profiles import validate_profile_id, validate_service_name
 from gost_watchdog.storage import WatchdogStore
 
 
@@ -64,6 +66,101 @@ class DurableServiceActions:
         self.store.persist(state, events, now)
         events.clear()
 
+    @staticmethod
+    def _fail_pending(
+        state: ProfileState,
+        events: list[WatchdogEvent],
+        now: int,
+        error_category: str,
+    ) -> None:
+        state.manual_override = True
+        state.pending_action = None
+        state.pending_action_at = None
+        events.append(
+            _event(
+                state,
+                "watchdog_action_error",
+                now,
+                action_result="failed",
+                error_category=error_category,
+            )
+        )
+
+    @staticmethod
+    def _finalize_pending_stop(
+        action: str,
+        state: ProfileState,
+        events: list[WatchdogEvent],
+        now: int,
+    ) -> None:
+        state.stopped_by_watchdog = action == "stop_watchdog"
+        state.stopped_by_maintenance = action == "stop_maintenance"
+        state.last_service_active = False
+        if action == "stop_watchdog":
+            events.append(
+                _event(
+                    state,
+                    "watchdog_profile_stopped",
+                    now,
+                    action_result="intent_reconciled",
+                )
+            )
+            return
+        state.maintenance = True
+        events.append(
+            _event(
+                state,
+                "watchdog_maintenance_enabled",
+                now,
+                previous_state=state.health_state,
+                new_state="maintenance",
+                action_result="maintenance_stop",
+            )
+        )
+
+    @staticmethod
+    def _finalize_pending_start(
+        action: str,
+        state: ProfileState,
+        events: list[WatchdogEvent],
+        now: int,
+    ) -> None:
+        state.stopped_by_watchdog = False
+        state.stopped_by_maintenance = False
+        state.manual_override = False
+        state.last_service_active = True
+        if action == "start_watchdog":
+            events.append(
+                _event(
+                    state,
+                    "watchdog_profile_started",
+                    now,
+                    action_result="intent_reconciled",
+                )
+            )
+            return
+        if action == "start_maintenance":
+            state.maintenance = False
+            events.append(
+                _event(
+                    state,
+                    "watchdog_maintenance_disabled",
+                    now,
+                    previous_state="maintenance",
+                    new_state=state.health_state,
+                    action_result="maintenance_exit_start",
+                )
+            )
+            return
+        events.append(
+            _event(
+                state,
+                "watchdog_mode_change_start",
+                now,
+                action_result="operator_start",
+            )
+        )
+
     def reconcile_pending(
         self,
         profile: ManagedProfile,
@@ -74,56 +171,47 @@ class DurableServiceActions:
         action = state.pending_action
         if action is None:
             return
-        active = self.systemd.is_active(profile.service_name)
+        if action not in PENDING_ACTIONS:
+            raise ValueError("invalid pending Watchdog action")
+        validate_profile_id(profile.profile_id)
+        validate_service_name(profile.service_name)
+        if profile.service_name != f"gost-{profile.profile_id}.service":
+            raise ValueError("service does not match the managed Iran profile")
+        try:
+            active = self.systemd.is_active(profile.service_name)
+        except CommandError:
+            state.last_service_check_at = now
+            self._fail_pending(state, events, now, "service_state_unavailable")
+            self._persist(state, events, now)
+            return
         state.last_service_active = active
         state.last_service_check_at = now
-        if action == "stop_watchdog":
-            state.stopped_by_watchdog = not active
-            if not active:
-                events.append(
-                    _event(
-                        state,
-                        "watchdog_profile_stopped",
-                        now,
-                        action_result="intent_reconciled",
-                    )
-                )
-        elif action == "stop_maintenance":
-            state.stopped_by_maintenance = not active
-        elif action in {"start_watchdog", "start_maintenance", "start_operator"}:
+        if action in {"stop_watchdog", "stop_maintenance"}:
+            if active:
+                try:
+                    active = not self.systemd.stop(profile.service_name)
+                except CommandError:
+                    active = True
             if active:
                 state.stopped_by_watchdog = False
                 state.stopped_by_maintenance = False
-                state.manual_override = False
-                if action == "start_watchdog":
-                    events.append(
-                        _event(
-                            state,
-                            "watchdog_profile_started",
-                            now,
-                            action_result="intent_reconciled",
-                        )
-                    )
-                elif action == "start_operator":
-                    events.append(
-                        _event(
-                            state,
-                            "watchdog_mode_change_start",
-                            now,
-                            action_result="operator_start",
-                        )
-                    )
-            else:
-                state.manual_override = True
-                events.append(
-                    _event(
-                        state,
-                        "watchdog_action_error",
-                        now,
-                        action_result="intent_reconciled",
-                        error_category="start_failed",
-                    )
-                )
+                state.last_service_active = True
+                self._fail_pending(state, events, now, "stop_failed")
+                self._persist(state, events, now)
+                return
+            self._finalize_pending_stop(action, state, events, now)
+        else:
+            if not active:
+                try:
+                    active = self.systemd.start(profile.service_name)
+                except CommandError:
+                    active = False
+            if not active:
+                state.last_service_active = False
+                self._fail_pending(state, events, now, "start_failed")
+                self._persist(state, events, now)
+                return
+            self._finalize_pending_start(action, state, events, now)
         state.pending_action = None
         state.pending_action_at = None
         self._persist(state, events, now)
@@ -320,6 +408,15 @@ class WatchdogEngine:
 
     _event = staticmethod(_event)
 
+    def reconcile_pending(self, profile: ManagedProfile) -> ProfileState:
+        now = int(self.clock.wall())
+        state = self.store.get_state(
+            profile.profile_id, profile.service_name, profile.kharej_ip
+        )
+        if state.pending_action is not None:
+            self.actions.reconcile_pending(profile, state, [], now)
+        return state
+
     def _transition(
         self,
         state: ProfileState,
@@ -505,21 +602,19 @@ class WatchdogEngine:
     def process(
         self, profile: ManagedProfile, result: ProbeResult | bool
     ) -> ProfileState:
-        if profile.config.mode == "disabled":
-            return self.store.get_state(
-                profile.profile_id, profile.service_name, profile.kharej_ip
-            )
-        if isinstance(result, bool):
-            result = ProbeResult("success" if result else "unreachable")
         now = int(self.clock.wall())
         state = self.store.get_state(
             profile.profile_id, profile.service_name, profile.kharej_ip
         )
         events: list[WatchdogEvent] = []
+        if state.pending_action is not None:
+            self.actions.reconcile_pending(profile, state, events, now)
+        if profile.config.mode == "disabled":
+            return state
+        if isinstance(result, bool):
+            result = ProbeResult("success" if result else "unreachable")
         state.last_check_at = now
         if result.status == "probe_error":
-            if profile.config.mode == "auto" and state.pending_action is not None:
-                self.actions.reconcile_pending(profile, state, events, now)
             if (
                 state.check_status != "probe_error"
                 or state.last_probe_error_category != result.error_category

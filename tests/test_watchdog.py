@@ -588,6 +588,9 @@ class WatchdogDaemonTests(unittest.TestCase):
                 return [profile(mode="monitor")], [], 2
 
         class FailingEngine:
+            def reconcile_pending(self, _profile: ManagedProfile) -> None:
+                return None
+
             def process(self, _profile: ManagedProfile, _success: bool) -> None:
                 raise RuntimeError("fixed failure")
 
