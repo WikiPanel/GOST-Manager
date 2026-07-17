@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.0.2 - 2026-07-17
+
 - Added the central per-profile Iran Upstream Watchdog v1 with exact 2-second
   ICMP defaults, concurrent deduplicated checks, stop ownership, manual and
   maintenance protection, bounded 24-hour SQLite transition history, hardened
@@ -17,6 +19,10 @@
 - Completed durable Watchdog crash recovery so persisted stop and start intents
   execute and finalize exactly once after restart for Auto, Monitor, and
   Disabled profiles, with bounded failure handling and no Ping in Disabled mode.
+- Validated Monitor Only and Auto Protect on real Ubuntu traffic profiles,
+  including a high-traffic outage where the exact GOST service stopped at the
+  threshold, released its socket load, continued probing, and recovered once
+  after qualified health returned.
 
 ## 2.0.1 - 2026-07-14
 

@@ -2,7 +2,7 @@
 
 GOST Manager is a menu-based Bash project for installing GOST v3 and managing numbered Iran/Kharej Direct Mode tunnels with systemd on Ubuntu servers.
 
-Direct Mode is the only supported traffic mode in GOST Manager v2.0.1. The project installs the official `go-gost/gost` release artifact unchanged; GOST Manager is only an installer, configuration, and service wrapper and does not alter upstream protocol behavior. Multiple independent Iran and Kharej profiles are supported.
+Direct Mode is the only supported traffic mode in GOST Manager v2.0.2. The project installs the official `go-gost/gost` release artifact unchanged; GOST Manager is only an installer, configuration, and service wrapper and does not alter upstream protocol behavior. Multiple independent Iran and Kharej profiles are supported.
 
 NGINX Gateway and Native GOST Gateway are cancelled. There is no placeholder, hidden command, route runtime, controller, failover layer, or NGINX dependency. Direct Mode profile management supports safe create, inspect, edit, clone, restart, and delete operations without changing the independent-process traffic architecture.
 
@@ -32,10 +32,10 @@ Setup accepts both a regular `/etc/os-release` file and Ubuntu's standard
 symlink to `/usr/lib/os-release`; OS metadata is resolved within those trusted
 paths and parsed as data before any download begins.
 
-Pin an exact release with either `v2.0.1` or `2.0.1`:
+Pin an exact release with either `v2.0.2` or `2.0.2`:
 
 ```bash
-GOST_MANAGER_VERSION=v2.0.1 \
+GOST_MANAGER_VERSION=v2.0.2 \
 bash <(curl -fsSL https://raw.githubusercontent.com/WikiPanel/GOST-Manager/main/setup.sh)
 ```
 
