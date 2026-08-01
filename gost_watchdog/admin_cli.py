@@ -539,12 +539,6 @@ def command_events(
         rows = store.events(int(time.time()), profile_id=profile_id, limit=limit)
     finally:
         store.close()
-    check_modes = {
-        profile.profile_id: profile.config.check_mode
-        for profile in _profiles(context)[0]
-    }
-    for row in rows:
-        row["check_mode"] = check_modes.get(row.get("profile_id"))
     if as_json:
         print(json.dumps(rows, sort_keys=True))
     else:
@@ -570,7 +564,7 @@ def command_summary(context: Context, profile_id: str | None, as_json: bool) -> 
         output = {}
         for profile in profiles:
             values = store.summary(now, profile.profile_id)
-            values["check_mode"] = profile.config.check_mode
+            values["current_check_mode"] = profile.config.check_mode
             output[profile.profile_id] = values
     finally:
         store.close()
@@ -579,7 +573,8 @@ def command_summary(context: Context, profile_id: str | None, as_json: bool) -> 
     else:
         for current, values in output.items():
             print(
-                f"{current}: check={values['check_mode']} outages={values['outage_count']} "
+                f"{current}: current_check={values['current_check_mode']} "
+                f"outages={values['outage_count']} "
                 f"downtime={values['total_downtime_seconds']}s "
                 f"longest={values['longest_outage_seconds']}s "
                 f"stops={values['automatic_stop_count']} "

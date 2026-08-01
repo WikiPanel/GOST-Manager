@@ -35,6 +35,12 @@ Store the baseline path. Snapshot output can contain production topology and
 must remain private. Review `gost-watchdog-admin status --json` separately and
 confirm all automatic ownership and pending actions are understood.
 
+Ping-only v2.0.1 and v2.0.2 status output did not include `check_mode`. The
+snapshot tool canonicalizes only that missing legacy field to `ping`, so its
+preflight policy compares exactly with an unchanged v2.0.3 Ping policy. Explicit
+`ping` and `tcp` values are preserved; maintenance, ownership, and manual override
+remain exact comparison fields.
+
 ## 2. Pinned upgrade
 
 Install only the published pinned release:

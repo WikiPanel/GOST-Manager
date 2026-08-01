@@ -14,9 +14,12 @@
 - Added an atomic high-traffic Monitoring preset, deterministic 10,000-FD and
   overrun/recovery coverage, v2.0.1/v2.0.2-to-v2.0.3 upgrade fixtures, and an
   operator-only production snapshot, verification, soak, and rollback runbook.
-- Preserved schema version 4, existing retention, Direct Mode traffic lifecycle,
-  user configs/history, firewall state, check modes, and manual ownership. This
-  work does not enable BBR or replace adequate host RAM.
+- Added Watchdog schema v3 event-time probe modes, with safe legacy profile-event
+  backfill to Ping. Historical events no longer inherit a profile's current mode,
+  and production snapshots canonicalize missing v2.0.1/v2.0.2 modes to Ping.
+- Preserved Monitoring schema version 4, existing retention, Direct Mode traffic
+  lifecycle, user configs/history, firewall state, check modes, and manual
+  ownership. This work does not enable BBR or replace adequate host RAM.
 
 ## 2.0.2 - 2026-07-17
 

@@ -134,3 +134,8 @@ class WatchdogEvent:
     action_result: str | None = None
     outage_duration: int | None = None
     error_category: str | None = None
+    check_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.check_mode is not None and self.check_mode not in CHECK_MODES:
+            raise ValueError("invalid Watchdog event check mode")

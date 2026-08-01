@@ -111,21 +111,30 @@ capture_watchdog_policy() {
     printf 'gost-watchdog-admin is unavailable.\n' >&2
     exit 2
   fi
-  gost-watchdog-admin status --json | python3 -c '
+  gost-watchdog-admin status --json | canonicalize_watchdog_policy > \
+    "${output}/watchdog-policy.json"
+}
+
+canonicalize_watchdog_policy() {
+  python3 -c '
 import json, sys
 payload = json.load(sys.stdin)
 fields = (
     "profile_id", "mode", "check_mode", "maintenance", "manual_override",
     "stopped_by_watchdog", "stopped_by_maintenance",
 )
-rows = [
-    {key: item.get(key) for key in fields}
-    for item in payload.get("profiles", [])
-]
+rows = []
+for item in payload.get("profiles", []):
+    row = {key: item.get(key) for key in fields}
+    if row["check_mode"] is None:
+        row["check_mode"] = "ping"
+    elif row["check_mode"] not in ("ping", "tcp"):
+        raise ValueError("invalid Watchdog check mode in status output")
+    rows.append(row)
 json.dump(sorted(rows, key=lambda item: item.get("profile_id") or ""), sys.stdout,
           sort_keys=True, indent=2)
 print()
-' > "${output}/watchdog-policy.json"
+'
 }
 
 capture_snapshot() {
@@ -227,4 +236,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

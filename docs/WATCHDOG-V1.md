@@ -125,7 +125,10 @@ file with `MODE=disabled`. This safely recovers malformed content, unsafe
 permissions, symlinked profile files, and overrides made incompatible by a
 later global timing change.
 
-SQLite stores persistent state and transition/action events only. WAL, busy
+SQLite schema v3 stores persistent state and transition/action events only. Each
+profile event retains its allowlisted event-time check mode (`ping` or `tcp`);
+global events retain `NULL`. Migration backfills profile-specific events from
+Ping-only releases to `ping` without changing history or indexes. WAL, busy
 timeout, fixed safe columns, indexed bounded queries, and batched pruning are
 used. Events older than exactly 24 hours are removed. Individual probe attempts
 are not written as events, and credentials are neither loaded nor stored.
@@ -148,8 +151,10 @@ gost-watchdog-admin set-check-mode iran-1 ping
 
 Changing check mode writes only that profile's Watchdog config. It does not
 restart GOST, change Auto Protect mode, or clear manual override. `profiles`,
-`status`, JSON status, `effective`, events, and summary expose the effective
-check mode.
+`status`, JSON status, and `effective` expose the current effective check mode.
+Events expose the mode stored when each event was created. Summary labels its
+profile setting as `current_check_mode` in JSON and `current_check` in text so it
+cannot be mistaken for the mode of every aggregated historical outage.
 
 The status view includes the effective settings, service state, health state,
 maintenance/manual-override ownership, counters, timestamps, and current outage

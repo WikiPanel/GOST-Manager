@@ -31,6 +31,8 @@ def _event(
     state: ProfileState,
     code: str,
     now: int,
+    *,
+    check_mode: str,
     **values: object,
 ) -> WatchdogEvent:
     return WatchdogEvent(
@@ -46,6 +48,7 @@ def _event(
         action_result=values.get("action_result"),
         outage_duration=values.get("outage_duration"),
         error_category=values.get("error_category"),
+        check_mode=check_mode,
     )
 
 
@@ -72,6 +75,7 @@ class DurableServiceActions:
         events: list[WatchdogEvent],
         now: int,
         error_category: str,
+        check_mode: str,
     ) -> None:
         state.manual_override = True
         state.pending_action = None
@@ -81,6 +85,7 @@ class DurableServiceActions:
                 state,
                 "watchdog_action_error",
                 now,
+                check_mode=check_mode,
                 action_result="failed",
                 error_category=error_category,
             )
@@ -92,6 +97,7 @@ class DurableServiceActions:
         state: ProfileState,
         events: list[WatchdogEvent],
         now: int,
+        check_mode: str,
     ) -> None:
         state.stopped_by_watchdog = action == "stop_watchdog"
         state.stopped_by_maintenance = action == "stop_maintenance"
@@ -102,6 +108,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_profile_stopped",
                     now,
+                    check_mode=check_mode,
                     action_result="intent_reconciled",
                 )
             )
@@ -112,6 +119,7 @@ class DurableServiceActions:
                 state,
                 "watchdog_maintenance_enabled",
                 now,
+                check_mode=check_mode,
                 previous_state=state.health_state,
                 new_state="maintenance",
                 action_result="maintenance_stop",
@@ -124,6 +132,7 @@ class DurableServiceActions:
         state: ProfileState,
         events: list[WatchdogEvent],
         now: int,
+        check_mode: str,
     ) -> None:
         state.stopped_by_watchdog = False
         state.stopped_by_maintenance = False
@@ -135,6 +144,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_profile_started",
                     now,
+                    check_mode=check_mode,
                     action_result="intent_reconciled",
                 )
             )
@@ -146,6 +156,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_maintenance_disabled",
                     now,
+                    check_mode=check_mode,
                     previous_state="maintenance",
                     new_state=state.health_state,
                     action_result="maintenance_exit_start",
@@ -157,6 +168,7 @@ class DurableServiceActions:
                 state,
                 "watchdog_mode_change_start",
                 now,
+                check_mode=check_mode,
                 action_result="operator_start",
             )
         )
@@ -181,7 +193,13 @@ class DurableServiceActions:
             active = self.systemd.is_active(profile.service_name)
         except CommandError:
             state.last_service_check_at = now
-            self._fail_pending(state, events, now, "service_state_unavailable")
+            self._fail_pending(
+                state,
+                events,
+                now,
+                "service_state_unavailable",
+                profile.config.check_mode,
+            )
             self._persist(state, events, now)
             return
         state.last_service_active = active
@@ -196,10 +214,14 @@ class DurableServiceActions:
                 state.stopped_by_watchdog = False
                 state.stopped_by_maintenance = False
                 state.last_service_active = True
-                self._fail_pending(state, events, now, "stop_failed")
+                self._fail_pending(
+                    state, events, now, "stop_failed", profile.config.check_mode
+                )
                 self._persist(state, events, now)
                 return
-            self._finalize_pending_stop(action, state, events, now)
+            self._finalize_pending_stop(
+                action, state, events, now, profile.config.check_mode
+            )
         else:
             if not active:
                 try:
@@ -208,10 +230,14 @@ class DurableServiceActions:
                     active = False
             if not active:
                 state.last_service_active = False
-                self._fail_pending(state, events, now, "start_failed")
+                self._fail_pending(
+                    state, events, now, "start_failed", profile.config.check_mode
+                )
                 self._persist(state, events, now)
                 return
-            self._finalize_pending_start(action, state, events, now)
+            self._finalize_pending_start(
+                action, state, events, now, profile.config.check_mode
+            )
         state.pending_action = None
         state.pending_action_at = None
         self._persist(state, events, now)
@@ -243,6 +269,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_manual_override",
                     now,
+                    check_mode=profile.config.check_mode,
                     action_result="manual_stop",
                 )
             )
@@ -262,6 +289,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_stop_failed",
                     now,
+                    check_mode=profile.config.check_mode,
                     action_result="failed",
                     error_category="stop_failed",
                 )
@@ -280,6 +308,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_profile_stopped",
                     now,
+                    check_mode=profile.config.check_mode,
                     action_result="stopped",
                 )
             )
@@ -305,6 +334,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_action_error",
                     now,
+                    check_mode=profile.config.check_mode,
                     action_result="compensated",
                     error_category="persistence_failed",
                 )
@@ -344,6 +374,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_start_failed",
                     now,
+                    check_mode=profile.config.check_mode,
                     action_result="failed",
                     error_category="start_failed",
                 )
@@ -363,6 +394,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_profile_started",
                     now,
+                    check_mode=profile.config.check_mode,
                     action_result="started",
                 )
             )
@@ -372,6 +404,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_mode_change_start",
                     now,
+                    check_mode=profile.config.check_mode,
                     action_result="operator_start",
                 )
             )
@@ -383,6 +416,7 @@ class DurableServiceActions:
                     state,
                     "watchdog_action_error",
                     now,
+                    check_mode=profile.config.check_mode,
                     action_result="intent_reconciled",
                     error_category="persistence_failed",
                 )
@@ -419,6 +453,7 @@ class WatchdogEngine:
 
     def _transition(
         self,
+        profile: ManagedProfile,
         state: ProfileState,
         new_state: str,
         now: int,
@@ -436,6 +471,7 @@ class WatchdogEngine:
                 state,
                 STATE_EVENT[new_state],
                 now,
+                check_mode=profile.config.check_mode,
                 previous_state=previous,
                 new_state=new_state,
                 outage_duration=outage_duration,
@@ -468,6 +504,7 @@ class WatchdogEngine:
                         state,
                         "watchdog_manual_override",
                         now,
+                        check_mode=profile.config.check_mode,
                         action_result="manual_start",
                     )
                 )
@@ -483,6 +520,7 @@ class WatchdogEngine:
                         state,
                         "watchdog_manual_override",
                         now,
+                        check_mode=profile.config.check_mode,
                         action_result="manual_stop",
                     )
                 )
@@ -527,7 +565,9 @@ class WatchdogEngine:
         duration = None
         if state.outage_started_at is not None:
             duration = max(0, now - state.outage_started_at)
-        self._transition(state, "healthy", now, events, outage_duration=duration)
+        self._transition(
+            profile, state, "healthy", now, events, outage_duration=duration
+        )
         state.outage_started_at = None
         state.recovery_started_at = None
         state.recovery_ready_at = None
@@ -545,7 +585,7 @@ class WatchdogEngine:
         state.failure_count = 0
         if state.health_state in {"unknown", "degraded"}:
             state.success_count = min(state.success_count + 1, config.success_threshold)
-            self._transition(state, "healthy", now, events)
+            self._transition(profile, state, "healthy", now, events)
             return
         if state.health_state == "healthy":
             state.success_count = min(state.success_count + 1, config.success_threshold)
@@ -556,7 +596,7 @@ class WatchdogEngine:
             state.recovery_started_at = now
             state.recovery_ready_at = None
             state.recovery_jitter_seconds = 0
-            self._transition(state, "recovering", now, events)
+            self._transition(profile, state, "recovering", now, events)
         else:
             state.success_count = min(state.success_count + 1, config.success_threshold)
         if state.success_count < config.success_threshold:
@@ -584,20 +624,20 @@ class WatchdogEngine:
         state.recovery_ready_at = None
         state.recovery_jitter_seconds = 0
         if state.health_state == "recovering":
-            self._transition(state, "down", now, events)
+            self._transition(profile, state, "down", now, events)
             return
         if state.failure_count >= config.failure_threshold:
             transitioned = state.health_state != "down"
             if state.outage_started_at is None:
                 state.outage_started_at = now
-            self._transition(state, "down", now, events)
+            self._transition(profile, state, "down", now, events)
             if transitioned or (
                 profile.config.mode == "auto" and not state.stopped_by_watchdog
             ):
                 self._stop_if_owned_transition(profile, state, now, events)
             return
         if state.health_state in {"unknown", "healthy"}:
-            self._transition(state, "degraded", now, events)
+            self._transition(profile, state, "degraded", now, events)
 
     def process(
         self, profile: ManagedProfile, result: ProbeResult | bool
@@ -624,6 +664,7 @@ class WatchdogEngine:
                         state,
                         "watchdog_probe_error",
                         now,
+                        check_mode=profile.config.check_mode,
                         error_category=result.error_category,
                     )
                 )
@@ -637,6 +678,7 @@ class WatchdogEngine:
                     state,
                     "watchdog_probe_recovered",
                     now,
+                    check_mode=profile.config.check_mode,
                     error_category=state.last_probe_error_category,
                 )
             )
@@ -689,6 +731,7 @@ class MaintenanceController:
                     state,
                     "watchdog_maintenance_enabled",
                     now,
+                    check_mode=profile.config.check_mode,
                     previous_state=previous_display,
                     new_state="maintenance",
                     action_result="maintenance_stop" if action == "enter-stop" else None,
@@ -723,6 +766,7 @@ class MaintenanceController:
                     state,
                     "watchdog_maintenance_disabled",
                     now,
+                    check_mode=profile.config.check_mode,
                     previous_state=previous_display,
                     new_state=state.health_state,
                     action_result=(
@@ -781,6 +825,7 @@ class MaintenanceController:
             state,
             "watchdog_manual_override",
             now,
+            check_mode=profile.config.check_mode,
             action_result="rearmed",
         )
         self.store.persist(state, [event], now)

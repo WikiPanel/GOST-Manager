@@ -105,8 +105,14 @@ class WatchdogDaemon:
         self.reported_errors: set[tuple[str | None, str]] = set()
         self.next_prune = 0.0
 
-    def _record_errors(self, errors: Sequence[tuple[str | None, str]], now: int) -> None:
+    def _record_errors(
+        self,
+        errors: Sequence[tuple[str | None, str]],
+        now: int,
+        check_modes: dict[str, str] | None = None,
+    ) -> None:
         current = set(errors)
+        event_modes = check_modes or {}
         for profile_id, category in current - self.reported_errors:
             self.store.record_event(
                 WatchdogEvent(
@@ -114,6 +120,7 @@ class WatchdogDaemon:
                     code="watchdog_config_error",
                     profile_id=profile_id,
                     error_category=category,
+                    check_mode=event_modes.get(profile_id or ""),
                 )
             )
         self.reported_errors = current
@@ -127,6 +134,9 @@ class WatchdogDaemon:
             self._record_errors([(None, "invalid_global_config")], wall_now)
             return monotonic_now + 2.0
         cycle_errors = list(errors)
+        check_modes = {
+            profile.profile_id: profile.config.check_mode for profile in profiles
+        }
         reconciliation_failed: set[str] = set()
         for profile in profiles:
             try:
@@ -166,7 +176,7 @@ class WatchdogDaemon:
                 float(profile.config.check_interval_seconds),
                 self.clock.monotonic(),
             )
-        self._record_errors(cycle_errors, wall_now)
+        self._record_errors(cycle_errors, wall_now, check_modes)
         if monotonic_now >= self.next_prune:
             self.store.prune_events(wall_now, retention_seconds=EVENT_RETENTION_SECONDS)
             self.next_prune = monotonic_now + 60.0
