@@ -61,6 +61,7 @@ SNAPSHOT_METRICS_BY_ENTITY = {
         "cycle_status", "duration_seconds", "missed_deadlines", "source_errors_total",
         "database_size_bytes", "database_wal_size_bytes", "checkpoint_success",
         "checkpoint_duration_seconds", "last_successful_cycle_timestamp",
+        "overrun_count", "load_shedding_active", "heavy_collection_deferred",
     ),
 }
 
@@ -72,6 +73,8 @@ HEALTH_EVENT_CODES = (
     "service_state_changed", "pid_replaced",
     "listener_disappeared", "listener_returned", "sampling_gap",
     "env_parse_error", "env_parse_recovered",
+    "collection_overrun", "collection_load_shedding_entered",
+    "collection_load_shedding_recovered",
 )
 
 

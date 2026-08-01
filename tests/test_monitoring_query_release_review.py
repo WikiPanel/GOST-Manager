@@ -274,7 +274,7 @@ class CollectorMembershipEventTests(unittest.TestCase):
     def _sources(self, root: Path, mode: list[str], sample_index: list[int], monotonic: list[float]):
         def command(parts):
             if parts[0] == "ss":
-                if "-lntp" in parts and mode[0] == "empty":
+                if "-tanp" in parts and mode[0] == "empty":
                     return ""
                 return fixture("ss.txt")
             return fixture("systemd-gost.txt")
@@ -299,7 +299,12 @@ class CollectorMembershipEventTests(unittest.TestCase):
             db = str(root / "metrics.sqlite3")
             mode, sample_index, monotonic = ["valid"], [0], [10.0]
             sources = self._sources(root, mode, sample_index, monotonic)
-            config = CollectorConfig(filesystem_paths=(Path("/"), Path("/var/lib/gost-manager")))
+            config = CollectorConfig(
+                sample_interval=5.0,
+                tcp_snapshot_interval=5.0,
+                slow_sample_interval=5.0,
+                filesystem_paths=(Path("/"), Path("/var/lib/gost-manager")),
+            )
 
             def collect(ts):
                 collect_once(db, str(env), ts, sources, config)

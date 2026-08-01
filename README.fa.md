@@ -242,15 +242,31 @@ reconfigure نمی‌کند.
     gost-monitor-admin status
     gost-monitor-admin maintenance
 
+مقدارهای پیش‌فرض نصب جدید `20 / 60 / 120 / 1800` ثانیه هستند و Load
+Shedding به‌صورت پیش‌فرض فعال است. upgrade فایل config موجود را بازنویسی
+نمی‌کند. Preset پرترافیک ابتدا مقدارهای فعلی را نشان می‌دهد، backup می‌سازد،
+فایل mode-0600 را اتمیک و fsync-safe می‌نویسد و فقط با درخواست صریح Collector
+را restart می‌کند:
+
+    gost-monitor-admin config
+    gost-monitor-admin apply-preset high-traffic --restart-collector
+
+چرخه Fast فقط داده‌های حیاتی CPU، memory، load، service state و process
+identity را می‌گیرد. snapshot کامل TCP هر ۶۰ ثانیه و FD/cgroup/filesystem
+سنگین هر ۱۲۰ ثانیه اجرا می‌شود. در overrun، Fast metrics ادامه دارند، کار
+سنگین موقتاً defer می‌شود و پس از سه چرخه on-time برمی‌گردد؛ event ورود و خروج
+تکراری نمی‌شود.
+
 SQLite با schema version 4، WAL و retention محدود حفظ شده است:
 
 - raw metrics: شش ساعت؛
 - minute rollups: بیست‌وچهار ساعت؛
 - structured events: بیست‌وچهار ساعت.
 
-برای پروفایل نماینده شامل شش سرویس GOST، برآورد محافظه‌کارانه کل database
-حدود 0.451 GiB است؛ حداقل 1 GiB فضا رزرو کنید. history موجود migrate یا پاک
-نمی‌شود و rowهای generic قدیمی با retention عادی منقضی می‌شوند.
+برای پروفایل نماینده شامل شش سرویس GOST، مدل جدید روزانه 1,738,080 point،
+434,520 raw row و 783,360 rollup row نگه می‌دارد. برآورد محافظه‌کارانه کل
+database حدود 0.312 GiB است؛ حداقل 1 GiB فضا رزرو کنید. history موجود migrate
+یا پاک نمی‌شود و rowهای generic قدیمی با retention عادی منقضی می‌شوند.
 
 fixture قطعی ۱٬۰۰۰ کاربر سربار parsing، attribution، storage و scheduling را
 می‌سنجد و اثبات ظرفیت شبکه نیست. ظرفیت واقعی به CPU، kernel، NIC، encryption،
@@ -260,24 +276,36 @@ GOST، RTT، CDN و ارائه‌دهنده بستگی دارد.
 
 گزینه ۱۲ Watchdog مرکزی پروفایل‌های ایران را باز می‌کند. همه پروفایل‌ها پس از
 نصب یا upgrade در حالت `Disabled` می‌مانند و فعال‌سازی `Monitor Only` یا
-`Auto Protect` برای هر پروفایل جداگانه و صریح است. مقدارهای پیش‌فرض دقیق شامل
-Ping هر ۲ ثانیه با timeout یک ثانیه، توقف پس از ۱۰ شکست متوالی، بازیابی پس از
+`Auto Protect` برای هر پروفایل جداگانه و صریح است. Check می‌تواند `ping` یا
+`tcp` باشد و Ping برای نصب جدید و upgrade پیش‌فرض باقی می‌ماند. مقدارهای
+پیش‌فرض دقیق شامل Probe هر ۲ ثانیه با timeout یک ثانیه، توقف پس از ۱۰ شکست متوالی، بازیابی پس از
 ۱۰ موفقیت متوالی، hold ده‌ثانیه‌ای و jitter بین صفر تا ده ثانیه است.
 
 Auto Protect فقط سرویس دقیق همان ایران را متوقف می‌کند و تنها سرویسی را دوباره
 شروع می‌کند که توقف موفق آن را خودش تأیید کرده باشد. توقف دستی، manual override
-و maintenance هرگز بدون اجازه برگردانده نمی‌شوند. یک daemon مرکزی IPهای یکتای
-Kharej را هم‌زمان بررسی می‌کند؛ اشتراک هر check فقط برای IP و timeout یکسان
-انجام می‌شود. خطای محلی اجرای Ping به‌صورت `probe_error` ثبت می‌شود، counter
+و maintenance هرگز بدون اجازه برگردانده نمی‌شوند. یک daemon مرکزی Targetهای
+یکتا را هم‌زمان بررسی می‌کند؛ اشتراک هر check فقط برای mode، IP، پورت TCP در
+صورت نیاز و timeout یکسان انجام می‌شود. حالت TCP فقط `KHAREJ_IP` و
+`TUNNEL_PORT` را با Parser allowlist می‌خواند و credential یا mapping را نگه
+نمی‌دارد. خطای محلی اجرا، کمبود resource یا target نامعتبر به‌صورت
+`probe_error` ثبت می‌شود، counter
 قطعی upstream را تغییر نمی‌دهد و هرگز action ترافیکی ایجاد نمی‌کند. ownership
 هر stop/start پیش از systemd به‌صورت intent پایدار ثبت می‌شود و بررسی تغییر
 دستی سرویس cadence جداگانه ۱۰ثانیه‌ای دارد. eventهای transition/action فقط
 برای ۲۴ ساعت در SQLite جداگانه نگه داشته می‌شوند. نصب یا upgrade هیچ سرویس
 ترافیکی GOST را stop، start یا restart نمی‌کند.
 
-Ping موفق فقط دسترسی‌پذیری host را ثابت می‌کند و سلامت خود سرویس SOCKS5 خارج
-را تضمین نمی‌کند. جزئیات config، ownership، rollout کنترل‌شده و rollback در
-`docs/WATCHDOG-V1.md` آمده است.
+Ping موفق فقط دسترسی‌پذیری host را ثابت می‌کند. TCP موفق فقط بازبودن پورت را
+ثابت می‌کند و authentication یا forwarding کامل SOCKS را تضمین نمی‌کند.
+تغییر و rollback بدون restart سرویس GOST انجام می‌شود:
+
+    gost-watchdog-admin set-check-mode iran-1 tcp
+    gost-watchdog-admin set-check-mode iran-1 ping
+
+تغییر Check Mode، Manual Override را پاک نمی‌کند. جزئیات config، ownership،
+rollout کنترل‌شده و rollback در `docs/WATCHDOG-V1.md` و Runbook اپراتوری
+`docs/GM-203-PRODUCTION-RUNBOOK.md` آمده است. این بهینه‌سازی جایگزین RAM کافی
+نیست و BBR، qdisc، sysctl یا firewall را تغییر نمی‌دهد.
 
 ## حذف امن
 

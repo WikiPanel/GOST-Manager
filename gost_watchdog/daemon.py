@@ -8,7 +8,12 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from gost_watchdog.commands import SubprocessPingExecutor, SystemdController, run_ping_checks
+from gost_watchdog.commands import (
+    SubprocessPingExecutor,
+    SystemdController,
+    TcpConnectExecutor,
+    run_checks,
+)
 from gost_watchdog.config import (
     DEFAULT_GLOBAL_CONFIG_PATH,
     DEFAULT_PROFILE_CONFIG_DIR,
@@ -84,6 +89,7 @@ class WatchdogDaemon:
         *,
         engine: WatchdogEngine | None = None,
         ping_executor: Callable[[str, int], ProbeResult | bool] | None = None,
+        tcp_executor: Callable[[str, int, int], ProbeResult | bool] | None = None,
         clock: Clock = Clock(),
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -94,6 +100,7 @@ class WatchdogDaemon:
         self.systemd = SystemdController()
         self.engine = engine or WatchdogEngine(store, self.systemd, clock=clock)
         self.ping_executor = ping_executor or SubprocessPingExecutor()
+        self.tcp_executor = tcp_executor or TcpConnectExecutor()
         self.next_due: dict[str, float] = {}
         self.reported_errors: set[tuple[str | None, str]] = set()
         self.next_prune = 0.0
@@ -144,7 +151,10 @@ class WatchdogDaemon:
             for profile in active
             if monotonic_now >= self.next_due.get(profile.profile_id, monotonic_now)
         ]
-        results = run_ping_checks(due, self.ping_executor)
+        for profile in due:
+            if profile.config.check_mode == "tcp" and profile.target_error is not None:
+                cycle_errors.append((profile.profile_id, profile.target_error))
+        results = run_checks(due, self.ping_executor, self.tcp_executor)
         for profile in due:
             try:
                 self.engine.process(profile, results[profile.profile_id])

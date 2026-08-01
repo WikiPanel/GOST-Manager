@@ -14,11 +14,12 @@ from monitoring.models import Event, Metric, MetricSample, QUALITY_RANK, Tunnel
 
 SCHEMA_VERSION = 4
 DEFAULT_DB_PATH = "/var/lib/gost-manager/metrics.sqlite3"
-DEFAULT_SAMPLE_INTERVAL_SECONDS = 10.0
+DEFAULT_SAMPLE_INTERVAL_SECONDS = 20.0
 RAW_RETENTION_SECONDS = 6 * 60 * 60
 ROLLUP_RETENTION_SECONDS = 24 * 60 * 60
 EVENT_RETENTION_SECONDS = 24 * 60 * 60
 ROLLUP_BATCH_MINUTES = 240
+RETENTION_DELETE_BATCH_SIZE = 10_000
 SENSITIVE_KEY_RE = re.compile(
     r"(?:^|_)(?:pass|password|token|secret|credential|auth|username|gost_user)(?:$|_)",
     re.IGNORECASE,
@@ -850,16 +851,28 @@ def rollup_completed_minutes(
 
 
 def apply_retention(conn: sqlite3.Connection, now: int) -> None:
-    conn.execute("DELETE FROM metric_samples WHERE collected_at < ?", (now - RAW_RETENTION_SECONDS,))
-    conn.execute("DELETE FROM sample_cycles WHERE collected_at < ?", (now - RAW_RETENTION_SECONDS,))
-    conn.execute("DELETE FROM metric_points WHERE ts < ?", (now - RAW_RETENTION_SECONDS,))
+    raw_cutoff = now - RAW_RETENTION_SECONDS
+    for table, column, cutoff in (
+        ("metric_points", "ts", raw_cutoff),
+        ("metric_samples", "collected_at", raw_cutoff),
+        ("minute_rollups", "minute_start", now - ROLLUP_RETENTION_SECONDS),
+        ("events", "ts", now - EVENT_RETENTION_SECONDS),
+    ):
+        conn.execute(
+            f"DELETE FROM {table} WHERE rowid IN "
+            f"(SELECT rowid FROM {table} WHERE {column} < ? ORDER BY {column} LIMIT ?)",
+            (cutoff, RETENTION_DELETE_BATCH_SIZE),
+        )
+    # Child rows are pruned first so deleting a cycle cannot trigger an
+    # unbounded foreign-key cascade in one maintenance transaction.
     conn.execute(
-        "DELETE FROM minute_rollups WHERE minute_start < ?",
-        (now - ROLLUP_RETENTION_SECONDS,),
-    )
-    conn.execute(
-        "DELETE FROM events WHERE ts < ?",
-        (now - EVENT_RETENTION_SECONDS,),
+        "DELETE FROM sample_cycles WHERE cycle_id IN ("
+        "SELECT cycle_id FROM sample_cycles AS cycle "
+        "WHERE collected_at < ? "
+        "AND NOT EXISTS (SELECT 1 FROM metric_points WHERE metric_points.cycle_id=cycle.cycle_id) "
+        "AND NOT EXISTS (SELECT 1 FROM metric_samples WHERE metric_samples.cycle_id=cycle.cycle_id) "
+        "ORDER BY collected_at LIMIT ?)",
+        (raw_cutoff, RETENTION_DELETE_BATCH_SIZE),
     )
 
 

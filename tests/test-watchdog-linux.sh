@@ -44,7 +44,7 @@ trap cleanup EXIT
 "${SUDO[@]}" cp "${ROOT_DIR}/tests/watchdog_runtime_probe.py" "${RUNTIME}/watchdog_runtime_probe.py"
 "${SUDO[@]}" cp "${ROOT_DIR}/tests/watchdog_soak.py" "${RUNTIME}/watchdog_soak.py"
 "${SUDO[@]}" cp "${ROOT_DIR}/packaging/watchdog.conf" "${ROOT}/etc/gost-manager/watchdog.conf"
-printf 'KHAREJ_IP=127.0.0.1\n' | "${SUDO[@]}" tee "${ROOT}/etc/gost/iran-1.env" >/dev/null
+printf 'KHAREJ_IP=127.0.0.1\nTUNNEL_PORT=28420\n' | "${SUDO[@]}" tee "${ROOT}/etc/gost/iran-1.env" >/dev/null
 printf '[Service]\nExecStart=/bin/true\n' | "${SUDO[@]}" tee \
   "${ROOT}/etc/systemd/system/gost-iran-1.service" >/dev/null
 printf 'MODE=disabled\n' | "${SUDO[@]}" tee \

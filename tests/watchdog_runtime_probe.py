@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import socket
+from dataclasses import replace
 from pathlib import Path
 
-from gost_watchdog.commands import SubprocessPingExecutor
+from gost_watchdog.commands import SubprocessPingExecutor, TcpConnectExecutor, run_checks
 from gost_watchdog.daemon import RuntimeLoader, WatchdogDaemon
 from gost_watchdog.models import Clock
 from gost_watchdog.storage import WatchdogStore
@@ -64,6 +66,35 @@ def main() -> int:
     if errors or len(profiles) != 1 or profiles[0].config.mode != "disabled":
         raise RuntimeError("sandbox profile did not remain Disabled")
 
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    tcp_port = int(listener.getsockname()[1])
+    ping_calls = 0
+
+    def blocked_ping(_destination: str, _timeout: int) -> bool:
+        nonlocal ping_calls
+        ping_calls += 1
+        return False
+
+    tcp_profile = replace(
+        profiles[0],
+        tunnel_port=tcp_port,
+        target_error=None,
+        config=replace(profiles[0].config, mode="monitor", check_mode="tcp"),
+    )
+    try:
+        tcp_results = run_checks(
+            [tcp_profile],
+            blocked_ping,
+            TcpConnectExecutor(),
+        )
+    finally:
+        listener.close()
+    if tcp_results[tcp_profile.profile_id].status != "success" or ping_calls != 0:
+        raise RuntimeError("open TCP target was not healthy with Ping unavailable")
+
     def forbidden_ping(_destination: str, _timeout: int) -> object:
         raise AssertionError("Disabled profile attempted Ping")
 
@@ -96,7 +127,8 @@ def main() -> int:
     metrics = run_benchmark(state_directory)
     print(
         "WATCHDOG_RUNTIME "
-        f"ping={ping.status} af_unix=ok profiles_disabled={len(profiles)} "
+        f"ping={ping.status} tcp={tcp_results[tcp_profile.profile_id].status} "
+        f"ping_blocked_calls={ping_calls} af_unix=ok profiles_disabled={len(profiles)} "
         "traffic_actions=0 forbidden_write=blocked"
     )
     print(

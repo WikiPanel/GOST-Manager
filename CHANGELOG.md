@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Added per-profile Ping/TCP Watchdog checks while keeping Ping as the upgrade
+  and fresh-install default. TCP probes use only allowlisted `KHAREJ_IP` and
+  `TUNNEL_PORT`, deduplicate by mode/target/timeout, classify local resource and
+  configuration failures as non-actionable `probe_error`, preserve manual
+  override, and never restart GOST when check mode changes.
+- Reduced Monitoring overhead with 20/60/120/1800-second fresh-install
+  cadences, one shared TCP snapshot, Slow-only FD/socket/process/filesystem
+  work, identity-safe caches, bounded retention, and observable load shedding
+  that keeps Fast metrics running and recovers after three on-time cycles.
+- Added an atomic high-traffic Monitoring preset, deterministic 10,000-FD and
+  overrun/recovery coverage, v2.0.1/v2.0.2-to-v2.0.3 upgrade fixtures, and an
+  operator-only production snapshot, verification, soak, and rollback runbook.
+- Preserved schema version 4, existing retention, Direct Mode traffic lifecycle,
+  user configs/history, firewall state, check modes, and manual ownership. This
+  work does not enable BBR or replace adequate host RAM.
+
 ## 2.0.2 - 2026-07-17
 
 - Added the central per-profile Iran Upstream Watchdog v1 with exact 2-second

@@ -370,7 +370,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
                 mono[0] += 5
             light = [call for call in calls if call[:3] == ("ss", "-H", "-lntp")]
             full = [call for call in calls if call[:3] == ("ss", "-H", "-tanp")]
-            self.assertEqual(len(light), 6)
+            self.assertEqual(len(light), 0)
             self.assertEqual(len(full), 1)
             conn = init_db(db)
             self.assertEqual(
@@ -400,13 +400,18 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
 
             def command(parts):
                 if parts[0] == "ss":
-                    if parts[-1] == "-lntp" and malformed[0]:
+                    if parts[-1] == "-tanp" and malformed[0]:
                         return CommandResult(fixture("ss-malformed.txt"), "", 0)
                     return CommandResult(fixture("ss-gost-inbound-outbound.txt"), "", 0)
                 return fixture("systemd-gost.txt")
 
             sources = integration_sources(root, command, mono)
-            config = CollectorConfig(filesystem_paths=(Path("/"),))
+            config = CollectorConfig(
+                sample_interval=5.0,
+                tcp_snapshot_interval=5.0,
+                slow_sample_interval=5.0,
+                filesystem_paths=(Path("/"),),
+            )
             db = str(root / "metrics.sqlite3")
             collect_once(db, str(env_dir), 1000, sources, config)
             malformed[0] = True
@@ -465,7 +470,11 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
 
                 source_name = "proc_net_" + relative.split("/")[-1]
                 db = str(root / "metrics.sqlite3")
-                config = CollectorConfig(filesystem_paths=(Path("/"),))
+                config = CollectorConfig(
+                    sample_interval=5.0,
+                    tcp_snapshot_interval=5.0,
+                    filesystem_paths=(Path("/"),),
+                )
                 sources = integration_sources(root, command, mono, reader)
                 collect_once(db, str(root / "env"), 1000, sources, config)
                 conn = init_db(db)
@@ -646,7 +655,7 @@ class MonitoringTechnicalRereviewTests(unittest.TestCase):
             self.assertEqual(statvfs_calls[0], 1)
             self.assertEqual(
                 len([call for call in command_calls if call[:3] == ("ss", "-H", "-lntp")]),
-                6,
+                0,
             )
             self.assertEqual(
                 len([call for call in command_calls if call[:3] == ("ss", "-H", "-tanp")]),

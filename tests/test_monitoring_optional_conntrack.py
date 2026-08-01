@@ -107,7 +107,7 @@ class OptionalConntrackTests(unittest.TestCase):
             sources = dataclasses.replace(sources, read_text=read_text)
         config = CollectorConfig(
             sample_interval=10.0,
-            tcp_snapshot_interval=30.0,
+            tcp_snapshot_interval=10.0,
             slow_sample_interval=60.0,
             filesystem_paths=(Path("/"),),
         )

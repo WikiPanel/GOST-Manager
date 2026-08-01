@@ -3739,6 +3739,24 @@ monitor_maintenance() {
   monitor_admin maintenance
 }
 
+monitor_high_traffic_preset() {
+  local restart_choice
+  local -a arguments=(apply-preset high-traffic)
+  require_root
+  info "Current monitoring configuration:"
+  monitor_admin config
+  info "High-traffic preset: sample=20s tcp=60s slow=120s maintenance=1800s."
+  confirm "Apply the high-traffic preset with an atomic backup?" || {
+    info "Monitoring preset cancelled."
+    return 0
+  }
+  read -r -p "Restart only ${MONITOR_SERVICE} after the change? [y/N]: " restart_choice
+  if [[ "${restart_choice}" =~ ^[Yy]$ ]]; then
+    arguments+=(--restart-collector)
+  fi
+  monitor_admin "${arguments[@]}"
+}
+
 monitor_purge_history() {
   local phrase was_active=0 status database_path
   require_root
@@ -3835,6 +3853,7 @@ Advanced tools
 12) Start collector
 13) Stop collector
 14) Restart collector
+15) Apply high-traffic preset
 0) Back
 MENU
 }
@@ -3859,6 +3878,7 @@ monitoring_advanced_menu() {
       12) monitoring_service_action start ;;
       13) monitoring_service_action stop ;;
       14) monitoring_service_action restart ;;
+      15) monitor_high_traffic_preset ;;
       0) return 0 ;;
       *) info "Invalid advanced monitoring option." ;;
     esac
@@ -3922,10 +3942,11 @@ try:
     value = json.load(sys.stdin)
     keys = ("check_interval_seconds", "ping_timeout_seconds", "failure_threshold", "success_threshold", "recovery_hold_seconds", "recovery_jitter_max_seconds")
     mode = value["mode"]
+    check_mode = value["check_mode"]
     items = [value[key] for key in keys]
-    if mode not in ("disabled", "monitor", "auto") or any(type(item) is not int for item in items):
+    if mode not in ("disabled", "monitor", "auto") or check_mode not in ("ping", "tcp") or any(type(item) is not int for item in items):
         raise ValueError
-    print("\t".join([mode] + [str(item) for item in items]))
+    print("\t".join([mode, check_mode] + [str(item) for item in items]))
 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
 ')"; then
@@ -3947,9 +3968,10 @@ try:
     value = json.load(sys.stdin)
     keys = ("check_interval_seconds", "ping_timeout_seconds", "failure_threshold", "success_threshold", "recovery_hold_seconds", "recovery_jitter_max_seconds")
     items = [value[key] for key in keys]
-    if value.get("check_mode") != "ping" or any(type(item) is not int for item in items):
+    check_mode = value.get("check_mode")
+    if check_mode not in ("ping", "tcp") or any(type(item) is not int for item in items):
         raise ValueError
-    print("\t".join(str(item) for item in items))
+    print("\t".join([check_mode] + [str(item) for item in items]))
 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
 ')"; then
@@ -4070,19 +4092,19 @@ watchdog_integer() {
 }
 
 watchdog_configure_profile() {
-  local profile_id current_mode current_interval current_timeout current_failures
+  local profile_id current_mode current_check_mode current_interval current_timeout current_failures
   local current_successes current_hold current_jitter parsed
   local interval timeout failures successes hold jitter
   local -a arguments
   watchdog_select_profile || return 0
   profile_id="${WATCHDOG_SELECTED_PROFILE}"
   parsed="$(watchdog_effective_values "${profile_id}")" || return 0
-  IFS=$'\t' read -r current_mode current_interval current_timeout current_failures \
+  IFS=$'\t' read -r current_mode current_check_mode current_interval current_timeout current_failures \
     current_successes current_hold current_jitter <<< "${parsed}"
   interval="$(watchdog_integer "Check interval seconds" "${current_interval}" 1 300)" || return 0
-  timeout="$(watchdog_integer "Ping timeout seconds" "${current_timeout}" 1 60)" || return 0
+  timeout="$(watchdog_integer "Probe timeout seconds" "${current_timeout}" 1 60)" || return 0
   if ((10#${timeout} > 10#${interval})); then
-    info "Ping timeout must not exceed the check interval."
+    info "Probe timeout must not exceed the check interval."
     return 0
   fi
   failures="$(watchdog_integer "Failure threshold" "${current_failures}" 1 1000)" || return 0
@@ -4117,7 +4139,32 @@ watchdog_test_ping() {
   local profile_id
   watchdog_select_profile || return 0
   profile_id="${WATCHDOG_SELECTED_PROFILE}"
-  run_watchdog_command ping "${profile_id}"
+  run_watchdog_command probe "${profile_id}"
+}
+
+watchdog_change_check_mode() {
+  local profile_id choice check_mode
+  watchdog_select_profile || return 0
+  profile_id="${WATCHDOG_SELECTED_PROFILE}"
+  run_watchdog_command effective "${profile_id}"
+  cat <<'MENU'
+1) Ping reachability (default)
+2) TCP connect to KHAREJ_IP:TUNNEL_PORT
+3) Cancel
+MENU
+  read -r -p "Choose health-check mode: " choice
+  case "${choice}" in
+    1) check_mode=ping ;;
+    2) check_mode=tcp ;;
+    3) info "Check-mode change cancelled."; return 0 ;;
+    *) info "Invalid health-check mode."; return 0 ;;
+  esac
+  info "Changing check mode does not restart GOST or clear manual override."
+  confirm "Set ${profile_id} health check to ${check_mode}?" || {
+    info "Check-mode change cancelled."
+    return 0
+  }
+  run_watchdog_command set-check-mode "${profile_id}" "${check_mode}"
 }
 
 watchdog_maintenance_menu() {
@@ -4145,16 +4192,16 @@ MENU
 }
 
 watchdog_configure_global() {
-  local current_interval current_timeout current_failures current_successes current_hold current_jitter parsed
+  local current_check_mode current_interval current_timeout current_failures current_successes current_hold current_jitter parsed
   local interval timeout failures successes hold jitter
   local -a arguments
   parsed="$(watchdog_global_values)" || return 0
-  IFS=$'\t' read -r current_interval current_timeout current_failures \
+  IFS=$'\t' read -r current_check_mode current_interval current_timeout current_failures \
     current_successes current_hold current_jitter <<< "${parsed}"
   interval="$(watchdog_integer "Global check interval seconds" "${current_interval}" 1 300)" || return 0
-  timeout="$(watchdog_integer "Global Ping timeout seconds" "${current_timeout}" 1 60)" || return 0
+  timeout="$(watchdog_integer "Global probe timeout seconds" "${current_timeout}" 1 60)" || return 0
   if ((10#${timeout} > 10#${interval})); then
-    info "Ping timeout must not exceed the check interval."
+    info "Probe timeout must not exceed the check interval."
     return 0
   fi
   failures="$(watchdog_integer "Global failure threshold" "${current_failures}" 1 1000)" || return 0
@@ -4172,7 +4219,7 @@ watchdog_configure_global() {
     info "No global values changed."
     return 0
   fi
-  info "Global candidate: Ping every ${interval}s, timeout ${timeout}s, down after ${failures}, recover after ${successes} + ${hold}s + 0-${jitter}s."
+  info "Global candidate: ${current_check_mode} every ${interval}s, timeout ${timeout}s, down after ${failures}, recover after ${successes} + ${hold}s + 0-${jitter}s."
   confirm "Save these global Watchdog defaults?" || { info "Global change cancelled."; return 0; }
   run_watchdog_command "${arguments[@]}"
 }
@@ -4204,14 +4251,14 @@ show_watchdog_menu() {
 Upstream Watchdog
 =================
 
-Default Ping interval: 2 seconds
+Default check: Ping every 2 seconds
 
 1) Show all profile status
 2) Enable or change profile mode
 3) Disable watchdog for profile
 4) Configure profile overrides
 5) Reset profile overrides to global defaults
-6) Test profile ping
+6) Test configured profile check
 7) Maintenance mode
 8) Show last 24-hour events
 9) Show 24-hour outage summary
@@ -4219,7 +4266,8 @@ Default Ping interval: 2 seconds
 11) Show watchdog service status
 12) Restart watchdog service
 13) Re-arm manual override
-14) Back
+14) Change profile check mode (Ping/TCP)
+15) Back
 MENU
 }
 
@@ -4242,7 +4290,8 @@ watchdog_menu() {
       11) watchdog_service_status ;;
       12) watchdog_restart_service ;;
       13) watchdog_rearm_profile ;;
-      14) return 0 ;;
+      14) watchdog_change_check_mode ;;
+      15) return 0 ;;
       *) info "Invalid Upstream Watchdog option." ;;
     esac
     printf '\n'

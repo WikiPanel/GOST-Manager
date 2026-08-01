@@ -70,6 +70,13 @@ SAFE_ERROR_CATEGORIES = {
     "ping_permission_denied",
     "ping_execution_failed",
     "ping_execution_timeout",
+    "missing_tunnel_port",
+    "invalid_tunnel_port",
+    "invalid_tcp_target",
+    "tcp_name_resolution_failed",
+    "tcp_local_resource_error",
+    "tcp_socket_error",
+    "tcp_execution_failed",
     "persistence_failed",
     "compensation_failed",
 }
