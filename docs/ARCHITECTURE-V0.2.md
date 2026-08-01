@@ -106,6 +106,10 @@ with WAL, bounded retention, and concurrent read support. It does not discover
 or require NGINX and cannot start, stop, restart, reload, or reconfigure a
 traffic service.
 
+Fast host/service identity work is separated from TCP and Slow FD/process/disk
+work. A missed deadline can defer only heavy collection while Fast observations
+continue; no work queue or traffic dependency is introduced.
+
 Historical generic rows already present in a monitoring database remain
 subject to the existing retention policy. This scope reset does not change the
 schema version and does not erase history.
@@ -119,6 +123,11 @@ validated `gost-iran-N.service`. All profiles default to Disabled. It shares no
 unit lifecycle relation with traffic services and installation performs no
 traffic action. Manual ownership and maintenance rules are documented in
 `docs/WATCHDOG-V1.md`.
+
+Ping is the compatible default probe. An operator may select a TCP connect
+check per profile using only validated `KHAREJ_IP:TUNNEL_PORT`; this proves port
+reachability, not SOCKS authentication or forwarding. Probe selection does not
+change traffic service state or manual ownership.
 
 ## Managed paths
 

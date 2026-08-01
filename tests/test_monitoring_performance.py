@@ -188,7 +188,7 @@ def run_monitoring_lite_benchmark() -> dict[str, int | float]:
 
         def list_dir(path: Path) -> list[str]:
             pid = int(path.parent.name)
-            return [str(index) for index in range(400)]
+            return [str(index) for index in range(10_000)]
 
         sources = dataclasses.replace(
             integration_sources(root, command, [10.0], read_text),
@@ -264,7 +264,7 @@ class MonitoringPerformanceTests(unittest.TestCase):
             db = str(root / "metrics.sqlite3")
             sources = integration_sources(root, command, [10.0])
             config = CollectorConfig()
-            for timestamp in (1000, 1010, 1030, 1060):
+            for timestamp in (1000, 1020, 1060, 1120):
                 collect_once(db, str(env_dir), timestamp, sources, config)
             conn = init_db(db)
             counts = dict(
@@ -272,9 +272,9 @@ class MonitoringPerformanceTests(unittest.TestCase):
                     "SELECT ts,COUNT(*) FROM metric_points GROUP BY ts ORDER BY ts"
                 ).fetchall()
             )
-            fast = counts[1010]
-            full_extra = counts[1030] - fast
-            slow_extra = counts[1060] - counts[1030]
+            fast = counts[1020]
+            full_extra = counts[1060] - fast
+            slow_extra = counts[1120] - counts[1060]
             self.assertEqual(fast, REPRESENTATIVE_FAST_POINTS_PER_CYCLE)
             self.assertEqual(full_extra, REPRESENTATIVE_FULL_SOCKET_EXTRA_POINTS)
             self.assertEqual(slow_extra, REPRESENTATIVE_SLOW_EXTRA_POINTS)
@@ -284,17 +284,17 @@ class MonitoringPerformanceTests(unittest.TestCase):
         self.assertEqual(budget.raw_retention_hours, 6)
         self.assertEqual(budget.rollup_retention_days, 1)
         self.assertEqual(budget.event_retention_days, 1)
-        self.assertEqual(budget.fast_metric_points_per_day, 4_190_400)
-        self.assertEqual(budget.full_socket_metric_points_per_day, 25_920)
-        self.assertEqual(budget.slow_metric_points_per_day, 69_120)
-        self.assertEqual(budget.metric_points_per_day, 4_285_440)
-        self.assertEqual(budget.raw_metric_points, 1_071_360)
-        self.assertEqual(budget.minute_rollup_rows, 780_480)
-        self.assertEqual(budget.sample_cycle_rows, 2_160)
-        self.assertEqual(budget.metric_sample_rows, 15_120)
+        self.assertEqual(budget.fast_metric_points_per_day, 1_512_000)
+        self.assertEqual(budget.full_socket_metric_points_per_day, 172_800)
+        self.assertEqual(budget.slow_metric_points_per_day, 53_280)
+        self.assertEqual(budget.metric_points_per_day, 1_738_080)
+        self.assertEqual(budget.raw_metric_points, 434_520)
+        self.assertEqual(budget.minute_rollup_rows, 783_360)
+        self.assertEqual(budget.sample_cycle_rows, 1_080)
+        self.assertEqual(budget.metric_sample_rows, 7_560)
         self.assertEqual(budget.event_rows, 5_000)
         self.assertEqual(budget.entity_rows, 2_048)
-        self.assertAlmostEqual(budget.estimated_total_database_gib, 0.451, places=3)
+        self.assertAlmostEqual(budget.estimated_total_database_gib, 0.312, places=3)
         self.assertLess(budget.estimated_total_database_bytes, GIB)
         self.assertEqual(budget.recommended_disk_reservation_bytes, GIB)
         self.assertEqual(budget.recommended_disk_reservation_gib, 1.0)
@@ -331,7 +331,7 @@ class MonitoringPerformanceTests(unittest.TestCase):
         )
         self.assertEqual(seven_day_events.event_rows, 35_000)
         self.assertEqual(seven_day_events.event_retention_days, 7)
-        self.assertEqual(seven_day_events.minute_rollup_rows, 780_480)
+        self.assertEqual(seven_day_events.minute_rollup_rows, 783_360)
         self.assertEqual(seven_day_rollups.event_rows, 150_000)
         self.assertEqual(seven_day_rollups.event_retention_days, 30)
         self.assertEqual(
@@ -363,10 +363,10 @@ class MonitoringPerformanceTests(unittest.TestCase):
             + REPRESENTATIVE_FULL_SOCKET_EXTRA_POINTS
             + REPRESENTATIVE_SLOW_EXTRA_POINTS,
         )
-        self.assertEqual(result["projected_points_per_day"], 4_285_440)
+        self.assertEqual(result["projected_points_per_day"], 1_738_080)
         self.assertLess(result["projected_database_bytes"], GIB)
         self.assertEqual(result["missed_deadlines"], 0)
-        self.assertEqual(result["ss_executions"], 2)
+        self.assertEqual(result["ss_executions"], 1)
 
 
 if __name__ == "__main__":

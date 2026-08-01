@@ -190,6 +190,152 @@ assert_eq "shared sbin directory mode preserved" "751" "$(mode_of "${direct_root
 assert_not_contains "Direct upgrade has no traffic systemctl" "gost-iran-1.service" "${COMMAND_LOG}"
 assert_not_contains "Kharej active state has no traffic systemctl" "gost-kharej-2.service" "${COMMAND_LOG}"
 
+gm203_source="${TEST_HOME}/gm203-candidate"
+create_source_fixture "${gm203_source}"
+printf '2.0.3\n' > "${gm203_source}/VERSION"
+for previous_version in 2.0.1 2.0.2; do
+  gm203_root="${TEST_HOME}/upgrade-${previous_version}"
+  mkdir -p \
+    "${gm203_root}/usr/local/lib/gost-manager" \
+    "${gm203_root}/etc/gost" \
+    "${gm203_root}/etc/gost-manager/watchdog.d" \
+    "${gm203_root}/etc/systemd/system" \
+    "${gm203_root}/var/lib/gost-manager/watchdog" \
+    "${gm203_root}/run/gost-fixture"
+  printf '%s\n' "${previous_version}" > \
+    "${gm203_root}/usr/local/lib/gost-manager/VERSION"
+  printf '%s\n' \
+    'KHAREJ_IP=192.0.2.10' \
+    'TUNNEL_PORT=28420' \
+    'GOST_USER=upgrade-user-canary' \
+    'GOST_PASS=upgrade-password-canary' \
+    'MAPPINGS=2052:2052' > "${gm203_root}/etc/gost/iran-1.env"
+  printf '%s\n' \
+    '[Unit]' \
+    'Description=existing traffic unit' \
+    '[Service]' \
+    'ExecStart=/usr/local/lib/gost-manager/gost-run-iran.sh iran-1' > \
+    "${gm203_root}/etc/systemd/system/gost-iran-1.service"
+  cp "${ROOT_DIR}/packaging/monitoring.env" \
+    "${gm203_root}/etc/gost-manager/monitoring.env"
+  set_config_value "${gm203_root}/etc/gost-manager/monitoring.env" \
+    GOST_MONITOR_SAMPLE_INTERVAL 10
+  set_config_value "${gm203_root}/etc/gost-manager/monitoring.env" \
+    GOST_MONITOR_TCP_INTERVAL 30
+  set_config_value "${gm203_root}/etc/gost-manager/monitoring.env" \
+    GOST_MONITOR_SLOW_INTERVAL 60
+  set_config_value "${gm203_root}/etc/gost-manager/monitoring.env" \
+    GOST_MONITOR_MAINTENANCE_INTERVAL 900
+  sed '/^GOST_MONITOR_LOAD_SHEDDING=/d' \
+    "${gm203_root}/etc/gost-manager/monitoring.env" > \
+    "${gm203_root}/etc/gost-manager/monitoring.env.old"
+  mv "${gm203_root}/etc/gost-manager/monitoring.env.old" \
+    "${gm203_root}/etc/gost-manager/monitoring.env"
+  cp "${ROOT_DIR}/packaging/watchdog.conf" \
+    "${gm203_root}/etc/gost-manager/watchdog.conf"
+  printf 'MODE=auto\n' > \
+    "${gm203_root}/etc/gost-manager/watchdog.d/iran-1.conf"
+  chmod 600 \
+    "${gm203_root}/etc/gost/iran-1.env" \
+    "${gm203_root}/etc/gost-manager/monitoring.env" \
+    "${gm203_root}/etc/gost-manager/watchdog.conf" \
+    "${gm203_root}/etc/gost-manager/watchdog.d/iran-1.conf"
+  printf 'MainPID=4201\nNRestarts=3\n' > \
+    "${gm203_root}/run/gost-fixture/traffic-state"
+  printf 'table inet filter { chain input { policy accept; } }\n' > \
+    "${gm203_root}/run/gost-fixture/firewall.snapshot"
+  PYTHONPATH="${ROOT_DIR}" python3 - "${gm203_root}" <<'PY'
+import sys
+from pathlib import Path
+
+from gost_watchdog.storage import WatchdogStore
+from monitoring.models import Event
+from monitoring.schema import init_db, insert_event
+
+root = Path(sys.argv[1])
+monitor_db = root / "var/lib/gost-manager/metrics.sqlite3"
+conn = init_db(str(monitor_db))
+conn.execute("BEGIN IMMEDIATE")
+insert_event(conn, Event(1000, "info", "upgrade_history_canary", "preserved"))
+conn.commit()
+conn.close()
+
+watchdog_db = root / "var/lib/gost-manager/watchdog/watchdog.sqlite3"
+store = WatchdogStore(str(watchdog_db))
+state = store.get_state("iran-1", "gost-iran-1.service", "192.0.2.10")
+state.manual_override = True
+store.persist(state, [], 1000)
+store.close()
+PY
+  gm203_env_before="$(cksum "${gm203_root}/etc/gost/iran-1.env")"
+  gm203_unit_before="$(cksum "${gm203_root}/etc/systemd/system/gost-iran-1.service")"
+  gm203_monitor_config_before="$(cksum "${gm203_root}/etc/gost-manager/monitoring.env")"
+  gm203_watchdog_config_before="$(cksum "${gm203_root}/etc/gost-manager/watchdog.conf")"
+  gm203_profile_config_before="$(cksum "${gm203_root}/etc/gost-manager/watchdog.d/iran-1.conf")"
+  gm203_runtime_before="$(tree_digest "${gm203_root}/run/gost-fixture")"
+  rm -f \
+    "${STUB_STATE_DIR}/enabled" "${STUB_STATE_DIR}/active" \
+    "${STUB_STATE_DIR}/watchdog-enabled" "${STUB_STATE_DIR}/watchdog-active"
+  : > "${COMMAND_LOG}"
+  GOST_MANAGER_SOURCE_ROOT_TEST="${gm203_source}" \
+    run_installer "${gm203_root}" >/dev/null
+  assert_eq "${previous_version} upgrade installs candidate version" "2.0.3" \
+    "$(< "${gm203_root}/usr/local/lib/gost-manager/VERSION")"
+  assert_eq "${previous_version} upgrade preserves traffic env" \
+    "${gm203_env_before}" "$(cksum "${gm203_root}/etc/gost/iran-1.env")"
+  assert_eq "${previous_version} upgrade preserves traffic unit" \
+    "${gm203_unit_before}" "$(cksum "${gm203_root}/etc/systemd/system/gost-iran-1.service")"
+  assert_eq "${previous_version} upgrade preserves monitoring config" \
+    "${gm203_monitor_config_before}" \
+    "$(cksum "${gm203_root}/etc/gost-manager/monitoring.env")"
+  assert_eq "${previous_version} upgrade preserves Watchdog config" \
+    "${gm203_watchdog_config_before}" \
+    "$(cksum "${gm203_root}/etc/gost-manager/watchdog.conf")"
+  assert_eq "${previous_version} upgrade preserves profile mode/check defaults" \
+    "${gm203_profile_config_before}" \
+    "$(cksum "${gm203_root}/etc/gost-manager/watchdog.d/iran-1.conf")"
+  assert_eq "${previous_version} upgrade preserves PID, NRestarts, and firewall" \
+    "${gm203_runtime_before}" "$(tree_digest "${gm203_root}/run/gost-fixture")"
+  gm203_db_state="$(PYTHONPATH="${gm203_source}" python3 - "${gm203_root}" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+from gost_watchdog.config import parse_global_config, parse_profile_config
+from gost_watchdog.storage import WatchdogStore
+
+root = Path(sys.argv[1])
+conn = sqlite3.connect(root / "var/lib/gost-manager/metrics.sqlite3")
+history = conn.execute(
+    "SELECT COUNT(*) FROM events WHERE code='upgrade_history_canary'"
+).fetchone()[0]
+conn.close()
+store = WatchdogStore(str(root / "var/lib/gost-manager/watchdog/watchdog.sqlite3"))
+state = store.get_state("iran-1", "gost-iran-1.service", "192.0.2.10")
+store.close()
+global_config = parse_global_config(
+    (root / "etc/gost-manager/watchdog.conf").read_text(encoding="ascii")
+)
+profile_config = parse_profile_config(
+    (root / "etc/gost-manager/watchdog.d/iran-1.conf").read_text(encoding="ascii"),
+    global_config,
+)
+print(
+    f"{history}:{int(state.manual_override)}:"
+    f"{profile_config.mode}:{profile_config.check_mode}"
+)
+PY
+)"
+  assert_eq "${previous_version} upgrade preserves history and manual override" \
+    "1:1:auto:ping" "${gm203_db_state}"
+  assert_not_contains "${previous_version} upgrade has zero Iran actions" \
+    "gost-iran-1.service" "${COMMAND_LOG}"
+  assert_not_contains "${previous_version} upgrade has zero firewall commands" \
+    "iptables" "${COMMAND_LOG}"
+  assert_not_contains "${previous_version} upgrade has zero nft commands" \
+    "nft" "${COMMAND_LOG}"
+done
+
 alternate_root="${TEST_HOME}/alternate-db"
 mkdir -p "${alternate_root}/etc/gost-manager"
 cp "${ROOT_DIR}/packaging/monitoring.env" "${alternate_root}/etc/gost-manager/monitoring.env"
@@ -226,7 +372,7 @@ fi
 assert_absent "DB symlink rejection creates no default database" "${db_symlink_root}/var/lib/gost-manager/metrics.sqlite3"
 
 custom_config="${fresh_root}/etc/gost-manager/monitoring.env"
-sed 's/GOST_MONITOR_SAMPLE_INTERVAL=10/GOST_MONITOR_SAMPLE_INTERVAL=20/' "${custom_config}" > "${custom_config}.new"
+sed 's/GOST_MONITOR_SAMPLE_INTERVAL=20/GOST_MONITOR_SAMPLE_INTERVAL=15/' "${custom_config}" > "${custom_config}.new"
 mv "${custom_config}.new" "${custom_config}"
 chmod 600 "${custom_config}"
 custom_before="$(cksum "${custom_config}")"

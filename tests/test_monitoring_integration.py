@@ -52,7 +52,7 @@ class ConfigParserTests(unittest.TestCase):
     def test_defaults_and_custom_values(self):
         self.assertEqual(DEFAULT_CONFIG, parse_config_text(default_config_text()))
         self.assertEqual(
-            (10, 30, 60, 900),
+            (20, 60, 120, 1800),
             (
                 DEFAULT_CONFIG.sample_interval,
                 DEFAULT_CONFIG.tcp_interval,
@@ -111,6 +111,11 @@ class ConfigParserTests(unittest.TestCase):
                 if key == KEY_SAMPLE and value == maximum:
                     values[KEY_TCP] = str(maximum)
                     values[KEY_SLOW] = str(maximum)
+                if key == KEY_TCP and value < DEFAULT_CONFIG.sample_interval:
+                    values[KEY_SAMPLE] = str(value)
+                if key == KEY_SLOW and value < DEFAULT_CONFIG.tcp_interval:
+                    values[KEY_SAMPLE] = str(min(value, DEFAULT_CONFIG.sample_interval))
+                    values[KEY_TCP] = str(value)
                 if key == KEY_SLOW and value == maximum:
                     values[KEY_MAINTENANCE] = str(maximum)
                 config_from_mapping(values, require_all=True)

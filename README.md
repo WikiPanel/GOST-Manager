@@ -82,8 +82,11 @@ The local installer copies:
 - `/etc/systemd/system/gost-upstream-watchdog.service`
 
 The monitoring collector is enabled and started on a fresh install. Upgrades
-preserve a valid operator-modified monitoring config, monitoring history, and
-the collector's enabled/active state. They preserve `/etc/gost/`,
+preserve a valid operator-modified monitoring config, monitoring history,
+Watchdog configuration/history/manual override, and the collector's
+enabled/active state. They never rewrite existing profile check modes or
+perform a GOST traffic service action. Deterministic upgrade fixtures cover
+both v2.0.1 and v2.0.2 as previous versions. They preserve `/etc/gost/`,
 `/etc/gost-manager/`, `/var/lib/gost-manager/`, numbered Iran/Kharej units and
 drop-ins under `/etc/systemd/system/`, and
 `/etc/sysctl.d/99-gost-stability.conf`. Existing traffic service PIDs,
@@ -312,10 +315,11 @@ The strict root-owned mode-`0600` config contains only:
 ```text
 GOST_MONITOR_DB=/var/lib/gost-manager/metrics.sqlite3
 GOST_ENV_DIR=/etc/gost
-GOST_MONITOR_SAMPLE_INTERVAL=10
-GOST_MONITOR_TCP_INTERVAL=30
-GOST_MONITOR_SLOW_INTERVAL=60
-GOST_MONITOR_MAINTENANCE_INTERVAL=900
+GOST_MONITOR_SAMPLE_INTERVAL=20
+GOST_MONITOR_TCP_INTERVAL=60
+GOST_MONITOR_SLOW_INTERVAL=120
+GOST_MONITOR_MAINTENANCE_INTERVAL=1800
+GOST_MONITOR_LOAD_SHEDDING=1
 ```
 
 Bounds are sample 5..60 seconds; TCP 10..300 and not below sample; slow 30..900 and not below sample; maintenance 300..86400 and not below slow. The file is parsed as strict `KEY=VALUE` data and is never sourced or executed. Unknown/duplicate keys, relative paths, shell substitutions, unsafe quoting, and invalid cadence combinations are rejected before collection starts.
@@ -327,7 +331,25 @@ gost-monitor-admin config --format json
 gost-monitor-admin config --format value --field database_path
 ```
 
-SQLite remains the dependency-free, restart-safe local history store. Monitoring Lite retains 6 hours of raw points, 24 hours of minute rollups, and 24 hours of structured events. The conservative estimate for six GOST services is about 0.451 GiB, including indexes, reusable pages, WAL, and operational headroom; reserve 1 GiB. `gost-monitor-admin maintenance` runs rollup/retention in one transaction and checkpoints after commit.
+Existing config files are preserved byte-for-byte on upgrade. For an explicit
+operator change, Advanced tools offers the high-traffic preset. The equivalent
+CLI shows current/updated values, validates and backs up the mode-`0600` file,
+writes atomically with fsync, rejects unsafe paths, and restarts only the
+collector when the flag is present:
+
+```bash
+gost-monitor-admin config
+gost-monitor-admin apply-preset high-traffic --restart-collector
+```
+
+SQLite remains the dependency-free, restart-safe local history store. Monitoring Lite retains 6 hours of raw points, 24 hours of minute rollups, and 24 hours of structured events. At the new 20/60/120-second cadences, the deterministic six-service model produces 1,738,080 points/day, 434,520 retained raw rows, and 783,360 rollup rows. Its conservative total is about 0.312 GiB including auxiliary rows, indexes, reusable pages, WAL, and operational headroom; reserve at least 1 GiB. `gost-monitor-admin maintenance` runs bounded rollup/retention in one transaction and checkpoints after commit.
+
+Fast cycles collect core CPU, memory, load, service state, and process identity.
+Full socket/network work runs every 60 seconds; FD, cgroup, filesystem, and
+other expensive work runs every 120 seconds. One full socket snapshot is shared
+per due cycle. If a collection misses its deadline, observable load shedding
+keeps Fast metrics running, defers heavy work, and restores it after three
+on-time cycles. Entry, overrun, and recovery events are transition-bounded.
 
 The deterministic 1,000-user fixture validates monitoring parsing, attribution, storage, and scheduling overhead; it is not a network-capacity claim. Production throughput still depends on CPU, kernel, NIC, encryption, GOST, RTT, CDN, and the server provider.
 
@@ -339,24 +361,32 @@ The collector service has bounded restart behavior, low CPU/I/O priority, privat
 
 Option `12` opens the central per-profile Iran Upstream Watchdog. Every profile
 starts in `Disabled`; operators can select `Monitor Only` or `Auto Protect`
-independently. The exact defaults are a 2-second ICMP interval, 1-second Ping
-timeout, 10 failures before stop, 10 successes before recovery, a 10-second
+independently. Health checks can be `ping` or `tcp`; Ping remains the default
+for fresh and upgraded profiles. The exact defaults are a 2-second interval,
+1-second probe timeout, 10 failures before stop, 10 successes before recovery, a 10-second
 hold, and 0-10 seconds of jitter. Auto Protect stops only its exact active Iran
 service and auto-starts only a service whose stop it previously verified and
 owned. Manual stops, manual overrides, and maintenance are never silently
 reversed.
 
-One central daemon shares checks only for profiles with the same Kharej IP and
-Ping timeout, and retains only state-transition/action history for 24 hours in
-a dedicated SQLite database. Local Ping execution failures are reported as
-deduplicated `probe_error` transitions; they never count as upstream failures
-or cause a traffic action. Manual service reconciliation runs every 10 seconds,
+One central daemon shares checks only when mode, Kharej IP, TCP port where
+applicable, and timeout all match. TCP mode strictly reads only `KHAREJ_IP` and
+`TUNNEL_PORT`; it never retains credential or mapping values. Local execution,
+resource, and invalid-target failures are reported as deduplicated
+`probe_error` transitions; they never count as upstream failures or cause a
+traffic action. Manual service reconciliation runs every 10 seconds,
 while each actual action uses a fresh exact-unit query and durable action intent.
 Installation and update enable that daemon but leave all profiles Disabled and
 never restart, stop, or start a GOST traffic service. A successful Ping proves
-host reachability, not that the remote SOCKS5 service itself is healthy. See
+host reachability. A successful TCP connect proves only that the configured
+port accepts a connection; neither proves SOCKS authentication or forwarding.
+Change one profile without restarting GOST using
+`gost-watchdog-admin set-check-mode iran-N tcp`, and roll back with the same
+command ending in `ping`. The change never clears manual override. See
 [Upstream Watchdog v1](docs/WATCHDOG-V1.md) for configuration, rollout,
-maintenance, recovery ownership, limitations, and rollback.
+maintenance, recovery ownership, limitations, and rollback. The operator-only
+[GM-203 production runbook](docs/GM-203-PRODUCTION-RUNBOOK.md) covers pinned
+upgrade, zero-traffic verification, controlled tests, soak, and rollback.
 
 ## Safe Uninstall
 
@@ -370,7 +400,7 @@ Removal decisions are rechecked against actual post-action state. If any exact m
 
 `tests/test-systemd-linux.sh` uses the host's real `systemd-analyze verify`
 environment and temporary executable/config paths. `tests/test-watchdog-linux.sh`
-also runs a hardened transient Watchdog unit, local Ping and AF_UNIX checks, and
+also runs a hardened transient Watchdog unit, local Ping/TCP and AF_UNIX checks, and
 a ten-profile process-rate benchmark without enabling Auto Protect for a real
 traffic service. The Ubuntu 22.04/24.04 workflow runs both validations.
 

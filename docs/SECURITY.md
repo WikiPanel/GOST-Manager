@@ -36,15 +36,25 @@ The systemd service uses `EnvironmentFile` so secrets are not embedded directly 
 
 The monitoring collector parses only the Direct Mode fields needed for topology and listener checks. It may store a remote `host:port` endpoint, but it never stores env usernames, passwords, tokens, or other credentials in metrics, events, entity metadata, collector state, or exports.
 
-The Upstream Watchdog parses only `KHAREJ_IP` from exact managed Iran env files.
-It does not load credential fields. Its argv-based Ping executor never invokes
-a shell, its systemd controller accepts only exact `gost-iran-N.service` names,
-and local execution failures are stored only as fixed safe categories without
-stderr, commands, or paths. Durable action intents prevent an interrupted
+The Upstream Watchdog streams exact managed Iran env files and retains only
+`KHAREJ_IP` and `TUNNEL_PORT`; it does not retain username, password, mapping,
+or unrelated values and never sources the file. Its argv-based Ping executor
+and standard-library TCP connector never invoke a shell. TCP targets require a
+strict port in 1..65535. Its systemd controller accepts only exact
+`gost-iran-N.service` names, and local execution failures are stored only as
+fixed safe categories without stderr, commands, paths, or credentials. Durable
+action intents prevent an interrupted
 ownership write from leaving a silently unowned stop. Its dedicated 24-hour
 event store has fixed safe columns. Config/state paths are private; ordinary
 writes reject symlinks, while the explicit reset command replaces only the
 validated profile config path without following a hostile final symlink.
+
+Monitoring's high-traffic preset accepts only the managed config, rejects
+symlink traversal, untrusted ownership, and permissions broader than `0600`,
+validates before replacement, and uses a same-directory fsynced backup plus
+atomic replace. Its optional restart command names only
+`gost-monitor-collector.service`. Load shedding defers bounded heavy collection
+and never queues work or controls traffic.
 
 ## Firewall Design
 

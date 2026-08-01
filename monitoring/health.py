@@ -71,6 +71,8 @@ def _required_event_codes(
         "database_retention_recovered": ("retention", False),
         "env_parse_error": ("managed_env", True),
         "env_parse_recovered": ("managed_env", False),
+        "collection_load_shedding_entered": ("load_shedding", True),
+        "collection_load_shedding_recovered": ("load_shedding", False),
     }
     events = sorted(
         (
@@ -138,7 +140,7 @@ def _required_event_codes(
                 if (
                     active
                     and ownership is not None
-                    and ownership.get("quality") == "exact"
+                    and ownership.get("quality") in {"exact", "estimated"}
                     and ownership.get("numeric_value") == 1
                     and int(ownership.get("ts", 0)) >= event_ts
                 ):
@@ -321,9 +323,12 @@ def evaluate_services(
         elif _unavailable(process):
             status = "unknown"
             reasons.append(("process_snapshot_unavailable", "Process snapshot is unavailable"))
-        elif _unavailable(listener) or listener.get("quality") != "exact":
+        elif _unavailable(listener) or listener.get("quality") not in {"exact", "estimated"}:
             status = "unknown"
             reasons.append(("listener_ownership_unavailable", "Listener ownership is unavailable"))
+        elif float(listener.get("numeric_value") or 0) == 0 and listener.get("quality") == "estimated":
+            status = "unknown"
+            reasons.append(("listener_ownership_stale", "Cached listener ownership is not healthy"))
         elif float(listener.get("numeric_value") or 0) == 0:
             status = "down"
             reasons.append(("required_listener_missing", "No listener is owned by the active service"))
@@ -372,9 +377,12 @@ def evaluate_tunnels(
         elif active and active.get("quality") != "exact":
             status = "unknown"
             reasons.append(("service_state_not_authoritative", "Tunnel service state is not authoritative"))
-        elif _unavailable(ownership) or ownership.get("quality") != "exact":
+        elif _unavailable(ownership) or ownership.get("quality") not in {"exact", "estimated"}:
             status = "unknown"
             reasons.append(("listener_ownership_unavailable", "Listener ownership is unavailable"))
+        elif float(ownership.get("numeric_value") or 0) == 0 and ownership.get("quality") == "estimated":
+            status = "unknown"
+            reasons.append(("listener_ownership_stale", "Cached listener ownership is not healthy"))
         elif float(ownership.get("numeric_value") or 0) == 0 and ownership.get("quality") == "exact":
             status = "down"
             reasons.append(("listener_missing", "Configured tunnel listener is missing"))

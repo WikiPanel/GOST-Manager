@@ -146,6 +146,13 @@ Opens local optional Monitoring Lite with live, 10-minute, 30-minute, and
 tunnels, and collector. Monitoring has no traffic-path dependency and cannot
 change a tunnel service.
 
+Fresh installs use 20-second Fast, 60-second TCP, 120-second Slow, and
+1800-second maintenance intervals with load shedding enabled. Existing configs
+are preserved on upgrade. Under `Advanced tools`, `Apply high-traffic preset`
+shows the current values, creates an atomic backup, and asks separately before
+restarting only `gost-monitor-collector.service`. The noninteractive equivalent
+is `gost-monitor-admin apply-preset high-traffic [--restart-collector]`.
+
 ## 11) Server Stability
 
 Runs the complete host-stability check, applies the managed sysctl profile,
@@ -157,7 +164,12 @@ services whose new limits require a later operator-scheduled restart.
 
 ## 12) Upstream Watchdog
 
-Opens status, per-profile Disabled/Monitor Only/Auto Protect modes, safe
-overrides, Ping testing, maintenance, 24-hour events/summary, global defaults,
-central service controls, and manual-override re-arming. All profiles default
-to Disabled. See `docs/WATCHDOG-V1.md` before enabling Auto Protect.
+Opens status, per-profile Disabled/Monitor Only/Auto Protect modes, Ping or TCP
+health checks, safe overrides, probe testing, maintenance, 24-hour
+events/summary, global defaults, central service controls, and manual-override
+re-arming. All profiles default to Disabled and Ping; upgrades do not change
+existing modes. Select one profile's check using
+`gost-watchdog-admin set-check-mode iran-N tcp` and return with `ping`. A TCP
+success proves only port reachability, not SOCKS authentication or forwarding.
+Changing check mode never restarts GOST or clears manual override. See
+`docs/WATCHDOG-V1.md` before enabling Auto Protect.

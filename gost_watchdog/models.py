@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 
 CHECK_MODE = "ping"
+CHECK_MODES = ("ping", "tcp")
 CHECK_INTERVAL_SECONDS = 2
 PING_TIMEOUT_SECONDS = 1
 FAILURE_THRESHOLD = 10
@@ -16,6 +17,7 @@ RECOVERY_HOLD_SECONDS = 10
 RECOVERY_JITTER_MAX_SECONDS = 10
 EVENT_RETENTION_SECONDS = 24 * 60 * 60
 MAX_PING_WORKERS = 32
+MAX_PROBE_WORKERS = MAX_PING_WORKERS
 SERVICE_RECONCILIATION_INTERVAL_SECONDS = 10
 
 MODES = ("disabled", "monitor", "auto")
@@ -52,6 +54,7 @@ class GlobalConfig:
 @dataclasses.dataclass(frozen=True)
 class ProfileConfig:
     mode: str = "disabled"
+    check_mode: str = CHECK_MODE
     check_interval_seconds: int = CHECK_INTERVAL_SECONDS
     ping_timeout_seconds: int = PING_TIMEOUT_SECONDS
     failure_threshold: int = FAILURE_THRESHOLD
@@ -69,6 +72,8 @@ class ManagedProfile:
     unit_path: str
     config_path: str
     config: ProfileConfig
+    tunnel_port: int | None = None
+    target_error: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,3 +134,8 @@ class WatchdogEvent:
     action_result: str | None = None
     outage_duration: int | None = None
     error_category: str | None = None
+    check_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.check_mode is not None and self.check_mode not in CHECK_MODES:
+            raise ValueError("invalid Watchdog event check mode")

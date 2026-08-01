@@ -8,7 +8,12 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from gost_watchdog.commands import SubprocessPingExecutor, SystemdController, run_ping_checks
+from gost_watchdog.commands import (
+    SubprocessPingExecutor,
+    SystemdController,
+    TcpConnectExecutor,
+    run_checks,
+)
 from gost_watchdog.config import (
     DEFAULT_GLOBAL_CONFIG_PATH,
     DEFAULT_PROFILE_CONFIG_DIR,
@@ -84,6 +89,7 @@ class WatchdogDaemon:
         *,
         engine: WatchdogEngine | None = None,
         ping_executor: Callable[[str, int], ProbeResult | bool] | None = None,
+        tcp_executor: Callable[[str, int, int], ProbeResult | bool] | None = None,
         clock: Clock = Clock(),
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -94,12 +100,19 @@ class WatchdogDaemon:
         self.systemd = SystemdController()
         self.engine = engine or WatchdogEngine(store, self.systemd, clock=clock)
         self.ping_executor = ping_executor or SubprocessPingExecutor()
+        self.tcp_executor = tcp_executor or TcpConnectExecutor()
         self.next_due: dict[str, float] = {}
         self.reported_errors: set[tuple[str | None, str]] = set()
         self.next_prune = 0.0
 
-    def _record_errors(self, errors: Sequence[tuple[str | None, str]], now: int) -> None:
+    def _record_errors(
+        self,
+        errors: Sequence[tuple[str | None, str]],
+        now: int,
+        check_modes: dict[str, str] | None = None,
+    ) -> None:
         current = set(errors)
+        event_modes = check_modes or {}
         for profile_id, category in current - self.reported_errors:
             self.store.record_event(
                 WatchdogEvent(
@@ -107,6 +120,7 @@ class WatchdogDaemon:
                     code="watchdog_config_error",
                     profile_id=profile_id,
                     error_category=category,
+                    check_mode=event_modes.get(profile_id or ""),
                 )
             )
         self.reported_errors = current
@@ -120,6 +134,9 @@ class WatchdogDaemon:
             self._record_errors([(None, "invalid_global_config")], wall_now)
             return monotonic_now + 2.0
         cycle_errors = list(errors)
+        check_modes = {
+            profile.profile_id: profile.config.check_mode for profile in profiles
+        }
         reconciliation_failed: set[str] = set()
         for profile in profiles:
             try:
@@ -144,7 +161,10 @@ class WatchdogDaemon:
             for profile in active
             if monotonic_now >= self.next_due.get(profile.profile_id, monotonic_now)
         ]
-        results = run_ping_checks(due, self.ping_executor)
+        for profile in due:
+            if profile.config.check_mode == "tcp" and profile.target_error is not None:
+                cycle_errors.append((profile.profile_id, profile.target_error))
+        results = run_checks(due, self.ping_executor, self.tcp_executor)
         for profile in due:
             try:
                 self.engine.process(profile, results[profile.profile_id])
@@ -156,7 +176,7 @@ class WatchdogDaemon:
                 float(profile.config.check_interval_seconds),
                 self.clock.monotonic(),
             )
-        self._record_errors(cycle_errors, wall_now)
+        self._record_errors(cycle_errors, wall_now, check_modes)
         if monotonic_now >= self.next_prune:
             self.store.prune_events(wall_now, retention_seconds=EVENT_RETENTION_SECONDS)
             self.next_prune = monotonic_now + 60.0

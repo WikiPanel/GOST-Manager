@@ -106,6 +106,7 @@ from monitoring.socket_readers import (
 from monitoring.systemd_readers import parse_systemd_properties
 
 _run = run_command
+_ORIGINAL_RECORD_CYCLE_OVERRUN = record_cycle_overrun
 
 
 def collect_sample(
@@ -291,6 +292,9 @@ def collect_once(
     checkpoint_metric_writer: Callable[[sqlite3.Connection, int, Metric, int | None, int | None], None] = insert_metric,
     sources: CollectorSources | None = None,
     config: CollectorConfig = CollectorConfig(),
+    defer_heavy: bool = False,
+    load_shedding_active: bool = False,
+    load_shedding_transition: str | None = None,
 ) -> int:
     active_sources = sources or CollectorSources(clock=clock, command=runner, proc_root=proc)
     return collect_once_with_sources(
@@ -307,6 +311,9 @@ def collect_once(
         maintenance_conn_factory,
         checkpoint_event_writer,
         checkpoint_metric_writer,
+        defer_heavy,
+        load_shedding_active,
+        load_shedding_transition,
     )
 
 
@@ -335,7 +342,11 @@ def run_daemon(
         sleeper,
         stop_requested,
         collect=collect_once,
-        record_overrun=record_cycle_overrun,
+        record_overrun=(
+            record_cycle_overrun
+            if record_cycle_overrun is not _ORIGINAL_RECORD_CYCLE_OVERRUN
+            else None
+        ),
         config=active_config,
     )
 

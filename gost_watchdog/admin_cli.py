@@ -10,7 +10,12 @@ import sys
 import time
 from pathlib import Path
 
-from gost_watchdog.commands import CommandError, SubprocessPingExecutor, SystemdController
+from gost_watchdog.commands import (
+    CommandError,
+    SubprocessPingExecutor,
+    SystemdController,
+    TcpConnectExecutor,
+)
 from gost_watchdog.config import (
     DEFAULT_GLOBAL_CONFIG_PATH,
     DEFAULT_PROFILE_CONFIG_DIR,
@@ -26,7 +31,7 @@ from gost_watchdog.config import (
 )
 from gost_watchdog.daemon import DEFAULT_ENV_DIR, DEFAULT_UNIT_DIR
 from gost_watchdog.engine import MaintenanceController
-from gost_watchdog.models import GlobalConfig, ManagedProfile, ProfileState
+from gost_watchdog.models import CHECK_MODES, GlobalConfig, ManagedProfile, ProfileState
 from gost_watchdog.profiles import (
     ProfileError,
     discover_profiles,
@@ -164,7 +169,12 @@ def _state_dict(
     return {
         "profile_id": profile.profile_id,
         "kharej_ip": profile.kharej_ip,
+        "tunnel_port": profile.tunnel_port,
         "mode": profile.config.mode,
+        "check_mode": profile.config.check_mode,
+        "target_config_valid": (
+            profile.config.check_mode != "tcp" or profile.target_error is None
+        ),
         "watchdog_state": state.display_state,
         "service_active": service_active,
         "maintenance": state.maintenance,
@@ -178,6 +188,7 @@ def _state_dict(
         "pending_action": state.pending_action,
         "check_interval_seconds": profile.config.check_interval_seconds,
         "ping_timeout_seconds": profile.config.ping_timeout_seconds,
+        "probe_timeout_seconds": profile.config.ping_timeout_seconds,
         "failure_threshold": profile.config.failure_threshold,
         "success_threshold": profile.config.success_threshold,
         "recovery_hold_seconds": profile.config.recovery_hold_seconds,
@@ -223,11 +234,23 @@ def command_migrate(context: Context) -> int:
 
 def command_profiles(context: Context) -> int:
     profiles, errors = _profiles(context)
+    profile_errors = {
+        profile_id: category
+        for profile_id, category in errors
+        if profile_id is not None
+    }
+    discovered_ids = {profile.profile_id for profile in profiles}
     for profile in profiles:
-        print(f"{profile.profile_id}\t{profile.kharej_ip}\t{profile.config.mode}")
-    for profile_id, _category in errors:
-        if profile_id:
-            print(f"{profile_id}\tUNAVAILABLE\tdisabled")
+        target_status = profile_errors.get(profile.profile_id, "valid")
+        print(
+            f"{profile.profile_id}\t{profile.kharej_ip}\t"
+            f"{profile.config.mode}\t{profile.config.check_mode}\t{target_status}"
+        )
+    for profile_id, category in errors:
+        if profile_id and profile_id not in discovered_ids:
+            print(
+                f"{profile_id}\tUNAVAILABLE\tdisabled\tunavailable\t{category}"
+            )
     return 0
 
 
@@ -288,18 +311,20 @@ def command_status(context: Context, profile_id: str | None, as_json: bool) -> i
     if not output:
         print("No valid managed Iran profiles found.")
         return 0
-    print("PROFILE  KHAREJ IP  MODE      STATE        SERVICE   MAINT  OVERRIDE  OWNER  FAIL/SUCCESS")
+    print("PROFILE  KHAREJ IP  MODE      CHECK  STATE        SERVICE   MAINT  OVERRIDE  OWNER  FAIL/SUCCESS")
     for item in output:
         service = "unknown" if item["service_active"] is None else (
             "active" if item["service_active"] else "inactive"
         )
-        display_state = (
-            item["check_status"]
-            if item["check_status"] == "probe_error"
-            else item["watchdog_state"]
-        )
+        if not item["target_config_valid"]:
+            display_state = "config_error"
+        elif item["check_status"] == "probe_error":
+            display_state = item["check_status"]
+        else:
+            display_state = item["watchdog_state"]
         print(
             f"{item['profile_id']:<8} {item['kharej_ip']:<10} {item['mode']:<9} "
+            f"{item['check_mode']:<6} "
             f"{display_state:<12} {service:<9} "
             f"{str(item['maintenance']).lower():<6} {str(item['manual_override']).lower():<9} "
             f"{str(item['stopped_by_watchdog']).lower():<6} "
@@ -353,15 +378,41 @@ def command_set_mode(
     return 0
 
 
+def command_set_check_mode(
+    context: Context,
+    profile_id: str,
+    check_mode: str,
+) -> int:
+    profile = _profile(context, profile_id)
+    if check_mode == "tcp" and profile.target_error is not None:
+        raise AdminInputError(
+            "TCP check requires a valid TUNNEL_PORT between 1 and 65535"
+        )
+    values = _existing_profile_values(context, profile_id)
+    if profile.config.check_mode == check_mode and values.get("CHECK_MODE") == check_mode:
+        print(f"{profile_id} check mode already {check_mode}; no change")
+        return 0
+    values["CHECK_MODE"] = check_mode
+    _write_profile_values(context, profile, values)
+    print(
+        f"{profile_id} check mode set to {check_mode}; "
+        "traffic service and manual override unchanged"
+    )
+    return 0
+
+
 def command_configure_profile(context: Context, args: argparse.Namespace) -> int:
     profile = _profile(context, args.profile_id)
     if args.mode is not None and args.mode != profile.config.mode:
         raise AdminInputError(
             "mode changes must use set-mode so stopped-service ownership is handled"
         )
+    if args.check_mode is not None and args.check_mode != profile.config.check_mode:
+        raise AdminInputError("check mode changes must use set-check-mode")
     values = _existing_profile_values(context, args.profile_id)
     option_map = {
         "mode": "MODE",
+        "check_mode": "CHECK_MODE",
         "check_interval": "CHECK_INTERVAL_SECONDS",
         "ping_timeout": "PING_TIMEOUT_SECONDS",
         "failure_threshold": "FAILURE_THRESHOLD",
@@ -418,6 +469,7 @@ def command_set_global(context: Context, args: argparse.Namespace) -> int:
         "RECOVERY_JITTER_MAX_SECONDS": str(config.recovery_jitter_max_seconds),
     }
     option_map = {
+        "check_mode": "CHECK_MODE",
         "check_interval": "CHECK_INTERVAL_SECONDS",
         "ping_timeout": "PING_TIMEOUT_SECONDS",
         "failure_threshold": "FAILURE_THRESHOLD",
@@ -454,6 +506,26 @@ def command_ping(context: Context, profile_id: str) -> int:
     return 0 if result.status == "success" else 1
 
 
+def command_probe(context: Context, profile_id: str) -> int:
+    profile = _profile(context, profile_id)
+    if profile.config.check_mode == "tcp":
+        if profile.target_error is not None or profile.tunnel_port is None:
+            result_status = "probe_error"
+        else:
+            result_status = TcpConnectExecutor()(
+                profile.kharej_ip,
+                profile.tunnel_port,
+                profile.config.ping_timeout_seconds,
+            ).status
+    else:
+        result_status = SubprocessPingExecutor()(
+            profile.kharej_ip,
+            profile.config.ping_timeout_seconds,
+        ).status
+    print(f"{profile.profile_id} {profile.config.check_mode}: {result_status}")
+    return 0 if result_status == "success" else 1
+
+
 def command_events(
     context: Context,
     profile_id: str | None,
@@ -472,7 +544,8 @@ def command_events(
     else:
         for row in rows:
             print(
-                f"{row['ts']} {row['profile_id'] or '-'} {row['code']} "
+                f"{row['ts']} {row['profile_id'] or '-'} "
+                f"{row['check_mode'] or '-'} {row['code']} "
                 f"{row['previous_state'] or '-'}->{row['new_state'] or '-'} "
                 f"{row['action_result'] or '-'}"
             )
@@ -488,10 +561,11 @@ def command_summary(context: Context, profile_id: str | None, as_json: bool) -> 
     store = _open_store(context)
     now = int(time.time())
     try:
-        output = {
-            profile.profile_id: store.summary(now, profile.profile_id)
-            for profile in profiles
-        }
+        output = {}
+        for profile in profiles:
+            values = store.summary(now, profile.profile_id)
+            values["current_check_mode"] = profile.config.check_mode
+            output[profile.profile_id] = values
     finally:
         store.close()
     if as_json:
@@ -499,7 +573,8 @@ def command_summary(context: Context, profile_id: str | None, as_json: bool) -> 
     else:
         for current, values in output.items():
             print(
-                f"{current}: outages={values['outage_count']} "
+                f"{current}: current_check={values['current_check_mode']} "
+                f"outages={values['outage_count']} "
                 f"downtime={values['total_downtime_seconds']}s "
                 f"longest={values['longest_outage_seconds']}s "
                 f"stops={values['automatic_stop_count']} "
@@ -572,16 +647,23 @@ def build_parser() -> argparse.ArgumentParser:
     set_mode.add_argument(
         "--owned-action", choices=("keep-stopped", "start-if-healthy")
     )
+    set_check_mode = subparsers.add_parser("set-check-mode")
+    set_check_mode.add_argument("profile_id")
+    set_check_mode.add_argument("check_mode", choices=CHECK_MODES)
     configure = subparsers.add_parser("configure-profile")
     configure.add_argument("profile_id")
     configure.add_argument("--mode", choices=("disabled", "monitor", "auto"))
+    configure.add_argument("--check-mode", choices=CHECK_MODES)
     _add_timing_arguments(configure)
     reset = subparsers.add_parser("reset-profile")
     reset.add_argument("profile_id")
     global_parser = subparsers.add_parser("set-global")
+    global_parser.add_argument("--check-mode", choices=CHECK_MODES)
     _add_timing_arguments(global_parser)
     ping = subparsers.add_parser("ping")
     ping.add_argument("profile_id")
+    probe = subparsers.add_parser("probe")
+    probe.add_argument("profile_id")
     events = subparsers.add_parser("events")
     events.add_argument("--profile")
     events.add_argument("--limit", type=int, default=200)
@@ -617,6 +699,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return command_set_mode(
             context, args.profile_id, args.mode, args.owned_action
         )
+    if args.command == "set-check-mode":
+        return command_set_check_mode(context, args.profile_id, args.check_mode)
     if args.command == "configure-profile":
         return command_configure_profile(context, args)
     if args.command == "reset-profile":
@@ -625,6 +709,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return command_set_global(context, args)
     if args.command == "ping":
         return command_ping(context, args.profile_id)
+    if args.command == "probe":
+        return command_probe(context, args.profile_id)
     if args.command == "events":
         return command_events(context, args.profile, args.limit, args.json)
     if args.command == "summary":

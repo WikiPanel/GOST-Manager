@@ -131,6 +131,25 @@ password retains the secret, a no-op writes nothing, and declining restart
 prints `restart required`. Clone requires new conflict-free local ports and
 never changes the source profile.
 
+## Monitoring
+
+Fresh installs use Fast/TCP/Slow/maintenance intervals of
+`20 / 60 / 120 / 1800` seconds and enable bounded load shedding. Upgrades
+preserve the existing mode-`0600` config unchanged. For a high-traffic host,
+inspect current values and apply the atomic preset explicitly:
+
+```bash
+sudo gost-monitor-admin config
+sudo gost-monitor-admin apply-preset high-traffic --restart-collector
+```
+
+The command backs up and validates the config, rejects unsafe paths, and
+restarts only `gost-monitor-collector.service`. Repeating an already-applied
+preset is a no-op. If load shedding is active, Fast metrics continue while TCP,
+Slow, and maintenance work is deferred; full collection returns after three
+on-time cycles. Treat persistent overruns as a host-capacity problem, not a
+reason to tune BBR/qdisc/sysctl or traffic services automatically.
+
 ## Server Stability
 
 Choose `11) Server Stability` to inspect and apply the bounded host stability
@@ -157,10 +176,19 @@ install, then follow the Monitor Only canary and controlled rollout in
 stops one affected Iran profile only after 10 consecutive failures, and starts
 only a verified Watchdog-owned stop after recovery qualification.
 
+Ping remains the default after fresh install and upgrade. TCP mode connects to
+the allowlisted `KHAREJ_IP:TUNNEL_PORT` target and proves port reachability only,
+not SOCKS authentication or forwarding. Use
+`gost-watchdog-admin set-check-mode iran-N tcp`; return to Ping with the same
+command ending in `ping`. Invalid TCP target or local socket resource failure is
+`probe_error`, never an upstream failure or traffic action.
+
 Use maintenance before an operator-planned service action. A manual state
 mismatch suspends automatic actions until `Re-arm manual override`; do not
 re-arm until the operator's intended service state is confirmed. History and
-the outage summary cover the last 24 hours only.
+the outage summary cover the last 24 hours only. Changing check mode does not
+clear manual override or restart GOST. Production upgrade, controlled-test,
+soak, and rollback steps are in `docs/GM-203-PRODUCTION-RUNBOOK.md`.
 
 ## Recovery If Service Fails
 

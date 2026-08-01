@@ -10,6 +10,7 @@ from pathlib import Path
 
 from gost_watchdog.models import (
     EVENT_RETENTION_SECONDS,
+    CHECK_MODES,
     CHECK_STATUSES,
     HEALTH_STATES,
     PENDING_ACTIONS,
@@ -18,7 +19,7 @@ from gost_watchdog.models import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_DB_PATH = "/var/lib/gost-manager/watchdog/watchdog.sqlite3"
 EVENT_CODES = {
     "watchdog_degraded",
@@ -70,6 +71,13 @@ SAFE_ERROR_CATEGORIES = {
     "ping_permission_denied",
     "ping_execution_failed",
     "ping_execution_timeout",
+    "missing_tunnel_port",
+    "invalid_tunnel_port",
+    "invalid_tcp_target",
+    "tcp_name_resolution_failed",
+    "tcp_local_resource_error",
+    "tcp_socket_error",
+    "tcp_execution_failed",
     "persistence_failed",
     "compensation_failed",
 }
@@ -140,8 +148,22 @@ def migrate_database(path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             "event_id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER NOT NULL,code TEXT NOT NULL,"
             "profile_id TEXT,service_name TEXT,kharej_ip TEXT,previous_state TEXT,new_state TEXT,"
             "failure_count INTEGER NOT NULL DEFAULT 0,success_count INTEGER NOT NULL DEFAULT 0,"
-            "action_result TEXT,outage_duration INTEGER,error_category TEXT)"
+            "action_result TEXT,outage_duration INTEGER,error_category TEXT,"
+            "check_mode TEXT CHECK(check_mode IS NULL OR check_mode IN('ping','tcp')))"
         )
+        event_columns = {
+            str(item[1]) for item in conn.execute("PRAGMA table_info(events)")
+        }
+        if "check_mode" not in event_columns:
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN check_mode TEXT "
+                "CHECK(check_mode IS NULL OR check_mode IN('ping','tcp'))"
+            )
+        if version < 3:
+            conn.execute(
+                "UPDATE events SET check_mode='ping' "
+                "WHERE profile_id IS NOT NULL AND check_mode IS NULL"
+            )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_watchdog_events_ts ON events(ts)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_watchdog_events_profile_ts "
@@ -273,10 +295,12 @@ class WatchdogStore:
             raise ValueError("unsafe Watchdog action result")
         if event.error_category not in SAFE_ERROR_CATEGORIES:
             raise ValueError("unsafe Watchdog error category")
+        if event.check_mode is not None and event.check_mode not in CHECK_MODES:
+            raise ValueError("unsafe Watchdog event check mode")
         self.conn.execute(
             "INSERT INTO events(ts,code,profile_id,service_name,kharej_ip,previous_state,new_state,"
-            "failure_count,success_count,action_result,outage_duration,error_category) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "failure_count,success_count,action_result,outage_duration,error_category,check_mode) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 event.ts,
                 event.code,
@@ -290,6 +314,7 @@ class WatchdogStore:
                 event.action_result,
                 event.outage_duration,
                 event.error_category,
+                event.check_mode,
             ),
         )
 

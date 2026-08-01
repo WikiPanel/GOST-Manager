@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import sqlite3
+import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,6 +26,7 @@ from monitoring.config import (
     MonitoringConfig,
     apply_config_policy,
     load_config,
+    parse_config_text,
     rooted_path,
 )
 from monitoring.runtime_lock import DEFAULT_LOCK_PATH, RuntimeLock, RuntimeLockError
@@ -48,7 +52,10 @@ CONFIG_FIELDS = (
     "tcp_interval_seconds",
     "slow_interval_seconds",
     "maintenance_interval_seconds",
+    "load_shedding_enabled",
 )
+HIGH_TRAFFIC_INTERVALS = (20, 60, 120, 1800)
+COLLECTOR_SERVICE = "gost-monitor-collector.service"
 PURGE_FAILURE_PHASES = (
     "after_lock",
     "after_checkpoint",
@@ -443,11 +450,178 @@ def _config_payload(config: MonitoringConfig) -> dict[str, object]:
         "tcp_interval_seconds": config.tcp_interval,
         "slow_interval_seconds": config.slow_interval,
         "maintenance_interval_seconds": config.maintenance_interval,
+        "load_shedding_enabled": config.load_shedding,
     }
 
 
+def _config_file_for_args(args: argparse.Namespace) -> Path:
+    path = Path(args.config)
+    if args.path_root and path.is_absolute():
+        if path.exists() or path.is_symlink():
+            return path
+        try:
+            path.relative_to(Path(args.path_root))
+            return path
+        except ValueError:
+            pass
+        return rooted_path(path, args.path_root)
+    return path
+
+
 def _load_for_args(args: argparse.Namespace) -> MonitoringConfig:
-    return load_config(args.config, policy=args.policy, root=args.path_root)
+    return load_config(
+        _config_file_for_args(args),
+        policy=args.policy,
+        root=args.path_root,
+    )
+
+
+def _validate_config_file(path: Path, expected_uid: int | None) -> os.stat_result:
+    current = Path(path.anchor) if path.is_absolute() else Path(".")
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    for part in parts:
+        current /= part
+        if current.is_symlink():
+            raise AdminUnsafeError("monitoring config may not traverse a symlink")
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise AdminUnsafeError("monitoring config is unavailable") from exc
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise AdminUnsafeError("monitoring config must be a regular non-symlink file")
+    if metadata.st_mode & 0o077:
+        raise AdminUnsafeError("monitoring config permissions must be 0600 or stricter")
+    if expected_uid is not None and metadata.st_uid != expected_uid:
+        raise AdminUnsafeError("monitoring config has an untrusted owner")
+    return metadata
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short config write")
+        view = view[written:]
+
+
+def _create_config_backup(path: Path, payload: bytes, metadata: os.stat_result) -> Path:
+    backup = path.with_name(f"{path.name}.backup.{time.time_ns()}")
+    descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(descriptor, metadata.st_mode & 0o777)
+        try:
+            os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
+        except PermissionError:
+            if os.geteuid() == 0:
+                raise
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_path(path.parent)
+    return backup
+
+
+def _atomic_replace_config(
+    path: Path,
+    text: str,
+    metadata: os.stat_result,
+) -> None:
+    descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.preset.", dir=path.parent)
+    temporary = Path(raw)
+    try:
+        os.fchmod(descriptor, metadata.st_mode & 0o777)
+        try:
+            os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
+        except PermissionError:
+            if os.geteuid() == 0:
+                raise
+        _write_all(descriptor, text.encode("ascii"))
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        temporary = Path()
+        _fsync_path(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary != Path() and temporary.exists() and not temporary.is_symlink():
+            temporary.unlink()
+
+
+def apply_high_traffic_preset(
+    config_path: Path,
+    *,
+    policy: str,
+    root: str | Path | None,
+    restart_collector: bool,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, object]:
+    expected_uid = None
+    if policy == INSTALLED_POLICY:
+        expected_uid = os.geteuid() if root else 0
+    metadata = _validate_config_file(config_path, expected_uid)
+    try:
+        original = config_path.read_bytes()
+    except OSError as exc:
+        raise AdminUnsafeError("monitoring config cannot be read safely") from exc
+    current = load_config(config_path, policy=policy, root=root)
+    sample, tcp, slow, maintenance_interval = HIGH_TRAFFIC_INTERVALS
+    updated = dataclasses.replace(
+        current,
+        sample_interval=sample,
+        tcp_interval=tcp,
+        slow_interval=slow,
+        maintenance_interval=maintenance_interval,
+    )
+    if updated == current:
+        return {
+            "current": _config_payload(current),
+            "updated": _config_payload(updated),
+            "changed": False,
+            "backup": None,
+            "collector_restarted": False,
+        }
+    text = "".join(
+        f"{key}={value}\n" for key, value in updated.as_mapping().items()
+    )
+    parsed = parse_config_text(text)
+    apply_config_policy(parsed, policy=policy, root=root)
+    backup = _create_config_backup(config_path, original, metadata)
+    try:
+        _atomic_replace_config(config_path, text, metadata)
+    except Exception:
+        if backup.exists():
+            os.replace(backup, config_path)
+            _fsync_path(config_path.parent)
+        raise
+    restarted = False
+    if restart_collector:
+        try:
+            result = command_runner(
+                ["systemctl", "restart", COLLECTOR_SERVICE],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                timeout=30.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AdminUnsafeError("collector restart command failed") from exc
+        if result.returncode != 0:
+            raise AdminUnsafeError("collector restart failed; config backup was preserved")
+        restarted = True
+    return {
+        "current": _config_payload(current),
+        "updated": _config_payload(updated),
+        "changed": True,
+        "backup": str(backup),
+        "collector_restarted": restarted,
+    }
 
 
 def _resolve_database(args: argparse.Namespace) -> str:
@@ -491,6 +665,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate = subparsers.add_parser("validate-config")
     validate.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    preset = subparsers.add_parser("apply-preset")
+    preset.add_argument("preset", choices=("high-traffic",))
+    preset.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    preset.add_argument("--restart-collector", action="store_true")
     for name in ("migrate", "status", "maintenance", "purge-history"):
         command = subparsers.add_parser(name)
         command.add_argument("--db")
@@ -518,6 +696,15 @@ def run_command(args: argparse.Namespace, *, stdout: TextIO = sys.stdout) -> int
             f"monitoring config valid: db={config.db_path} env_dir={config.env_dir}",
             file=stdout,
         )
+        return 0
+    if args.command == "apply-preset":
+        result = apply_high_traffic_preset(
+            _config_file_for_args(args),
+            policy=args.policy,
+            root=args.path_root,
+            restart_collector=args.restart_collector,
+        )
+        print(json.dumps(result, sort_keys=True), file=stdout)
         return 0
     db_path = _resolve_database(args)
     if args.command == "migrate":

@@ -91,8 +91,8 @@ from monitoring.systemd_readers import (
     service_metrics,
 )
 
-DEFAULT_TCP_SNAPSHOT_INTERVAL_SECONDS = 30.0
-DEFAULT_SLOW_SAMPLE_INTERVAL_SECONDS = 60.0
+DEFAULT_TCP_SNAPSHOT_INTERVAL_SECONDS = 60.0
+DEFAULT_SLOW_SAMPLE_INTERVAL_SECONDS = 120.0
 DEFAULT_MAX_GAP_MULTIPLIER = 2.5
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 10.0
 MAX_TRACKED_SOURCE_ERRORS = 64
@@ -181,7 +181,8 @@ class CollectorConfig:
     sample_interval: float = DEFAULT_SAMPLE_INTERVAL_SECONDS
     tcp_snapshot_interval: float = DEFAULT_TCP_SNAPSHOT_INTERVAL_SECONDS
     slow_sample_interval: float = DEFAULT_SLOW_SAMPLE_INTERVAL_SECONDS
-    maintenance_interval: float = 15 * 60
+    maintenance_interval: float = 30 * 60
+    load_shedding_enabled: bool = True
     max_gap_multiplier: float = DEFAULT_MAX_GAP_MULTIPLIER
     filesystem_paths: tuple[Path, ...] = (
         Path("/"),
@@ -192,6 +193,14 @@ class CollectorConfig:
     @property
     def max_gap(self) -> float:
         return self.sample_interval * self.max_gap_multiplier
+
+    @property
+    def tcp_max_gap(self) -> float:
+        return self.tcp_snapshot_interval * self.max_gap_multiplier
+
+    @property
+    def slow_max_gap(self) -> float:
+        return self.slow_sample_interval * self.max_gap_multiplier
 
 
 @dataclasses.dataclass
@@ -429,51 +438,60 @@ def _capture_raw(
     capture.read("proc_stat", lambda: parse_proc_stat(sources.read_text(proc / "stat")))
     capture.read("proc_loadavg", lambda: sources.read_text(proc / "loadavg"))
     capture.read("proc_meminfo", lambda: sources.read_text(proc / "meminfo"))
-    interfaces = capture.read("proc_net_dev", lambda: parse_net_dev(sources.read_text(proc / "net/dev")))
-    if isinstance(interfaces, dict):
-        for interface in interfaces:
-            capture.read(
-                f"sysfs_net:{interface}",
-                lambda interface=interface: read_interface_link(
-                    str(interface),
-                    sources.sys_root,
-                    sources.read_text,
-                ),
-            )
-    capture.read(
-        "proc_net_snmp",
-        lambda: parse_required_protocol_table(
-            sources.read_text(proc / "net/snmp"),
-            "Tcp",
-        ),
-    )
-    capture.read(
-        "proc_net_netstat",
-        lambda: parse_required_protocol_table(
-            sources.read_text(proc / "net/netstat"),
-            "TcpExt",
-        ),
-    )
-    capture.read("proc_diskstats", lambda: parse_diskstats(sources.read_text(proc / "diskstats")))
-    _capture_conntrack(capture, sources, proc)
-    capture.read(
-        "file_handles",
-        lambda: (
-            sources.read_text(proc / "sys/fs/file-nr"),
-            sources.read_text(proc / "sys/fs/file-max"),
-        ),
-    )
-    capture.read(
-        "ss_listeners",
-        lambda: parse_ss_sockets(
-            command_stdout(sources.command(["ss", "-H", "-lntp"]))
-        ),
-    )
     if full_socket_due:
+        interfaces = capture.read(
+            "proc_net_dev",
+            lambda: parse_net_dev(sources.read_text(proc / "net/dev")),
+        )
+        if isinstance(interfaces, dict):
+            for interface in interfaces:
+                capture.read(
+                    f"sysfs_net:{interface}",
+                    lambda interface=interface: read_interface_link(
+                        str(interface),
+                        sources.sys_root,
+                        sources.read_text,
+                    ),
+                )
         capture.read(
+            "proc_net_snmp",
+            lambda: parse_required_protocol_table(
+                sources.read_text(proc / "net/snmp"),
+                "Tcp",
+            ),
+        )
+        capture.read(
+            "proc_net_netstat",
+            lambda: parse_required_protocol_table(
+                sources.read_text(proc / "net/netstat"),
+                "TcpExt",
+            ),
+        )
+        _capture_conntrack(capture, sources, proc)
+        records = capture.read(
             "ss_connections",
             lambda: parse_ss_sockets(
                 command_stdout(sources.command(["ss", "-H", "-tanp"]))
+            ),
+        )
+        if isinstance(records, list):
+            capture.values["ss_listeners"] = records
+            capture.states["ss_listeners"] = "available"
+        else:
+            capture.record_error(
+                "ss_listeners",
+                capture.errors.get("ss_connections", "socket_snapshot_unavailable"),
+            )
+    if slow_sources_due:
+        capture.read(
+            "proc_diskstats",
+            lambda: parse_diskstats(sources.read_text(proc / "diskstats")),
+        )
+        capture.read(
+            "file_handles",
+            lambda: (
+                sources.read_text(proc / "sys/fs/file-nr"),
+                sources.read_text(proc / "sys/fs/file-max"),
             ),
         )
     unit_paths = capture.read(
@@ -747,25 +765,27 @@ def _host_metrics(
         )
         metrics.extend(_unavailable("host", tuple((name, "percent" if name.endswith("percent") else "bytes") for name in memory_names), "host", "local"))
 
-    conntrack = capture.values.get("conntrack")
-    if isinstance(conntrack, tuple):
-        try:
-            metrics.extend(conntrack_metrics(str(conntrack[0]), str(conntrack[1])))
-        except (ValueError, IndexError):
-            capture.record_error("conntrack", "parse_error")
-            conntrack = None
-    if conntrack is None:
-        metrics.extend(_unavailable("host", (("conntrack_count", "count"), ("conntrack_max", "count"), ("conntrack_utilization_percent", "percent")), "host", "local"))
+    if "conntrack" in capture.states:
+        conntrack = capture.values.get("conntrack")
+        if isinstance(conntrack, tuple):
+            try:
+                metrics.extend(conntrack_metrics(str(conntrack[0]), str(conntrack[1])))
+            except (ValueError, IndexError):
+                capture.record_error("conntrack", "parse_error")
+                conntrack = None
+        if conntrack is None:
+            metrics.extend(_unavailable("host", (("conntrack_count", "count"), ("conntrack_max", "count"), ("conntrack_utilization_percent", "percent")), "host", "local"))
 
-    handles = capture.values.get("file_handles")
-    if isinstance(handles, tuple):
-        try:
-            metrics.extend(file_handle_metrics(str(handles[0]), str(handles[1])))
-        except (ValueError, IndexError) as exc:
-            capture.record_error("file_handles", exc)
-            handles = None
-    if handles is None:
-        metrics.extend(_unavailable("host", (("file_handles_allocated", "count"), ("file_handles_max", "count"), ("file_handles_utilization_percent", "percent")), "host", "local"))
+    if "file_handles" in capture.states:
+        handles = capture.values.get("file_handles")
+        if isinstance(handles, tuple):
+            try:
+                metrics.extend(file_handle_metrics(str(handles[0]), str(handles[1])))
+            except (ValueError, IndexError) as exc:
+                capture.record_error("file_handles", exc)
+                handles = None
+        if handles is None:
+            metrics.extend(_unavailable("host", (("file_handles_allocated", "count"), ("file_handles_max", "count"), ("file_handles_utilization_percent", "percent")), "host", "local"))
     return metrics, events
 
 
@@ -796,13 +816,13 @@ def _network_metrics(
                 "mtu": None,
                 "speed_mbps": None,
             }
-            values = interface_metrics(counters, previous.get(name), elapsed, link, config.max_gap)
+            values = interface_metrics(counters, previous.get(name), elapsed, link, config.tcp_max_gap)
             metrics.extend(values)
             events.extend(_record_flag_event(event_state, f"interface.{name}.reset", any(metric.reset for metric in values), ts, "counter_reset", {"source": "proc_net_dev", "interface": name}))
             events.extend(_record_flag_event(event_state, f"interface.{name}.gap", any(metric.gap for metric in values), ts, "sampling_gap", {"source": "proc_net_dev", "interface": name}))
         aggregate = aggregate_external(current)
         previous_aggregate = aggregate_external(previous) if previous else None
-        metrics.extend(interface_metrics(aggregate, previous_aggregate, elapsed, None, config.max_gap))
+        metrics.extend(interface_metrics(aggregate, previous_aggregate, elapsed, None, config.tcp_max_gap))
         _save_timed_state(conn, "counter.interfaces", monotonic, {name: dataclasses.asdict(value) for name, value in current.items()})
     else:
         names = []
@@ -820,7 +840,7 @@ def _network_metrics(
     tcp_mono, tcp_raw = _timed_state(conn, "counter.tcp")
     previous_tcp = {str(key): int(value) for key, value in tcp_raw.items()} if isinstance(tcp_raw, dict) else None
     tcp_elapsed = monotonic - tcp_mono if tcp_mono is not None else None
-    metrics.extend(tcp_counter_metrics(current_tcp, previous_tcp, tcp_elapsed, config.max_gap))
+    metrics.extend(tcp_counter_metrics(current_tcp, previous_tcp, tcp_elapsed, config.tcp_max_gap))
     expected = set(TCP_COUNTERS.values()) | set(TCPEXT_COUNTERS.values())
     for missing in sorted(expected - set(current_tcp)):
         metrics.append(Metric("tcp", missing, None, "count", "unavailable", entity_type="host", entity_id="local"))
@@ -892,7 +912,7 @@ def _storage_metrics(
     if isinstance(disks, dict):
         current = {str(name): value for name, value in disks.items() if isinstance(value, DiskCounters)}
         for name, disk in sorted(current.items()):
-            values = disk_metrics(disk, previous.get(name), elapsed, config.max_gap)
+            values = disk_metrics(disk, previous.get(name), elapsed, config.slow_max_gap)
             metrics.extend(values)
             events.extend(_record_flag_event(event_state, f"disk.{name}.reset", any(metric.reset for metric in values), ts, "counter_reset", {"source": "diskstats", "device": name}))
             events.extend(_record_flag_event(event_state, f"disk.{name}.gap", any(metric.gap for metric in values), ts, "sampling_gap", {"source": "diskstats", "device": name}))
@@ -997,7 +1017,7 @@ def _service_socket_metrics(
         pids
         and pids_authoritative
         and process_identity is not None
-        and (not full_socket_due or full_records is None)
+        and not full_socket_due
     ):
         cached = get_json_state(conn, cache_key)
         if (
@@ -1100,6 +1120,7 @@ def _tunnel_remote_socket_metric(
         and pids
         and pids_authoritative
         and process_identity is not None
+        and not full_socket_due
     ):
         cached = get_json_state(conn, cache_key)
         if (
@@ -1267,6 +1288,7 @@ def _service_and_tunnel_metrics(
         if isinstance(full_raw, list)
         else None
     )
+    socket_ownership_due = full_socket_due and slow_sources_due
     process_metrics_by_service: dict[str, dict[str, Metric]] = {}
     props_by_service: dict[str, dict[str, str]] = {}
     pid_sets_by_service: dict[str, ServicePidSet] = {}
@@ -1364,6 +1386,8 @@ def _service_and_tunnel_metrics(
                         )
                     )
                 listener_records_authoritative = (
+                    socket_ownership_due
+                    and
                     listener_records is not None
                     and pid_set.authoritative
                     and all(
@@ -1372,19 +1396,47 @@ def _service_and_tunnel_metrics(
                         if record.state == "LISTEN"
                     )
                 )
+                listener_count: int | None = None
+                listener_quality = "unavailable"
+                listener_cache_key = f"listener_cache.service.{service}"
                 if pid_set.pids and listener_records_authoritative and listener_records is not None:
                     ports = tuple(record.local_port for record in listener_records if record.state == "LISTEN")
                     listener_count = len(owned_listener_ports(listener_records, ports, pid_set.pids))
-                    local_metrics.append(Metric("service", "listener_owned_count", listener_count, "count", "exact", {"service": service}, "service", service))
-                else:
-                    local_metrics.extend(_unavailable("service", (("listener_owned_count", "count"),), "service", service, {"service": service}))
+                    listener_quality = "exact"
+                    if process_identity is not None:
+                        set_json_state(
+                            conn,
+                            listener_cache_key,
+                            {"identity": process_identity, "count": listener_count},
+                        )
+                elif process_identity is not None and not socket_ownership_due:
+                    cached_listener = get_json_state(conn, listener_cache_key)
+                    if (
+                        isinstance(cached_listener, dict)
+                        and cached_listener.get("identity") == process_identity
+                        and isinstance(cached_listener.get("count"), int)
+                    ):
+                        listener_count = int(cached_listener["count"])
+                        listener_quality = "estimated"
+                local_metrics.append(
+                    Metric(
+                        "service",
+                        "listener_owned_count",
+                        listener_count,
+                        "count",
+                        listener_quality,
+                        {"service": service},
+                        "service",
+                        service,
+                    )
+                )
                 socket_values = _service_socket_metrics(
                     conn,
                     service,
                     pid_set.pids,
                     pid_set.authoritative,
                     process_identity,
-                    full_socket_due,
+                    socket_ownership_due,
                     full_records,
                 )
                 local_metrics.extend(socket_values)
@@ -1412,6 +1464,8 @@ def _service_and_tunnel_metrics(
             pid_set = pid_sets_by_service.get(tunnel.service_name, ServicePidSet((), False))
             process_identity = identities_by_service.get(tunnel.service_name)
             listener_authoritative = (
+                socket_ownership_due
+                and
                 bool(props)
                 and bool(pid_set.pids)
                 and pid_set.authoritative
@@ -1419,20 +1473,45 @@ def _service_and_tunnel_metrics(
             )
             owned = owned_listener_ports(listener_records, tunnel.listen_ports, pid_set.pids) if listener_authoritative and listener_records is not None else set()
             ownership = listener_ownership_exact(listener_records, tunnel.listen_ports, pid_set.pids) if listener_authoritative and listener_records is not None else None
+            listener_quality = "exact" if ownership is not None else "unavailable"
+            listener_cache_key = f"listener_cache.tunnel.{tunnel.tunnel_id}"
+            if ownership is not None and process_identity is not None:
+                set_json_state(
+                    conn,
+                    listener_cache_key,
+                    {
+                        "identity": process_identity,
+                        "listen_ports": list(tunnel.listen_ports),
+                        "observed_count": len(owned),
+                        "ownership": ownership,
+                    },
+                )
+            elif process_identity is not None and not socket_ownership_due:
+                cached_listener = get_json_state(conn, listener_cache_key)
+                if (
+                    isinstance(cached_listener, dict)
+                    and cached_listener.get("identity") == process_identity
+                    and cached_listener.get("listen_ports") == list(tunnel.listen_ports)
+                    and isinstance(cached_listener.get("observed_count"), int)
+                    and isinstance(cached_listener.get("ownership"), bool)
+                ):
+                    owned = set(range(int(cached_listener["observed_count"])))
+                    ownership = bool(cached_listener["ownership"])
+                    listener_quality = "estimated"
             active = int(props.get("ActiveState") == "active")
             running = int(props.get("SubState") == "running")
             restarts_raw = props.get("NRestarts", "")
             restarts = int(restarts_raw) if restarts_raw.isdigit() else 0
             sample = MetricSample(tunnel.tunnel_id, ts, active, running, restarts, len(tunnel.listen_ports), len(owned), len(tunnel.target_ports))
             sample_id = insert_sample(conn, sample, cycle_id)
-            quality = "exact" if ownership is not None else "unavailable"
+            quality = listener_quality
             remote_socket = _tunnel_remote_socket_metric(
                 conn,
                 tunnel,
                 pid_set.pids,
                 pid_set.authoritative,
                 process_identity,
-                full_socket_due,
+                socket_ownership_due,
                 full_records,
             )
             local_metrics.extend([
@@ -1466,7 +1545,7 @@ def _service_and_tunnel_metrics(
                         gap=source_metric.gap if source_metric else False,
                     )
                 )
-            if ownership is not None:
+            if ownership is not None and quality == "exact":
                 listener_missing = not ownership
                 state_key = f"event.value.tunnel.listener_missing.{tunnel.tunnel_id}"
                 previous_missing = get_json_state(conn, state_key)
@@ -1605,6 +1684,9 @@ def collect_once(
     maintenance_conn_factory: Callable[[str], sqlite3.Connection] = open_runtime_database,
     checkpoint_event_writer: Callable[[sqlite3.Connection, Event], None] = insert_event,
     checkpoint_metric_writer: Callable[[sqlite3.Connection, int, Metric, int | None, int | None], None] = insert_metric,
+    defer_heavy: bool = False,
+    load_shedding_active: bool = False,
+    load_shedding_transition: str | None = None,
 ) -> int:
     active_sources = sources or CollectorSources()
     ts = int(active_sources.clock.wall() if now is None else now)
@@ -1628,12 +1710,10 @@ def collect_once(
             ts,
             config.slow_sample_interval,
         )
-        if full_socket_due:
-            set_state(conn, "tcp_snapshot_last_attempt_ts", str(ts))
-        if slow_sources_due:
-            set_state(conn, "slow_sources_last_attempt_ts", str(ts))
-        if full_socket_due or slow_sources_due:
-            conn.commit()
+        if defer_heavy:
+            full_socket_due = False
+            slow_sources_due = False
+            maintenance = False
         capture, tunnels, env_events, services = _capture_raw(
             db_path,
             env_dir,
@@ -1644,6 +1724,10 @@ def collect_once(
         sampled_monotonic = active_sources.clock.monotonic()
         transaction_started = active_sources.clock.monotonic()
         conn.execute("BEGIN IMMEDIATE")
+        if full_socket_due:
+            set_state(conn, "tcp_snapshot_last_attempt_ts", str(ts))
+        if slow_sources_due:
+            set_state(conn, "slow_sources_last_attempt_ts", str(ts))
         cycle_id = _cycle(conn, ts, started, transaction_started, max(0.0, transaction_started - started), True, overrun, missed_deadlines, overrun_seconds)
         host_sample_id = insert_sample(conn, MetricSample(None, ts, 1, 1, 0, 0, 0, 0), cycle_id)
         metrics: list[Metric] = []
@@ -1652,7 +1736,11 @@ def collect_once(
         cadence_registry = get_json_state(conn, "metric_cadence_seconds")
         cadences = dict(cadence_registry) if isinstance(cadence_registry, dict) else {}
         cadences["host:tcp_state_*"] = config.tcp_snapshot_interval
+        cadences["host:conntrack_*"] = config.tcp_snapshot_interval
+        cadences["interface:*"] = config.tcp_snapshot_interval
         cadences["collector_source:source_ss_connections_available"] = config.tcp_snapshot_interval
+        cadences["collector_source:source_ss_listeners_available"] = config.tcp_snapshot_interval
+        cadences["host:file_handles_*"] = config.slow_sample_interval
         cadences["filesystem:filesystem_*"] = config.slow_sample_interval
         cadences["collector:database_*"] = config.slow_sample_interval
         cadences["collector_source:source_cgroup_memory_*"] = config.slow_sample_interval
@@ -1660,6 +1748,42 @@ def collect_once(
         cadences["collector_source:source_filesystem_*"] = config.slow_sample_interval
         cadences["collector_source:source_db_size_metrics_available"] = config.slow_sample_interval
         set_json_state(conn, "metric_cadence_seconds", cadences)
+        events.extend(
+            event_state.boolean_transition(
+                "collection_load_shedding",
+                load_shedding_active,
+                ts,
+                "collection_load_shedding_entered",
+                "Heavy monitoring sources were deferred after a collection overrun",
+                "collection_load_shedding_recovered",
+                "Full monitoring collection resumed after on-time cycles",
+            )
+        )
+        if overrun:
+            events.extend(
+                event_state.edge(
+                    "collection_overrun",
+                    True,
+                    ts,
+                    "collection_overrun",
+                    "Previous collection cycle exceeded its deadline",
+                    {
+                        "missed_deadlines": missed_deadlines,
+                        "overrun_seconds": overrun_seconds,
+                    },
+                )
+            )
+        else:
+            events.extend(
+                event_state.edge(
+                    "collection_overrun",
+                    False,
+                    ts,
+                    "collection_overrun",
+                    "Collection cycle returned within its deadline",
+                    {},
+                )
+            )
         malformed_paths = {str(event.details.get("path", "")) for event in env_events}
         previous_bad = get_json_state(conn, "event.malformed_env_paths")
         previous_paths = {str(value) for value in previous_bad} if isinstance(previous_bad, list) else set()
@@ -1695,7 +1819,10 @@ def collect_once(
                 )
             )
 
-        for collector in (_host_metrics, _storage_metrics):
+        collectors = [_host_metrics]
+        if slow_sources_due:
+            collectors.append(_storage_metrics)
+        for collector in collectors:
             try:
                 if collector is _storage_metrics:
                     collected_metrics, collected_events = collector(
@@ -1716,21 +1843,22 @@ def collect_once(
                 source = collector.__name__.removeprefix("_")
                 capture.record_error(source, exc)
                 metrics.append(Metric("collector", _source_metric_name(source), 0, "boolean", "exact", {"source": source}, "collector_source", source))
-        try:
-            network_values, network_events = _network_metrics(
-                conn,
-                capture,
-                active_sources,
-                config,
-                sampled_monotonic,
-                ts,
-                full_socket_due,
-            )
-            metrics.extend(network_values)
-            events.extend(network_events)
-            capture.values["network_metrics"] = True
-        except Exception as exc:
-            capture.record_error("network_metrics", exc)
+        if full_socket_due:
+            try:
+                network_values, network_events = _network_metrics(
+                    conn,
+                    capture,
+                    active_sources,
+                    config,
+                    sampled_monotonic,
+                    ts,
+                    full_socket_due,
+                )
+                metrics.extend(network_values)
+                events.extend(network_events)
+                capture.values["network_metrics"] = True
+            except Exception as exc:
+                capture.record_error("network_metrics", exc)
 
         service_values, service_events, tunnel_sample_ids = _service_and_tunnel_metrics(conn, capture, tunnels, services, active_sources, config, sampled_monotonic, ts, cycle_id, full_socket_due, slow_sources_due)
         metrics.extend(service_values)
@@ -1792,6 +1920,8 @@ def collect_once(
             Metric("collector", "overrun_count", overrun_count, "count", "exact", entity_type="collector", entity_id="local"),
             Metric("collector", "last_successful_cycle_timestamp", ts, "unix_seconds", "exact", entity_type="collector", entity_id="local"),
             Metric("collector", "source_error_codes", len(source_errors), "count", "exact", entity_type="collector", entity_id="local"),
+            Metric("collector", "load_shedding_active", int(load_shedding_active), "boolean", "exact", entity_type="collector", entity_id="local"),
+            Metric("collector", "heavy_collection_deferred", int(defer_heavy), "boolean", "exact", entity_type="collector", entity_id="local"),
         ]
         metrics.extend(self_metrics)
         metrics = _deduplicate_metrics(metrics)

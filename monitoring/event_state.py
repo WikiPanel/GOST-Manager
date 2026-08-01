@@ -120,6 +120,27 @@ class EventState:
             return []
         return [Event(ts, severity, code, message, safe_details(details))]
 
+    def boolean_transition(
+        self,
+        key: str,
+        active: bool,
+        ts: int,
+        active_code: str,
+        active_message: str,
+        recovered_code: str,
+        recovered_message: str,
+    ) -> list[Event]:
+        state_key = f"event.boolean.{key}"
+        previous = get_json_state(self.conn, state_key)
+        set_json_state(self.conn, state_key, active)
+        if previous is None and not active:
+            return []
+        if previous is not None and bool(previous) == active:
+            return []
+        if active:
+            return [Event(ts, "warning", active_code, active_message)]
+        return [Event(ts, "info", recovered_code, recovered_message)]
+
     def set_transitions(
         self,
         key: str,

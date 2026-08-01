@@ -5,6 +5,7 @@ BASH_SCRIPTS = gost-manager.sh setup.sh install.sh uninstall.sh \
 	tests/run-tests.sh tests/integration-test-lib.sh tests/test-install.sh \
 	tests/test-menu.sh tests/test-uninstall.sh tests/test-systemd-linux.sh \
 	tests/test-watchdog-linux.sh \
+	scripts/gm-203-production-check.sh \
 	tests/test-scope-reset.sh tests/test-profiles.sh tests/test-firewall-multi-source.sh \
 	tests/test-stability.sh tests/test-setup.sh tests/test-release-workflow.sh
 

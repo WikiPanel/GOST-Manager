@@ -25,13 +25,18 @@ KEY_SAMPLE = "GOST_MONITOR_SAMPLE_INTERVAL"
 KEY_TCP = "GOST_MONITOR_TCP_INTERVAL"
 KEY_SLOW = "GOST_MONITOR_SLOW_INTERVAL"
 KEY_MAINTENANCE = "GOST_MONITOR_MAINTENANCE_INTERVAL"
-ALLOWED_KEYS = (
+KEY_LOAD_SHEDDING = "GOST_MONITOR_LOAD_SHEDDING"
+REQUIRED_KEYS = (
     KEY_DB,
     KEY_ENV_DIR,
     KEY_SAMPLE,
     KEY_TCP,
     KEY_SLOW,
     KEY_MAINTENANCE,
+)
+ALLOWED_KEYS = (
+    *REQUIRED_KEYS,
+    KEY_LOAD_SHEDDING,
 )
 INTERVAL_BOUNDS = {
     KEY_SAMPLE: (5, 60),
@@ -52,9 +57,10 @@ class MonitoringConfig:
     db_path: str = DEFAULT_DB_PATH
     env_dir: str = "/etc/gost"
     sample_interval: int = int(DEFAULT_SAMPLE_INTERVAL_SECONDS)
-    tcp_interval: int = 30
-    slow_interval: int = 60
+    tcp_interval: int = 60
+    slow_interval: int = 120
     maintenance_interval: int = int(MAINTENANCE_INTERVAL_SECONDS)
+    load_shedding: bool = True
 
     def as_mapping(self) -> dict[str, str]:
         return {
@@ -64,6 +70,7 @@ class MonitoringConfig:
             KEY_TCP: str(self.tcp_interval),
             KEY_SLOW: str(self.slow_interval),
             KEY_MAINTENANCE: str(self.maintenance_interval),
+            KEY_LOAD_SHEDDING: "1" if self.load_shedding else "0",
         }
 
     def collector_config(self) -> CollectorConfig:
@@ -72,6 +79,7 @@ class MonitoringConfig:
             tcp_snapshot_interval=float(self.tcp_interval),
             slow_sample_interval=float(self.slow_interval),
             maintenance_interval=float(self.maintenance_interval),
+            load_shedding_enabled=self.load_shedding,
         )
 
 
@@ -181,6 +189,12 @@ def _validate_interval(key: str, value: str) -> int:
     return parsed
 
 
+def _validate_boolean(key: str, value: str) -> bool:
+    if value not in ("0", "1"):
+        raise ConfigError(f"{key} must be 0 or 1")
+    return value == "1"
+
+
 def config_from_mapping(
     values: Mapping[str, object],
     *,
@@ -196,7 +210,7 @@ def config_from_mapping(
             raise ConfigError(f"{key} may not be empty")
         merged[key] = value
     if require_all:
-        missing = [key for key in ALLOWED_KEYS if key not in values]
+        missing = [key for key in REQUIRED_KEYS if key not in values]
         if missing:
             raise ConfigError(f"missing monitoring config key: {missing[0]}")
 
@@ -208,6 +222,9 @@ def config_from_mapping(
         slow_interval=_validate_interval(KEY_SLOW, merged[KEY_SLOW]),
         maintenance_interval=_validate_interval(
             KEY_MAINTENANCE, merged[KEY_MAINTENANCE]
+        ),
+        load_shedding=_validate_boolean(
+            KEY_LOAD_SHEDDING, merged[KEY_LOAD_SHEDDING]
         ),
     )
     if config.tcp_interval < config.sample_interval:

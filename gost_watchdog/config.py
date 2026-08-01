@@ -8,7 +8,7 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
-from gost_watchdog.models import GlobalConfig, MODES, ProfileConfig
+from gost_watchdog.models import CHECK_MODES, GlobalConfig, MODES, ProfileConfig
 
 
 DEFAULT_GLOBAL_CONFIG_PATH = "/etc/gost-manager/watchdog.conf"
@@ -22,7 +22,7 @@ GLOBAL_KEYS = (
     "RECOVERY_HOLD_SECONDS",
     "RECOVERY_JITTER_MAX_SECONDS",
 )
-PROFILE_KEYS = ("MODE",) + GLOBAL_KEYS[1:]
+PROFILE_KEYS = ("MODE", "CHECK_MODE") + GLOBAL_KEYS[1:]
 BOUNDS = {
     "CHECK_INTERVAL_SECONDS": (1, 300),
     "PING_TIMEOUT_SECONDS": (1, 60),
@@ -129,8 +129,8 @@ def global_config_from_mapping(values: Mapping[str, str]) -> GlobalConfig:
     if unknown:
         raise ConfigError(f"unknown global config key: {sorted(unknown)[0]}")
     mode = values.get("CHECK_MODE", "ping")
-    if mode != "ping":
-        raise ConfigError("CHECK_MODE must be ping in Watchdog v1")
+    if mode not in CHECK_MODES:
+        raise ConfigError("CHECK_MODE must be ping or tcp")
     defaults = GlobalConfig()
     interval = _integer(values, "CHECK_INTERVAL_SECONDS", defaults.check_interval_seconds)
     timeout = _integer(values, "PING_TIMEOUT_SECONDS", defaults.ping_timeout_seconds)
@@ -164,11 +164,15 @@ def profile_config_from_mapping(
     mode = values.get("MODE", "disabled")
     if mode not in MODES:
         raise ConfigError("MODE must be disabled, monitor, or auto")
+    check_mode = values.get("CHECK_MODE", global_config.check_mode)
+    if check_mode not in CHECK_MODES:
+        raise ConfigError("CHECK_MODE must be ping or tcp")
     interval = _integer(values, "CHECK_INTERVAL_SECONDS", global_config.check_interval_seconds)
     timeout = _integer(values, "PING_TIMEOUT_SECONDS", global_config.ping_timeout_seconds)
     _validate_timing(interval, timeout)
     return ProfileConfig(
         mode=mode,
+        check_mode=check_mode,
         check_interval_seconds=interval,
         ping_timeout_seconds=timeout,
         failure_threshold=_integer(values, "FAILURE_THRESHOLD", global_config.failure_threshold),

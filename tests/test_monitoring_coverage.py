@@ -666,14 +666,19 @@ class TechnicalReviewRegressionTests(unittest.TestCase):
 
             def command(parts):
                 if parts[0] == "ss":
-                    if parts[-1] == "-lntp" and listener_fails[0]:
+                    if parts[-1] == "-tanp" and listener_fails[0]:
                         return CommandResult("", "failed", 1)
                     return CommandResult(fixture("ss.txt"), "", 0)
                 return fixture("systemd-gost.txt")
 
             sources = integration_sources(root, command, mono)
             db = str(root / "metrics.sqlite3")
-            config = CollectorConfig(filesystem_paths=(Path("/"),))
+            config = CollectorConfig(
+                sample_interval=5.0,
+                tcp_snapshot_interval=5.0,
+                slow_sample_interval=5.0,
+                filesystem_paths=(Path("/"),),
+            )
             collect_once(db, str(env_dir), 1000, sources, config)
             listener_fails[0] = True
             mono[0] += 5
@@ -714,7 +719,7 @@ class TechnicalReviewRegressionTests(unittest.TestCase):
                 mono[0] += 5
             light = [call for call in calls if call[:3] == ("ss", "-H", "-lntp")]
             full = [call for call in calls if call[:3] == ("ss", "-H", "-tanp")]
-            self.assertEqual(len(light), 6)
+            self.assertEqual(len(light), 0)
             self.assertEqual(len(full), 1)
 
     def test_thirty_second_metric_rollup_has_full_coverage(self):

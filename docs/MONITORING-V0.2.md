@@ -42,14 +42,24 @@ The installed root-owned 0600 configuration accepts only:
 
     GOST_MONITOR_DB=/var/lib/gost-manager/metrics.sqlite3
     GOST_ENV_DIR=/etc/gost
-    GOST_MONITOR_SAMPLE_INTERVAL=10
-    GOST_MONITOR_TCP_INTERVAL=30
-    GOST_MONITOR_SLOW_INTERVAL=60
-    GOST_MONITOR_MAINTENANCE_INTERVAL=900
+    GOST_MONITOR_SAMPLE_INTERVAL=20
+    GOST_MONITOR_TCP_INTERVAL=60
+    GOST_MONITOR_SLOW_INTERVAL=120
+    GOST_MONITOR_MAINTENANCE_INTERVAL=1800
+    GOST_MONITOR_LOAD_SHEDDING=1
 
 The parser rejects unknown or duplicate keys, unsafe quoting or substitution,
 relative paths, invalid cadences, and installed paths outside the managed
 roots. The file is parsed as data and is never sourced by a shell.
+Existing config files without the load-shedding key remain valid, default to
+enabled, and are not rewritten during upgrade.
+
+`gost-monitor-admin apply-preset high-traffic` applies exactly these intervals.
+It displays current and updated values, creates a same-directory backup,
+validates, writes atomically with file and directory fsync, and rejects
+symlinks, untrusted ownership, or permissions broader than `0600`. Reapplying
+the same values is a no-op. Only the explicit `--restart-collector` flag may
+restart `gost-monitor-collector.service`; no GOST service command is issued.
 
 ## Metric quality
 
@@ -168,6 +178,21 @@ Labels are display metadata; the stable tunnel entity ID remains `iran-N` or
 - bounded active source errors;
 - metrics/events written estimates;
 - database size.
+- overrun count, active load-shedding state, and heavy-work deferral.
+
+Fast cycles collect basic CPU, memory, load, service state, and process
+identity. Network/protocol counters and one shared full TCP snapshot run on the
+TCP cadence. FD enumeration, socket ownership, cgroup/process detail,
+disk/filesystem data, and other expensive work run on the Slow cadence. PID
+changes invalidate identity-bound caches; unavailable due snapshots are not
+presented as exact cached data.
+
+When a cycle misses its deadline, `collection_overrun` and one
+`collection_load_shedding_entered` transition are recorded. The next cycles
+continue Fast metrics while TCP/Slow/maintenance work is deferred. Three
+on-time cycles restore full collection and emit one recovery transition. No
+unbounded queue is created, and the feature can be disabled with
+`GOST_MONITOR_LOAD_SHEDDING=0`.
 
 ## Views and commands
 
@@ -218,25 +243,26 @@ Existing rows are not erased by a migration. Obsolete historical generic rows
 remain queryable where existing APIs already allow it and age out through
 normal retention.
 
-The representative Direct Mode profile models six GOST services:
+The representative Direct Mode profile models six GOST services at the new
+cadences:
 
-- 485 fast series every 10 seconds;
-- 9 full-socket extra series every 30 seconds;
-- 48 slow extra series every 60 seconds;
-- approximately 542 rollup series per minute.
+- 350 fast metric points every 20 seconds;
+- 120 full-socket/network extra points every 60 seconds;
+- 74 slow extra points every 120 seconds;
+- approximately 544 rollup series per minute.
 
-This produces 4,285,440 metric points per day, 1,071,360 raw rows over six
-hours, and 780,480 minute-rollup rows over 24 hours. Conservative storage
+This produces 1,738,080 metric points per day, 434,520 raw rows over six hours,
+and 783,360 minute-rollup rows over 24 hours. Conservative storage
 components are:
 
 | Component | Estimated bytes | GiB |
 | --- | ---: | ---: |
-| Raw metric table | 137,134,080 | 0.128 |
-| Minute-rollup table | 124,876,800 | 0.116 |
-| Cycles, events, entities | 6,788,096 | 0.006 |
-| Indexes and reusable pages | 134,399,488 | 0.125 |
-| WAL and operational headroom | 80,639,693 | 0.075 |
-| **Estimated total** | **483,838,157** | **0.451** |
+| Raw metric table | 55,618,560 | 0.052 |
+| Minute-rollup table | 125,337,600 | 0.117 |
+| Cycles, samples, events, entities | 5,198,336 | 0.005 |
+| Indexes and reusable pages | 93,077,248 | 0.087 |
+| WAL and operational headroom | 55,846,349 | 0.052 |
+| **Estimated total** | **335,078,093** | **0.312** |
 
 Reserve at least 1 GiB for the representative profile. Higher service
 cardinality, longer retention, or custom cadence requires a recalculated
@@ -250,10 +276,11 @@ six listeners, for 2,026 socket rows. It includes six GOST services, six
 tunnels, three interfaces, and representative FD counts.
 
 The fixture measures parsing, socket attribution, complete heavy collection,
-database writes, command-call cadence, and projected storage. Safety limits
-remain five seconds for the heavy cycle, 256 MiB RSS where portable, zero
-deterministic missed deadlines, and exactly two ss calls for one listener plus
-one full snapshot. It proves bounded monitoring overhead, not network
+database writes, command-call cadence, and projected storage. A separate
+synthetic process exposes 10,000 FDs and proves Fast cycles do not enumerate
+them. Safety limits remain five seconds for the heavy cycle, 256 MiB RSS where
+portable, zero deterministic missed deadlines, and exactly one shared `ss`
+snapshot per due TCP cycle. It proves bounded monitoring overhead, not network
 capacity.
 
 ## Compatibility and failure behavior

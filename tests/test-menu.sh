@@ -71,7 +71,7 @@ export GOST_WATCHDOG_ADMIN_BIN_TEST="${STUB_BIN}/gost-watchdog-admin"
 export GOST_MONITOR_CONFIG_TEST="${TEST_HOME}/monitoring.env"
 export GOST_MONITOR_EXPORT_DIR_TEST="${TEST_HOME}"
 export STUB_CONFIG_DB="/var/lib/gost-manager/custom.sqlite3"
-export STUB_WATCHDOG_PROFILE_JSON='{"mode":"monitor","check_interval_seconds":7,"ping_timeout_seconds":3,"failure_threshold":17,"success_threshold":19,"recovery_hold_seconds":23,"recovery_jitter_max_seconds":29}'
+export STUB_WATCHDOG_PROFILE_JSON='{"mode":"monitor","check_mode":"ping","check_interval_seconds":7,"ping_timeout_seconds":3,"failure_threshold":17,"success_threshold":19,"recovery_hold_seconds":23,"recovery_jitter_max_seconds":29}'
 export STUB_WATCHDOG_GLOBAL_JSON='{"check_mode":"ping","check_interval_seconds":11,"ping_timeout_seconds":4,"failure_threshold":31,"success_threshold":37,"recovery_hold_seconds":41,"recovery_jitter_max_seconds":43}'
 export STUB_WATCHDOG_STATUS_JSON='{"errors":[],"profiles":[{"mode":"monitor","stopped_by_watchdog":false,"watchdog_state":"healthy","check_status":"success"}]}'
 
@@ -240,7 +240,7 @@ for label in \
   "3) Disable watchdog for profile" \
   "4) Configure profile overrides" \
   "5) Reset profile overrides to global defaults" \
-  "6) Test profile ping" \
+  "6) Test configured profile check" \
   "7) Maintenance mode" \
   "8) Show last 24-hour events" \
   "9) Show 24-hour outage summary" \
@@ -248,10 +248,11 @@ for label in \
   "11) Show watchdog service status" \
   "12) Restart watchdog service" \
   "13) Re-arm manual override" \
-  "14) Back"; do
+  "14) Change profile check mode (Ping/TCP)" \
+  "15) Back"; do
   assert_contains "Watchdog menu ${label}" "${label}" "${watchdog_menu_file}"
 done
-assert_contains "Watchdog menu displays exact default interval" "Default Ping interval: 2 seconds" "${watchdog_menu_file}"
+assert_contains "Watchdog menu displays exact default interval" "Default check: Ping every 2 seconds" "${watchdog_menu_file}"
 
 : > "${COMMAND_LOG}"
 watchdog_configure_profile <<< $'iran-1\n\n\n\n\n\n\n' >/dev/null
@@ -288,7 +289,7 @@ export STUB_WATCHDOG_PROFILE_JSON='{'
 watchdog_configure_profile <<< $'iran-1' >/dev/null 2>&1 || true
 assert_not_contains "invalid profile JSON causes no configuration write" \
   "configure-profile" "${COMMAND_LOG}"
-export STUB_WATCHDOG_PROFILE_JSON='{"mode":"monitor","check_interval_seconds":7,"ping_timeout_seconds":3,"failure_threshold":17,"success_threshold":19,"recovery_hold_seconds":23,"recovery_jitter_max_seconds":29}'
+export STUB_WATCHDOG_PROFILE_JSON='{"mode":"monitor","check_mode":"ping","check_interval_seconds":7,"ping_timeout_seconds":3,"failure_threshold":17,"success_threshold":19,"recovery_hold_seconds":23,"recovery_jitter_max_seconds":29}'
 
 : > "${COMMAND_LOG}"
 export STUB_WATCHDOG_GLOBAL_JSON='{"check_mode":"ping"}'
@@ -314,6 +315,13 @@ assert_not_contains "mode-change cancellation performs no write or service actio
   "set-mode" "${COMMAND_LOG}"
 export STUB_WATCHDOG_STATUS_JSON='{"errors":[],"profiles":[{"mode":"monitor","stopped_by_watchdog":false,"watchdog_state":"healthy","check_status":"success"}]}'
 
+: > "${COMMAND_LOG}"
+watchdog_change_check_mode <<< $'iran-1\n2\ny' >/dev/null
+assert_contains "check-mode menu uses the safe noninteractive command" \
+  "watchdog-admin set-check-mode iran-1 tcp" "${COMMAND_LOG}"
+assert_not_contains "check-mode change never targets a traffic service" \
+  "systemctl" "${COMMAND_LOG}"
+
 watchdog_dispatch_stubs="${TEST_HOME}/watchdog-dispatch-stubs.sh"
 cat > "${watchdog_dispatch_stubs}" <<'STUB'
 run_watchdog_command() { printf 'watchdog-command %s\n' "$*" >> "${DISPATCH_LOG}"; }
@@ -327,18 +335,20 @@ watchdog_configure_global() { printf 'watchdog-global-config\n' >> "${DISPATCH_L
 watchdog_service_status() { printf 'watchdog-service-status\n' >> "${DISPATCH_LOG}"; }
 watchdog_restart_service() { printf 'watchdog-restart\n' >> "${DISPATCH_LOG}"; }
 watchdog_rearm_profile() { printf 'watchdog-rearm\n' >> "${DISPATCH_LOG}"; }
+watchdog_change_check_mode() { printf 'watchdog-check-mode\n' >> "${DISPATCH_LOG}"; }
 STUB
 # shellcheck source=/dev/null
 source "${watchdog_dispatch_stubs}"
 : > "${DISPATCH_LOG}"
-watchdog_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14' >/dev/null
-assert_eq "Watchdog submenu dispatch count" "13" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
+watchdog_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15' >/dev/null
+assert_eq "Watchdog submenu dispatch count" "14" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
 for marker in \
   "watchdog-command status" "watchdog-mode" "watchdog-disable" \
   "watchdog-profile-config" "watchdog-reset" "watchdog-ping" \
   "watchdog-maintenance" "watchdog-command events --limit 200" \
   "watchdog-command summary" "watchdog-global-config" \
-  "watchdog-service-status" "watchdog-restart" "watchdog-rearm"; do
+  "watchdog-service-status" "watchdog-restart" "watchdog-rearm" \
+  "watchdog-check-mode"; do
   assert_contains "Watchdog dispatch ${marker}" "${marker}" "${DISPATCH_LOG}"
 done
 
@@ -380,13 +390,14 @@ for marker in "query services --window 10m" "service-detail" \
 done
 
 : > "${DISPATCH_LOG}"
-monitoring_advanced_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n0' >/dev/null
-assert_eq "Advanced tools dispatch count" "14" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
+monitor_high_traffic_preset() { printf 'high-traffic-preset\n' >> "${DISPATCH_LOG}"; }
+monitoring_advanced_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n0' >/dev/null
+assert_eq "Advanced tools dispatch count" "15" "$(wc -l < "${DISPATCH_LOG}" | tr -d ' ')"
 for marker in \
   "query snapshot" "query host --window 30m" "query network --window 30m" \
   "query collector --window 1h" "events" "custom" "export-json" \
   "export-csv" "diagnostic" "maintenance" "purge" "service-start" \
-  "service-stop" "service-restart"; do
+  "service-stop" "service-restart" "high-traffic-preset"; do
   assert_contains "Advanced tools dispatch ${marker}" "${marker}" "${DISPATCH_LOG}"
 done
 

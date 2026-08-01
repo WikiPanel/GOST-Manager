@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import stat
+from collections.abc import Iterable
 from pathlib import Path
 
 from gost_watchdog.config import ConfigError, load_profile_config, profile_config_from_mapping
@@ -14,6 +15,7 @@ PROFILE_RE = re.compile(r"^iran-([1-9][0-9]*)$")
 ENV_RE = re.compile(r"^iran-([1-9][0-9]*)\.env$")
 UNIT_RE = re.compile(r"^gost-iran-([1-9][0-9]*)\.service$")
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+SAFE_TARGET_KEYS = frozenset(("KHAREJ_IP", "TUNNEL_PORT"))
 
 
 class ProfileError(ValueError):
@@ -38,26 +40,63 @@ def validate_kharej_ip(value: str) -> str:
     return value
 
 
-def parse_kharej_ip_text(text: str) -> str:
-    if "\x00" in text or "\r" in text:
-        raise ProfileError("profile contains an invalid control character")
+def validate_tunnel_port(value: str) -> int:
+    if not value or not value.isascii() or not value.isdigit():
+        raise ProfileError("TUNNEL_PORT must be an integer between 1 and 65535")
+    port = int(value)
+    if port < 1 or port > 65535:
+        raise ProfileError("TUNNEL_PORT must be an integer between 1 and 65535")
+    return port
+
+
+def _parse_safe_target_lines(lines: Iterable[str]) -> tuple[str, int | None, str | None]:
+    """Extract allowlisted target fields without retaining unrelated values."""
     seen: set[str] = set()
     kharej_ip: str | None = None
-    for number, line in enumerate(text.splitlines(), 1):
+    tunnel_port: int | None = None
+    target_error: str | None = None
+    for number, raw_line in enumerate(lines, 1):
+        line = raw_line.removesuffix("\n")
         if not line or line.startswith("#"):
             continue
-        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
-        if not match:
-            raise ProfileError(f"profile line {number} is malformed")
-        key, value = match.groups()
+        key, separator, value = line.partition("=")
+        if not separator or key not in SAFE_TARGET_KEYS:
+            continue
+        if "\x00" in value or "\r" in value:
+            raise ProfileError("profile target contains an invalid control character")
         if key in seen:
             raise ProfileError(f"profile line {number} duplicates {key}")
         seen.add(key)
         if key == "KHAREJ_IP":
             kharej_ip = validate_kharej_ip(value)
+        elif key == "TUNNEL_PORT":
+            try:
+                tunnel_port = validate_tunnel_port(value)
+            except ProfileError:
+                target_error = "invalid_tunnel_port"
     if kharej_ip is None:
         raise ProfileError("profile is missing KHAREJ_IP")
-    return kharej_ip
+    if "TUNNEL_PORT" not in seen:
+        target_error = "missing_tunnel_port"
+    return kharej_ip, tunnel_port, target_error
+
+
+def parse_safe_target_text(text: str) -> tuple[str, int | None, str | None]:
+    """Extract only the non-secret Watchdog target fields from env text."""
+    return _parse_safe_target_lines(text.splitlines())
+
+
+def read_safe_target_file(path: Path) -> tuple[str, int | None, str | None]:
+    """Stream an env file while retaining only KHAREJ_IP and TUNNEL_PORT."""
+    try:
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            return _parse_safe_target_lines(stream)
+    except (OSError, UnicodeError) as exc:
+        raise ProfileError("cannot read managed profile identity") from exc
+
+
+def parse_kharej_ip_text(text: str) -> str:
+    return parse_safe_target_text(text)[0]
 
 
 def _validate_managed_file(path: Path, *, expected_uid: int | None) -> None:
@@ -95,10 +134,7 @@ def load_managed_profile_identity(
     unit_path = unit_root / service_name
     _validate_managed_file(env_path, expected_uid=expected_uid)
     _validate_managed_file(unit_path, expected_uid=expected_uid)
-    try:
-        kharej_ip = parse_kharej_ip_text(env_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError) as exc:
-        raise ProfileError("cannot read managed profile identity") from exc
+    kharej_ip, tunnel_port, target_error = read_safe_target_file(env_path)
     return ManagedProfile(
         profile_id=profile_id,
         service_name=service_name,
@@ -107,6 +143,8 @@ def load_managed_profile_identity(
         unit_path=str(unit_path),
         config_path=str(config_root / f"{profile_id}.conf"),
         config=profile_config_from_mapping({"MODE": "disabled"}, global_config),
+        tunnel_port=tunnel_port,
+        target_error=target_error,
     )
 
 
@@ -146,8 +184,7 @@ def discover_profiles(
         try:
             _validate_managed_file(env_path, expected_uid=expected_uid)
             _validate_managed_file(unit_path, expected_uid=expected_uid)
-            text = env_path.read_text(encoding="utf-8")
-            kharej_ip = parse_kharej_ip_text(text)
+            kharej_ip, tunnel_port, target_error = read_safe_target_file(env_path)
             config = load_profile_config(
                 config_path,
                 global_config,
@@ -157,6 +194,8 @@ def discover_profiles(
         except (OSError, UnicodeError, ConfigError, ProfileError):
             errors.append((profile_id, "invalid_profile"))
             continue
+        if config.check_mode == "tcp" and target_error is not None:
+            errors.append((profile_id, target_error))
         profiles.append(
             ManagedProfile(
                 profile_id=profile_id,
@@ -166,6 +205,8 @@ def discover_profiles(
                 unit_path=str(unit_path),
                 config_path=str(config_path),
                 config=config,
+                tunnel_port=tunnel_port,
+                target_error=target_error,
             )
         )
     return profiles, errors

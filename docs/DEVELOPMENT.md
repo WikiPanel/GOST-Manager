@@ -99,13 +99,22 @@ must prove:
   service restart, preserves env/unit bytes, and is idempotent after its first
   successful run.
 - Watchdog defaults to Disabled per profile, validates exact Iran unit names,
-  deduplicates checks by `(KHAREJ_IP, PING_TIMEOUT_SECONDS)`, distinguishes
-  upstream unreachability from local probe errors, persists action intent
+  keeps Ping as the compatible default, deduplicates checks by mode, IP,
+  optional TCP port, and timeout, distinguishes upstream unreachability from
+  local probe/config/resource errors, persists action intent
   before systemd, reconciles service state on a 10-second cadence, bounds
   events to 24 hours, and never controls a Kharej or arbitrary service.
 - `tests/test-watchdog-linux.sh` runs the supported hardened runtime probe and
-  reports CPU, RSS, task count, Ping/systemctl process rates, overlap, scheduler
+  reports CPU, RSS, task count, Ping/TCP/systemctl process rates, overlap, scheduler
   stability, Disabled startup, and zero traffic actions for ten profiles.
+- Monitoring keeps Fast collection independent of TCP and Slow cadence, uses
+  one full socket snapshot per due cycle, enumerates large FD sets only on Slow
+  cycles, performs bounded retention without automatic VACUUM, and defers heavy
+  work after an overrun until three on-time cycles recover it.
+- Installer fixtures exercise future v2.0.3 candidates from both v2.0.1 and
+  v2.0.2 roots while preserving traffic env/unit hashes, PID/NRestarts and
+  firewall snapshots, Monitoring/Watchdog history, manual override, and
+  existing config bytes with zero traffic service action.
 
 ## Release
 

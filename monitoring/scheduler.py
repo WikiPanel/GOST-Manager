@@ -6,6 +6,7 @@ import math
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from collections.abc import Callable, Sequence
 
 from monitoring.collector import (
@@ -29,7 +30,61 @@ from monitoring.schema import (
     set_state,
 )
 
-MAINTENANCE_INTERVAL_SECONDS = 15 * 60
+MAINTENANCE_INTERVAL_SECONDS = 30 * 60
+LOAD_SHEDDING_RECOVERY_CYCLES = 3
+
+
+@dataclass
+class LoadSheddingState:
+    active: bool = False
+    on_time_cycles: int = 0
+    pending_transition: str | None = None
+    previous_overrun: bool = False
+    previous_missed_deadlines: int = 0
+    previous_overrun_seconds: float = 0.0
+
+    def consume_cycle_context(self) -> tuple[str | None, bool, int, float]:
+        context = (
+            self.pending_transition,
+            self.previous_overrun,
+            self.previous_missed_deadlines,
+            self.previous_overrun_seconds,
+        )
+        self.pending_transition = None
+        self.previous_overrun = False
+        self.previous_missed_deadlines = 0
+        self.previous_overrun_seconds = 0.0
+        return context
+
+    def observe(
+        self,
+        *,
+        overrun: bool,
+        missed_deadlines: int,
+        overrun_seconds: float,
+        enabled: bool,
+    ) -> None:
+        self.previous_overrun = overrun
+        self.previous_missed_deadlines = missed_deadlines
+        self.previous_overrun_seconds = overrun_seconds
+        if not enabled:
+            self.active = False
+            self.on_time_cycles = 0
+            self.pending_transition = None
+            return
+        if overrun:
+            self.on_time_cycles = 0
+            if not self.active:
+                self.active = True
+                self.pending_transition = "entered"
+            return
+        if not self.active:
+            return
+        self.on_time_cycles += 1
+        if self.on_time_cycles >= LOAD_SHEDDING_RECOVERY_CYCLES:
+            self.active = False
+            self.on_time_cycles = 0
+            self.pending_transition = "recovered"
 
 
 def scheduler_ticks(start: float, interval: float, durations: Sequence[float]) -> list[float]:
@@ -146,7 +201,7 @@ def run_daemon(
     sleeper: Callable[[float], None] = time.sleep,
     stop_requested: Callable[[], bool] | None = None,
     collect: Callable[..., int] = collect_once,
-    record_overrun: Callable[[str, int, float, float, float], None] = record_cycle_overrun,
+    record_overrun: Callable[[str, int, float, float, float], None] | None = None,
     config: CollectorConfig | None = None,
 ) -> int:
     active_sources = sources or CollectorSources()
@@ -158,6 +213,7 @@ def run_daemon(
     maintenance_interval = active_config.maintenance_interval
     clock = active_sources.clock
     stop = False
+    shedding = LoadSheddingState()
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop
@@ -178,9 +234,13 @@ def run_daemon(
             if current < deadline:
                 sleeper(deadline - current)
                 continue
-            maintenance = current >= next_maintenance
+            defer_heavy = active_config.load_shedding_enabled and shedding.active
+            maintenance = current >= next_maintenance and not defer_heavy
             if maintenance:
                 next_maintenance = current + maintenance_interval
+            transition, prior_overrun, prior_missed, prior_seconds = (
+                shedding.consume_cycle_context()
+            )
             try:
                 cycle_ts = collect(
                     db_path,
@@ -188,11 +248,38 @@ def run_daemon(
                     sources=active_sources,
                     config=active_config,
                     maintenance=maintenance,
+                    overrun=prior_overrun,
+                    missed_deadlines=prior_missed,
+                    overrun_seconds=prior_seconds,
+                    defer_heavy=defer_heavy,
+                    load_shedding_active=shedding.active,
+                    load_shedding_transition=transition,
                 )
-                record_overrun(db_path, cycle_ts, clock.monotonic(), deadline, interval)
+                finished = clock.monotonic()
+                overrun_seconds = max(0.0, finished - (deadline + interval))
+                missed = math.ceil(overrun_seconds / interval) if interval > 0 else 0
+                shedding.observe(
+                    overrun=overrun_seconds > 0,
+                    missed_deadlines=missed,
+                    overrun_seconds=overrun_seconds,
+                    enabled=active_config.load_shedding_enabled,
+                )
+                if record_overrun is not None:
+                    record_overrun(db_path, cycle_ts, finished, deadline, interval)
             except CollectionCycleError as exc:
+                finished = clock.monotonic()
+                overrun_seconds = max(0.0, finished - (deadline + interval))
+                missed = math.ceil(overrun_seconds / interval) if interval > 0 else 0
+                shedding.observe(
+                    overrun=overrun_seconds > 0,
+                    missed_deadlines=missed,
+                    overrun_seconds=overrun_seconds,
+                    enabled=active_config.load_shedding_enabled,
+                )
                 try:
-                    record_overrun(db_path, exc.ts, clock.monotonic(), deadline, interval)
+                    (record_overrun or record_cycle_overrun)(
+                        db_path, exc.ts, finished, deadline, interval
+                    )
                 except Exception:
                     pass
                 print(f"collection failed: {exc}", file=sys.stderr)
