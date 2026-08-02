@@ -192,7 +192,7 @@ assert_not_contains "Kharej active state has no traffic systemctl" "gost-kharej-
 
 gm203_source="${TEST_HOME}/gm203-candidate"
 create_source_fixture "${gm203_source}"
-printf '2.0.3\n' > "${gm203_source}/VERSION"
+printf '%s\n' "${CURRENT_VERSION}" > "${gm203_source}/VERSION"
 for previous_version in 2.0.1 2.0.2; do
   gm203_root="${TEST_HOME}/upgrade-${previous_version}"
   mkdir -p \
@@ -279,7 +279,8 @@ PY
   : > "${COMMAND_LOG}"
   GOST_MANAGER_SOURCE_ROOT_TEST="${gm203_source}" \
     run_installer "${gm203_root}" >/dev/null
-  assert_eq "${previous_version} upgrade installs candidate version" "2.0.3" \
+  assert_eq "${previous_version} upgrade installs candidate version" \
+    "${CURRENT_VERSION}" \
     "$(< "${gm203_root}/usr/local/lib/gost-manager/VERSION")"
   assert_eq "${previous_version} upgrade preserves traffic env" \
     "${gm203_env_before}" "$(cksum "${gm203_root}/etc/gost/iran-1.env")"

@@ -3,9 +3,14 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CURRENT_VERSION="$(< "${ROOT_DIR}/VERSION")"
-PREVIOUS_VERSION="2.0.1"
+PREVIOUS_VERSION="2.0.2"
 # shellcheck source=integration-test-lib.sh
 source "${ROOT_DIR}/tests/integration-test-lib.sh"
+
+if [[ "${PREVIOUS_VERSION}" == "${CURRENT_VERSION}" ]]; then
+  printf 'PREVIOUS_VERSION must differ from CURRENT_VERSION\n' >&2
+  exit 1
+fi
 
 TEST_HOME="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/gost-setup-tests.XXXXXX")" && pwd -P)"
 cleanup_test_home() {
