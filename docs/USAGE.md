@@ -15,7 +15,7 @@ sudo bash gost-manager.sh
 ## Menu
 
 ```text
-GOST Manager v2.0.2
+GOST Manager v2.0.3
 ====================
 
 1) Install / Update GOST

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.0.3 - 2026-08-02
+
 - Added per-profile Ping/TCP Watchdog checks while keeping Ping as the upgrade
   and fresh-install default. TCP probes use only allowlisted `KHAREJ_IP` and
   `TUNNEL_PORT`, deduplicate by mode/target/timeout, classify local resource and

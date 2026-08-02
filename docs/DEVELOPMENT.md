@@ -2,7 +2,7 @@
 
 ## Product boundary
 
-GOST Manager v2.0.2 is Direct Mode plus optional local Monitoring Lite and the
+GOST Manager v2.0.3 is Direct Mode plus optional local Monitoring Lite and the
 explicitly enabled Upstream Watchdog safety controller. NGINX Gateway and
 Native GOST Gateway are cancelled. Do not add placeholders, hidden commands,
 Gateway packages, NGINX discovery, or a second traffic runtime.
@@ -111,7 +111,7 @@ must prove:
   one full socket snapshot per due cycle, enumerates large FD sets only on Slow
   cycles, performs bounded retention without automatic VACUUM, and defers heavy
   work after an overrun until three on-time cycles recover it.
-- Installer fixtures exercise future v2.0.3 candidates from both v2.0.1 and
+- Installer fixtures exercise the v2.0.3 release from both v2.0.1 and
   v2.0.2 roots while preserving traffic env/unit hashes, PID/NRestarts and
   firewall snapshots, Monitoring/Watchdog history, manual override, and
   existing config bytes with zero traffic service action.

@@ -56,7 +56,7 @@ GOST protocol behavior is not changed by this project.
 
 ## Menu contract
 
-    GOST Manager v2.0.2
+    GOST Manager v2.0.3
     ====================
 
     1) Install / Update GOST
