@@ -1,4 +1,4 @@
-# GOST Manager agent instructions
+# GOST Manager agent instructions 
 
 These instructions apply to the whole repository. Read `README.md`, `README.fa.md`, `docs/DEVELOPMENT.md`, and the v0.2 architecture documents before changing runtime behavior.
 
