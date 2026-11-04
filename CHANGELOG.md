@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Fixed menu option `9` deleting valid profiles: failed or disabled profiles
+  that still have both env and unit are now only listed for attention, names
+  outside the exact `gost-<side>-<number>.service` and
+  `<side>-<number>.env` patterns are never touched, orphan units are disabled
+  before removal, a running orphan is never stopped, only managed env/unit
+  backups are cleaned, and `systemctl reset-failed` targets only the exact
+  removed unit instead of every unit on the host.
+- Fixed the installer rolling back twice when a command inside `$(...)`
+  failed (for example `mktemp` on a full disk). The second pass deleted the
+  files the first pass had just restored, which could remove the Iran runner
+  and the manager after a failed upgrade.
+- Fixed unbounded Monitoring database growth: one maintenance run deleted at
+  most 10,000 expired rows per table, below the documented insert rate, and
+  persistent load shedding could skip maintenance entirely. Retention now
+  deletes up to 12 bounded batches per table per run, drains any remaining
+  backlog one batch per cycle, and maintenance can be postponed by at most
+  one extra interval. Retention periods and schema version 4 are unchanged.
+- Fixed the Upstream Watchdog exiting on any event-storage error such as a
+  full disk; after five quick restarts systemd gave up, leaving profiles it
+  had stopped stopped. Event writes and pruning are now best effort, checks
+  continue, and errors that could not be stored are retried.
+
 ## 2.0.3 - 2026-08-02
 
 - Added per-profile Ping/TCP Watchdog checks while keeping Ping as the upgrade
