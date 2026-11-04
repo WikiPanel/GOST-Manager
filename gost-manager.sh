@@ -3018,57 +3018,87 @@ list_active_gost_services() {
   direct_profiles_menu
 }
 
+is_managed_backup_name() {
+  local base="$1"
+  [[ "${base}" =~ ^(iran|kharej)-[1-9][0-9]*\.env\.bak\.[A-Za-z0-9]+$ \
+    || "${base}" =~ ^gost-(iran|kharej)-[1-9][0-9]*\.service\.bak\.[A-Za-z0-9]+$ ]]
+}
+
+# Cleanup only deletes true orphans and managed backups. A profile that has
+# both its env and unit is never deleted here, whatever its service state:
+# failed and disabled profiles are reported and left for Delete tunnel.
 collect_cleanup_candidates() {
   local tmp="$1"
-  local file base side number env_file svc_file service state enabled
+  local file parsed side number env_file svc_file service active enabled
   : > "${tmp}"
 
   for file in "${SYSTEMD_DIR}"/gost-iran-*.service "${SYSTEMD_DIR}"/gost-kharej-*.service; do
-    [[ -e "${file}" ]] || continue
-    base="$(basename "${file}")"
-    side="${base#gost-}"
-    side="${side%-*.service}"
-    number="${base%.service}"
-    number="${number##*-}"
+    [[ -e "${file}" || -L "${file}" ]] || continue
+    parsed="$(parse_tunnel_service_name "$(basename "${file}")")" || continue
+    read -r side number <<< "${parsed}"
+    validate_managed_destination "${file}" unit || continue
     env_file="$(env_path "${side}" "${number}")"
     service="$(service_name "${side}" "${number}")"
-    if [[ ! -f "${env_file}" ]]; then
-      printf 'service-with-missing-env|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
-    fi
-    state="$(systemctl is-failed "${service}" 2>/dev/null || true)"
-    if [[ "${state}" == "failed" ]]; then
-      printf 'failed-service|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
+    active="$(systemctl is-active "${service}" 2>/dev/null || true)"
+    if [[ ! -e "${env_file}" && ! -L "${env_file}" ]]; then
+      if [[ "${active}" == "active" || "${active}" == "activating" || "${active}" == "reloading" ]]; then
+        printf 'active-missing-env|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
+      else
+        printf 'service-with-missing-env|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
+      fi
+      continue
     fi
     enabled="$(systemctl is-enabled "${service}" 2>/dev/null || true)"
-    state="$(systemctl is-active "${service}" 2>/dev/null || true)"
-    if [[ "${enabled}" == "disabled" && "${state}" != "active" ]]; then
-      printf 'disabled-orphan-service|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
+    if [[ "${active}" == "failed" ]]; then
+      printf 'failed-profile|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
+    elif [[ "${enabled}" == "disabled" && "${active}" != "active" ]]; then
+      printf 'disabled-profile|%s|%s\n' "${file}" "${env_file}" >> "${tmp}"
     fi
   done
 
   for file in "${GOST_ETC_DIR}"/iran-*.env "${GOST_ETC_DIR}"/kharej-*.env; do
-    [[ -e "${file}" ]] || continue
-    base="$(basename "${file}")"
-    side="${base%-*.env}"
-    number="${base%.env}"
-    number="${number##*-}"
+    [[ -e "${file}" || -L "${file}" ]] || continue
+    parsed="$(parse_tunnel_env_name "${file}")" || continue
+    read -r side number <<< "${parsed}"
+    validate_managed_destination "${file}" env || continue
     svc_file="$(service_path "${side}" "${number}")"
-    if [[ ! -f "${svc_file}" ]]; then
+    if [[ ! -e "${svc_file}" && ! -L "${svc_file}" ]]; then
       printf 'env-with-missing-service|%s|%s\n' "${file}" "${svc_file}" >> "${tmp}"
     fi
   done
 
-  for file in "${GOST_ETC_DIR}"/*.bak.* "${SYSTEMD_DIR}"/gost-iran-*.service.bak.* "${SYSTEMD_DIR}"/gost-kharej-*.service.bak.*; do
-    [[ -e "${file}" ]] || continue
+  for file in "${GOST_ETC_DIR}"/*.env.bak.* "${SYSTEMD_DIR}"/gost-iran-*.service.bak.* "${SYSTEMD_DIR}"/gost-kharej-*.service.bak.*; do
+    [[ -f "${file}" && ! -L "${file}" ]] || continue
+    is_managed_backup_name "$(basename "${file}")" || continue
     printf 'old-backup|%s|\n' "${file}" >> "${tmp}"
   done
+}
+
+remove_orphan_managed_unit() {
+  local unit_file="$1"
+  local parsed side number service
+  parsed="$(parse_tunnel_service_name "$(basename "${unit_file}")")" || return 1
+  read -r side number <<< "${parsed}"
+  service="$(service_name "${side}" "${number}")"
+  if ! validate_managed_destination "${unit_file}" unit || [[ ! -f "${unit_file}" ]]; then
+    return 1
+  fi
+  # The env may have been restored since the candidate list was shown.
+  [[ ! -e "$(env_path "${side}" "${number}")" ]] || return 1
+  systemctl disable --now "${service}" >/dev/null 2>&1 || true
+  systemctl reset-failed "${service}" >/dev/null 2>&1 || true
+  if ! service_is_inactive_disabled "${service}"; then
+    printf 'Could not stop/disable %s; its unit file was kept.\n' "${service}" >&2
+    return 1
+  fi
+  rm -f "${unit_file}"
 }
 
 clean_old_broken_configs() {
   require_root
   ensure_commands systemctl
 
-  local tmp reason primary secondary
+  local tmp reason primary secondary deletable=0 attention=0 removed_units=0 failures=0
   tmp="$(mktemp)"
   collect_cleanup_candidates "${tmp}"
   if [[ ! -s "${tmp}" ]]; then
@@ -3077,12 +3107,34 @@ clean_old_broken_configs() {
     return 0
   fi
 
+  while IFS='|' read -r reason primary secondary; do
+    case "${reason}" in
+      service-with-missing-env|env-with-missing-service|old-backup) deletable=$((deletable + 1)) ;;
+      *) attention=$((attention + 1)) ;;
+    esac
+  done < "${tmp}"
+
+  if [[ "${attention}" -gt 0 ]]; then
+    info "Profiles that need attention (cleanup never deletes these):"
+    while IFS='|' read -r reason primary secondary; do
+      case "${reason}" in
+        failed-profile) printf '  failed profile: %s (inspect with Show logs, then Restart or Delete tunnel)\n' "${primary}" ;;
+        disabled-profile) printf '  disabled and stopped profile: %s (start it with Restart, or remove it with Delete tunnel)\n' "${primary}" ;;
+        active-missing-env) printf '  running service whose env is missing: %s (missing %s; restore the env or use Delete tunnel)\n' "${primary}" "${secondary}" ;;
+      esac
+    done < "${tmp}"
+  fi
+
+  if [[ "${deletable}" -eq 0 ]]; then
+    info "Nothing to delete."
+    rm -f "${tmp}"
+    return 0
+  fi
+
   info "Cleanup candidates:"
   while IFS='|' read -r reason primary secondary; do
     case "${reason}" in
-      service-with-missing-env) printf '  service exists but env is missing: %s (missing %s)\n' "${primary}" "${secondary}" ;;
-      failed-service) printf '  failed managed service: %s\n' "${primary}" ;;
-      disabled-orphan-service) printf '  disabled orphan managed service: %s\n' "${primary}" ;;
+      service-with-missing-env) printf '  stopped service whose env is missing: %s (missing %s)\n' "${primary}" "${secondary}" ;;
       env-with-missing-service) printf '  env exists but service is missing: %s (missing %s)\n' "${primary}" "${secondary}" ;;
       old-backup) printf '  old backup file: %s\n' "${primary}" ;;
     esac
@@ -3094,25 +3146,36 @@ clean_old_broken_configs() {
 
   while IFS='|' read -r reason primary secondary; do
     case "${reason}" in
-      service-with-missing-env|failed-service|disabled-orphan-service)
-        if [[ "${primary}" == "${SYSTEMD_DIR}"/gost-iran-*.service || "${primary}" == "${SYSTEMD_DIR}"/gost-kharej-*.service ]]; then
-          rm -f "${primary}"
-        fi
-        if [[ -n "${secondary}" && -e "${secondary}" && ( "${secondary}" == "${GOST_ETC_DIR}"/iran-*.env || "${secondary}" == "${GOST_ETC_DIR}"/kharej-*.env ) ]]; then
-          rm -f "${secondary}"
+      service-with-missing-env)
+        if remove_orphan_managed_unit "${primary}"; then
+          removed_units=$((removed_units + 1))
+        else
+          failures=$((failures + 1))
         fi
         ;;
-      env-with-missing-service|old-backup)
-        if [[ "${primary}" == "${GOST_ETC_DIR}"/iran-*.env || "${primary}" == "${GOST_ETC_DIR}"/kharej-*.env || "${primary}" == "${GOST_ETC_DIR}"/*.bak.* || "${primary}" == "${SYSTEMD_DIR}"/gost-iran-*.service.bak.* || "${primary}" == "${SYSTEMD_DIR}"/gost-kharej-*.service.bak.* ]]; then
+      env-with-missing-service)
+        if validate_managed_destination "${primary}" env && [[ -f "${primary}" && ! -e "${secondary}" && ! -L "${secondary}" ]]; then
+          rm -f "${primary}"
+        else
+          failures=$((failures + 1))
+        fi
+        ;;
+      old-backup)
+        if [[ -f "${primary}" && ! -L "${primary}" ]] && is_managed_backup_name "$(basename "${primary}")"; then
           rm -f "${primary}"
         fi
         ;;
     esac
   done < "${tmp}"
 
-  systemctl daemon-reload
-  systemctl reset-failed
+  if [[ "${removed_units}" -gt 0 ]]; then
+    systemctl daemon-reload
+  fi
   rm -f "${tmp}"
+  if [[ "${failures}" -gt 0 ]]; then
+    printf 'Cleanup finished with %s item(s) kept because they changed or could not be stopped safely.\n' "${failures}" >&2
+    return 1
+  fi
   info "Cleanup complete."
 }
 
