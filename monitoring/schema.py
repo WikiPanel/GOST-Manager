@@ -20,6 +20,12 @@ ROLLUP_RETENTION_SECONDS = 24 * 60 * 60
 EVENT_RETENTION_SECONDS = 24 * 60 * 60
 ROLLUP_BATCH_MINUTES = 240
 RETENTION_DELETE_BATCH_SIZE = 10_000
+# A 30-minute maintenance run may delete up to 12 batches per table, well
+# above the documented insert rate; any backlog left over is drained one batch
+# per table per collection cycle until it is gone.
+RETENTION_MAX_BATCHES_PER_RUN = 12
+RETENTION_CATCH_UP_BATCHES = 1
+RETENTION_BACKLOG_STATE_KEY = "retention_backlog"
 SENSITIVE_KEY_RE = re.compile(
     r"(?:^|_)(?:pass|password|token|secret|credential|auth|username|gost_user)(?:$|_)",
     re.IGNORECASE,
@@ -850,35 +856,67 @@ def rollup_completed_minutes(
     set_state(conn, "minute_rollup_watermark", str(end))
 
 
-def apply_retention(conn: sqlite3.Connection, now: int) -> None:
+def _delete_expired_batches(
+    conn: sqlite3.Connection,
+    sql: str,
+    cutoff: int,
+    max_batches: int,
+) -> bool:
+    """Repeat one bounded DELETE; return True when expired rows may remain."""
+    for _batch in range(max_batches):
+        deleted = conn.execute(sql, (cutoff, RETENTION_DELETE_BATCH_SIZE)).rowcount
+        if deleted < RETENTION_DELETE_BATCH_SIZE:
+            return False
+    return True
+
+
+def apply_retention(
+    conn: sqlite3.Connection,
+    now: int,
+    max_batches: int = RETENTION_MAX_BATCHES_PER_RUN,
+) -> bool:
+    """Delete expired rows in bounded batches.
+
+    Each table gets at most ``max_batches`` deletes of
+    ``RETENTION_DELETE_BATCH_SIZE`` rows, so one call stays bounded while
+    still outpacing inserts. Returns True when a table hit that limit and
+    expired rows may remain (a backlog the caller should keep draining).
+    """
     raw_cutoff = now - RAW_RETENTION_SECONDS
+    backlog = False
     for table, column, cutoff in (
         ("metric_points", "ts", raw_cutoff),
         ("metric_samples", "collected_at", raw_cutoff),
         ("minute_rollups", "minute_start", now - ROLLUP_RETENTION_SECONDS),
         ("events", "ts", now - EVENT_RETENTION_SECONDS),
     ):
-        conn.execute(
+        backlog |= _delete_expired_batches(
+            conn,
             f"DELETE FROM {table} WHERE rowid IN "
             f"(SELECT rowid FROM {table} WHERE {column} < ? ORDER BY {column} LIMIT ?)",
-            (cutoff, RETENTION_DELETE_BATCH_SIZE),
+            cutoff,
+            max_batches,
         )
     # Child rows are pruned first so deleting a cycle cannot trigger an
     # unbounded foreign-key cascade in one maintenance transaction.
-    conn.execute(
+    backlog |= _delete_expired_batches(
+        conn,
         "DELETE FROM sample_cycles WHERE cycle_id IN ("
         "SELECT cycle_id FROM sample_cycles AS cycle "
         "WHERE collected_at < ? "
         "AND NOT EXISTS (SELECT 1 FROM metric_points WHERE metric_points.cycle_id=cycle.cycle_id) "
         "AND NOT EXISTS (SELECT 1 FROM metric_samples WHERE metric_samples.cycle_id=cycle.cycle_id) "
         "ORDER BY collected_at LIMIT ?)",
-        (raw_cutoff, RETENTION_DELETE_BATCH_SIZE),
+        raw_cutoff,
+        max_batches,
     )
+    return backlog
 
 
-def run_maintenance(conn: sqlite3.Connection, now: int) -> None:
+def run_maintenance(conn: sqlite3.Connection, now: int) -> bool:
+    """Roll up completed minutes and apply retention; True if a backlog remains."""
     rollup_completed_minutes(conn, now)
-    apply_retention(conn, now)
+    return apply_retention(conn, now)
 
 
 def checkpoint_wal(db_path: str) -> tuple[int, int, int]:

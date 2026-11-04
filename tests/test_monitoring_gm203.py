@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from monitoring import collector
+from monitoring import collector, schema
 from monitoring.admin_cli import AdminUnsafeError, apply_high_traffic_preset
 from monitoring.collector import CollectorConfig, CollectorSources, collect_once
 from monitoring.config import (
@@ -24,11 +24,14 @@ from monitoring.scheduler import LoadSheddingState, run_daemon
 from monitoring.schema import (
     EVENT_RETENTION_SECONDS,
     RAW_RETENTION_SECONDS,
+    RETENTION_BACKLOG_STATE_KEY,
     RETENTION_DELETE_BATCH_SIZE,
     ROLLUP_RETENTION_SECONDS,
     apply_retention,
     init_db,
     insert_event,
+    run_maintenance,
+    set_state,
 )
 
 
@@ -213,6 +216,40 @@ class LoadSheddingTests(unittest.TestCase):
                 [None, "entered", None, None, "recovered"],
             )
 
+    def test_persistent_load_shedding_cannot_postpone_maintenance_forever(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db = str(root / "metrics.sqlite3")
+            env = root / "env"
+            env.mkdir()
+            monotonic = [0.0]
+            wall = [1000.0]
+            calls: list[tuple[float, dict[str, object]]] = []
+
+            def collect(*_args, **kwargs):
+                calls.append((monotonic[0], dict(kwargs)))
+                # Every cycle overruns, so load shedding never recovers.
+                monotonic[0] += 6.0
+                wall[0] += 6.0
+                return int(wall[0])
+
+            sources = CollectorSources(clock=Clock(lambda: wall[0], lambda: monotonic[0]))
+            with mock.patch("monitoring.scheduler.signal.signal", return_value=None):
+                run_daemon(
+                    db,
+                    str(env),
+                    sources=sources,
+                    sleeper=lambda seconds: monotonic.__setitem__(0, monotonic[0] + seconds),
+                    stop_requested=lambda: len(calls) >= 40,
+                    collect=collect,
+                    config=CollectorConfig(sample_interval=5.0, maintenance_interval=60.0),
+                )
+            self.assertTrue(all(kwargs["defer_heavy"] for _ts, kwargs in calls[1:]))
+            maintenance_times = [ts for ts, kwargs in calls if kwargs["maintenance"]]
+            self.assertGreaterEqual(len(maintenance_times), 3)
+            gaps = [later - earlier for earlier, later in zip(maintenance_times, maintenance_times[1:])]
+            self.assertTrue(all(gap <= 2 * 60.0 + 10.0 for gap in gaps), gaps)
+
     def test_load_shedding_events_are_persisted_and_deduplicated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = str(Path(temporary) / "metrics.sqlite3")
@@ -389,15 +426,103 @@ class CollectorCadenceAndMaintenanceTests(unittest.TestCase):
             conn.execute("BEGIN IMMEDIATE")
             for index in range(RETENTION_DELETE_BATCH_SIZE + 5):
                 insert_event(conn, Event(now - EVENT_RETENTION_SECONDS - index - 1, "info", "old", "old"))
-            apply_retention(conn, now)
+            self.assertTrue(apply_retention(conn, now, max_batches=1))
             conn.commit()
             remaining = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
             self.assertEqual(remaining, 5)
             conn.execute("BEGIN IMMEDIATE")
-            apply_retention(conn, now)
+            self.assertFalse(apply_retention(conn, now, max_batches=1))
             conn.commit()
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
             conn.close()
+
+    def test_one_maintenance_run_deletes_more_than_one_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            conn = init_db(str(Path(temporary) / "metrics.sqlite3"))
+            now = 200_000
+            conn.execute("BEGIN IMMEDIATE")
+            for index in range(2 * RETENTION_DELETE_BATCH_SIZE + 7):
+                insert_event(conn, Event(now - EVENT_RETENTION_SECONDS - index - 1, "info", "old", "old"))
+            insert_event(conn, Event(now - 1, "info", "fresh", "fresh"))
+            self.assertFalse(apply_retention(conn, now))
+            conn.commit()
+            self.assertEqual(conn.execute("SELECT code FROM events").fetchall(), [("fresh",)])
+            conn.close()
+
+    def test_steady_state_retention_keeps_up_with_inserts_above_one_batch(self) -> None:
+        # Scaled-down model of the documented load: every maintenance
+        # interval inserts more rows than one delete batch.
+        batch = 100
+        per_interval = 3 * batch
+        interval = 1800
+        window_intervals = EVENT_RETENTION_SECONDS // interval
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            schema, "RETENTION_DELETE_BATCH_SIZE", batch
+        ):
+            conn = init_db(str(Path(temporary) / "metrics.sqlite3"))
+            now = 1_000_000
+            for step in range(window_intervals * 2):
+                now += interval
+                conn.execute("BEGIN IMMEDIATE")
+                for index in range(per_interval):
+                    insert_event(conn, Event(now - interval + index, "info", "load", "load"))
+                self.assertFalse(run_maintenance(conn, now))
+                conn.commit()
+                count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                self.assertLessEqual(count, (window_intervals + 1) * per_interval, step)
+            conn.close()
+
+    def test_retention_backlog_is_drained_every_cycle_until_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            schema, "RETENTION_DELETE_BATCH_SIZE", 50
+        ):
+            root = Path(temporary)
+            env = root / "env"
+            env.mkdir()
+            (root / "units").mkdir()
+            db = str(root / "metrics.sqlite3")
+            now = 500_000
+            cutoff = now - EVENT_RETENTION_SECONDS
+            conn = init_db(db)
+            conn.execute("BEGIN IMMEDIATE")
+            for index in range(120):
+                insert_event(conn, Event(cutoff - index - 1, "info", "old", "old"))
+            set_state(conn, RETENTION_BACKLOG_STATE_KEY, "1")
+            conn.commit()
+            conn.close()
+            sources = dataclasses.replace(
+                CollectorSources(
+                    command=lambda _parts: CommandResult("", "", 0),
+                    read_text=lambda path: path.read_text(encoding="utf-8"),
+                    glob=lambda _root, _pattern: [],
+                    exists=Path.exists,
+                ),
+                proc_root=FIXTURES / "proc",
+                sys_root=FIXTURES / "sys",
+                systemd_unit_root=root / "units",
+            )
+            config = CollectorConfig(filesystem_paths=())
+
+            def expired_and_flag() -> tuple[int, str | None]:
+                check = sqlite3.connect(db)
+                try:
+                    expired = check.execute("SELECT COUNT(*) FROM events WHERE ts < ?", (cutoff,)).fetchone()[0]
+                    flag = check.execute(
+                        "SELECT value FROM collector_state WHERE key=?", (RETENTION_BACKLOG_STATE_KEY,)
+                    ).fetchone()
+                    return expired, flag[0] if flag else None
+                finally:
+                    check.close()
+
+            collect_once(db, str(env), now, sources, config)
+            self.assertEqual(expired_and_flag(), (70, "1"))
+            collect_once(db, str(env), now + 20, sources, config, defer_heavy=True)
+            self.assertEqual(expired_and_flag(), (70, "1"))
+            collect_once(db, str(env), now + 40, sources, config)
+            collect_once(db, str(env), now + 60, sources, config)
+            self.assertEqual(expired_and_flag(), (0, "0"))
+            collect_once(db, str(env), now + 80, sources, config)
+            self.assertEqual(expired_and_flag(), (0, "0"))
 
 
 if __name__ == "__main__":

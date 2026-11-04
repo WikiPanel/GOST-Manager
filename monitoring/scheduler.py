@@ -235,7 +235,12 @@ def run_daemon(
                 sleeper(deadline - current)
                 continue
             defer_heavy = active_config.load_shedding_enabled and shedding.active
-            maintenance = current >= next_maintenance and not defer_heavy
+            # Load shedding may postpone maintenance by at most one extra
+            # interval; skipping it indefinitely would let the DB grow forever.
+            maintenance_overdue = current >= next_maintenance + maintenance_interval
+            maintenance = current >= next_maintenance and (
+                not defer_heavy or maintenance_overdue
+            )
             if maintenance:
                 next_maintenance = current + maintenance_interval
             transition, prior_overrun, prior_missed, prior_seconds = (
