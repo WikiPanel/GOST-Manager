@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from gost_watchdog.commands import SystemdController, run_ping_checks
 from gost_watchdog.config import (
@@ -614,6 +615,70 @@ class WatchdogDaemonTests(unittest.TestCase):
             ]
             self.assertEqual(len(errors), 1)
             self.assertEqual(errors[0]["error_category"], "runtime_error")
+            store.close()
+
+    def test_event_storage_failure_never_stops_the_daemon(self) -> None:
+        class Loader:
+            def load(self) -> tuple[list[ManagedProfile], list[tuple[str | None, str]], int]:
+                return [profile(mode="monitor")], [(None, "invalid_profile")], 2
+
+        class CountingEngine:
+            def __init__(self) -> None:
+                self.processed = 0
+
+            def reconcile_pending(self, _profile: ManagedProfile) -> None:
+                return None
+
+            def process(self, _profile: ManagedProfile, _result: object) -> None:
+                self.processed += 1
+
+        class FlakyStore:
+            def __init__(self, store: WatchdogStore) -> None:
+                self.store = store
+                self.failing = True
+
+            def record_event(self, event: WatchdogEvent) -> None:
+                if self.failing:
+                    raise sqlite3.OperationalError("database or disk is full")
+                self.store.record_event(event)
+
+            def prune_events(self, now: int, **kwargs: int) -> int:
+                if self.failing:
+                    raise sqlite3.OperationalError("database or disk is full")
+                return self.store.prune_events(now, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = WatchdogStore(str(Path(temporary) / "watchdog.sqlite3"))
+            flaky = FlakyStore(store)
+            clock = FakeClock()
+            engine = CountingEngine()
+            probes: list[str] = []
+            daemon = WatchdogDaemon(
+                flaky,  # type: ignore[arg-type]
+                Loader(),  # type: ignore[arg-type]
+                engine=engine,  # type: ignore[arg-type]
+                ping_executor=lambda ip, _timeout: probes.append(ip) is None,
+                clock=clock.model(),
+                sleeper=lambda seconds: clock.advance(int(seconds) or 1),
+            )
+            with mock.patch("gost_watchdog.daemon.signal.signal", return_value=None):
+                status = daemon.run(stop_requested=lambda: len(probes) >= 4)
+            self.assertEqual(status, 0)
+            self.assertEqual(engine.processed, 4)
+            self.assertTrue(daemon.storage_failing)
+            self.assertEqual(store.events(clock.value, limit=100), [])
+
+            # Once storage recovers, the error that could not be stored is
+            # recorded on the next cycle instead of being lost.
+            flaky.failing = False
+            clock.advance(2)
+            daemon.run_cycle()
+            self.assertFalse(daemon.storage_failing)
+            codes = [
+                (row["code"], row["error_category"])
+                for row in store.events(clock.value, limit=100)
+            ]
+            self.assertEqual(codes, [("watchdog_config_error", "invalid_profile")])
             store.close()
 
 

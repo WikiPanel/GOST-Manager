@@ -422,6 +422,36 @@ assert_eq "rollback leaves unreleased experimental files untouched" "${experimen
 assert_eq "rollback preserves custom config" "${custom_before}" "$(cksum "${custom_config}")"
 assert_not_contains "rollback never targets traffic" "gost-iran-" "${COMMAND_LOG}"
 
+# A failure inside a command substitution (e.g. mktemp on a full disk) must
+# roll back exactly once in the installer process, not again in a subshell.
+real_mktemp="$(command -v mktemp)"
+mktemp_fail_bin="${TEST_HOME}/mktemp-fail-bin"
+mkdir -p "${mktemp_fail_bin}"
+cat > "${mktemp_fail_bin}/mktemp" <<STUB
+#!/usr/bin/env bash
+for argument in "\$@"; do
+  [[ "\${argument}" != *gost-run-kharej.sh.gost-manager-new* ]] || exit 1
+done
+exec "${real_mktemp}" "\$@"
+STUB
+chmod 755 "${mktemp_fail_bin}/mktemp"
+printf 'previous-manager-substitution\n' > "${fresh_root}/usr/local/sbin/gost-manager"
+printf 'previous-iran-runner\n' > "${fresh_root}/usr/local/lib/gost-manager/gost-run-iran.sh"
+printf 'previous-kharej-runner\n' > "${fresh_root}/usr/local/lib/gost-manager/gost-run-kharej.sh"
+substitution_manager_before="$(cksum "${fresh_root}/usr/local/sbin/gost-manager")"
+substitution_iran_before="$(cksum "${fresh_root}/usr/local/lib/gost-manager/gost-run-iran.sh")"
+substitution_kharej_before="$(cksum "${fresh_root}/usr/local/lib/gost-manager/gost-run-kharej.sh")"
+substitution_status=0
+PATH="${mktemp_fail_bin}:${PATH}" run_installer "${fresh_root}" > "${TEST_HOME}/substitution-failure.out" 2>&1 || substitution_status=$?
+assert_eq "command substitution failure reports one verified rollback" "1" "${substitution_status}"
+assert_eq "command substitution rollback restores manager" "${substitution_manager_before}" "$(cksum "${fresh_root}/usr/local/sbin/gost-manager")"
+assert_eq "command substitution rollback restores Iran runner" "${substitution_iran_before}" "$(cksum "${fresh_root}/usr/local/lib/gost-manager/gost-run-iran.sh" 2>/dev/null || printf missing)"
+assert_eq "command substitution rollback keeps Kharej runner" "${substitution_kharej_before}" "$(cksum "${fresh_root}/usr/local/lib/gost-manager/gost-run-kharej.sh")"
+assert_not_contains "command substitution rollback is verified" "rollback could not be verified" "${TEST_HOME}/substitution-failure.out"
+leftovers="$(find "${fresh_root}/usr/local" -name '*.gost-manager-new.*' -o -name '*.gost-manager-backup.*')"
+assert_eq "command substitution rollback leaves no temporary files" "" "${leftovers}"
+run_installer "${fresh_root}" >/dev/null
+
 printf '1.9.0\n' > "${fresh_root}/usr/local/lib/gost-manager/VERSION"
 printf 'pre-gate-manager-canary\n' > "${fresh_root}/usr/local/sbin/gost-manager"
 version_gate_before="$(cksum "${fresh_root}/usr/local/lib/gost-manager/VERSION")"

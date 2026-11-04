@@ -137,7 +137,20 @@ Detects only managed files:
 /etc/gost/kharej-*.env
 ```
 
-It reports service/env mismatches, failed services, disabled orphan services, and old backup files. Nothing is deleted until you confirm.
+It deletes only true orphans and managed backups, and nothing until you confirm:
+
+- a stopped `gost-<side>-<number>.service` whose env file is missing (the
+  exact service is disabled and stopped first; only its own failed state is
+  reset);
+- an `iran-<number>.env` or `kharej-<number>.env` whose unit is missing;
+- managed `*.env.bak.*` and `gost-*-<number>.service.bak.*` backups.
+
+A profile that has both its env and unit is never deleted by cleanup, even
+when its service is failed or disabled; it is listed for attention so you can
+inspect logs, restart it, or remove it with `4) Delete tunnel`. A running
+service whose env is missing is also only reported. Names that do not match
+the exact numbered pattern, such as `gost-kharej-edge.service` or
+`gost.service`, are never touched.
 
 ## 10) Monitoring
 

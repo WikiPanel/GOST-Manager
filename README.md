@@ -436,5 +436,5 @@ Warning: iptables rules are not persistent by default. They may be lost after re
 
 - If a local port is configured by another profile or occupied live, the manager prints a bounded profile/PID ownership summary and does not create files. Unknown ownership is treated as a conflict.
 - If a systemd service fails, use menu option `5` for status and option `6` for logs.
-- If a tunnel was partially removed, use menu option `9` to find managed orphan env files, service files, failed services, and old backups.
+- If a tunnel was partially removed, use menu option `9` to find managed orphan env files, orphan service files, and old backups. Cleanup lists failed or disabled profiles for attention but never deletes a profile that still has both its env and unit; use option `4` for that.
 - If GOST install fails, verify outbound HTTPS access to `github.com` and `api.github.com`.

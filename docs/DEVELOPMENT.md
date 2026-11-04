@@ -45,6 +45,7 @@ Run supported Bash suites:
     bash tests/test-scope-reset.sh
     bash tests/test-systemd-linux.sh
     bash tests/test-profiles.sh
+    bash tests/test-cleanup.sh
     bash tests/test-firewall-multi-source.sh
     bash tests/test-stability.sh
     bash tests/test-setup.sh

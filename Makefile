@@ -6,7 +6,8 @@ BASH_SCRIPTS = gost-manager.sh setup.sh install.sh uninstall.sh \
 	tests/test-menu.sh tests/test-uninstall.sh tests/test-systemd-linux.sh \
 	tests/test-watchdog-linux.sh \
 	scripts/gm-203-production-check.sh \
-	tests/test-scope-reset.sh tests/test-profiles.sh tests/test-firewall-multi-source.sh \
+	tests/test-scope-reset.sh tests/test-profiles.sh tests/test-cleanup.sh \
+	tests/test-firewall-multi-source.sh \
 	tests/test-stability.sh tests/test-setup.sh tests/test-release-workflow.sh
 
 lint:
@@ -24,6 +25,7 @@ test:
 	bash tests/test-watchdog-linux.sh
 	bash tests/test-scope-reset.sh
 	bash tests/test-profiles.sh
+	bash tests/test-cleanup.sh
 	bash tests/test-firewall-multi-source.sh
 	bash tests/test-stability.sh
 	bash tests/test-setup.sh

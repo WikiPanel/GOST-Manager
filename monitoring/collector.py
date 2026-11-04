@@ -60,7 +60,10 @@ from monitoring.proc_readers import (
 from monitoring.schema import (
     DEFAULT_DB_PATH,
     DEFAULT_SAMPLE_INTERVAL_SECONDS,
+    RETENTION_BACKLOG_STATE_KEY,
+    RETENTION_CATCH_UP_BATCHES,
     _cycle,
+    apply_retention,
     checkpoint_wal,
     get_json_state,
     get_state,
@@ -1711,9 +1714,10 @@ def collect_once(
             config.slow_sample_interval,
         )
         if defer_heavy:
+            # Maintenance is not cleared here: the scheduler already defers
+            # it under load shedding and only forces it once it is overdue.
             full_socket_due = False
             slow_sources_due = False
-            maintenance = False
         capture, tunnels, env_events, services = _capture_raw(
             db_path,
             env_dir,
@@ -1873,8 +1877,9 @@ def collect_once(
         if maintenance:
             conn.execute("SAVEPOINT monitoring_maintenance")
             try:
-                run_maintenance(conn, ts)
+                backlog = run_maintenance(conn, ts)
                 conn.execute("RELEASE monitoring_maintenance")
+                set_state(conn, RETENTION_BACKLOG_STATE_KEY, "1" if backlog else "0")
                 previous_maintenance = get_state(conn, "event.maintenance_health")
                 set_state(conn, "event.maintenance_health", "ok")
                 if previous_maintenance == "failed":
@@ -1900,6 +1905,18 @@ def collect_once(
                             "Database retention maintenance failed",
                         )
                     )
+            maintenance_duration = max(0.0, active_sources.clock.monotonic() - maintenance_started)
+        elif not defer_heavy and get_state(conn, RETENTION_BACKLOG_STATE_KEY) == "1":
+            # The last maintenance run hit its batch limit: keep draining
+            # expired rows a little every cycle instead of growing the DB.
+            conn.execute("SAVEPOINT monitoring_retention_catch_up")
+            try:
+                backlog = apply_retention(conn, ts, max_batches=RETENTION_CATCH_UP_BATCHES)
+                conn.execute("RELEASE monitoring_retention_catch_up")
+                set_state(conn, RETENTION_BACKLOG_STATE_KEY, "1" if backlog else "0")
+            except Exception:
+                conn.execute("ROLLBACK TO monitoring_retention_catch_up")
+                conn.execute("RELEASE monitoring_retention_catch_up")
             maintenance_duration = max(0.0, active_sources.clock.monotonic() - maintenance_started)
 
         overrun_count_raw = get_state(conn, "counter.overrun_count")

@@ -243,6 +243,14 @@ Existing rows are not erased by a migration. Obsolete historical generic rows
 remain queryable where existing APIs already allow it and age out through
 normal retention.
 
+Retention deletes in bounded batches of 10,000 rows. Each maintenance run may
+delete up to 12 batches per table, which is well above the documented insert
+rate. If a run hits that limit, the remaining expired rows are drained one
+batch per table on each following collection cycle until none are left. Load
+shedding may postpone maintenance by at most one extra maintenance interval.
+SQLite reuses the freed pages, so a database that grew before this fix stops
+growing but does not shrink on disk by itself.
+
 The representative Direct Mode profile models six GOST services at the new
 cadences:
 
