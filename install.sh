@@ -1181,6 +1181,12 @@ print_recovery_guidance() {
 
 on_error() {
   local status=$?
+  # errtrace makes this trap fire inside command substitutions and other
+  # subshells too. Only the installer process itself may roll back; a
+  # subshell just exits so the parent's trap rolls back exactly once.
+  if [[ "${BASHPID}" != "$$" ]]; then
+    exit "${status}"
+  fi
   trap - ERR
   set +e
   if [[ "${INSTALL_COMMITTED}" != "1" ]]; then
