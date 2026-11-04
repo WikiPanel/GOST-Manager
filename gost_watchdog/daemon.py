@@ -104,6 +104,27 @@ class WatchdogDaemon:
         self.next_due: dict[str, float] = {}
         self.reported_errors: set[tuple[str | None, str]] = set()
         self.next_prune = 0.0
+        self.storage_failing = False
+
+    def _note_storage_failure(self, exc: Exception) -> None:
+        if not self.storage_failing:
+            print(
+                f"Watchdog event storage failed: {exc.__class__.__name__}; checks continue",
+                file=sys.stderr,
+            )
+        self.storage_failing = True
+
+    def _record_event(self, event: WatchdogEvent) -> bool:
+        """Best-effort event write: a full disk or broken DB never stops the daemon."""
+        try:
+            self.store.record_event(event)
+        except Exception as exc:
+            self._note_storage_failure(exc)
+            return False
+        if self.storage_failing:
+            print("Watchdog event storage recovered", file=sys.stderr)
+            self.storage_failing = False
+        return True
 
     def _record_errors(
         self,
@@ -113,8 +134,9 @@ class WatchdogDaemon:
     ) -> None:
         current = set(errors)
         event_modes = check_modes or {}
+        unrecorded: set[tuple[str | None, str]] = set()
         for profile_id, category in current - self.reported_errors:
-            self.store.record_event(
+            recorded = self._record_event(
                 WatchdogEvent(
                     ts=now,
                     code="watchdog_config_error",
@@ -123,7 +145,10 @@ class WatchdogDaemon:
                     check_mode=event_modes.get(profile_id or ""),
                 )
             )
-        self.reported_errors = current
+            if not recorded:
+                unrecorded.add((profile_id, category))
+        # Errors that could not be stored are retried on the next cycle.
+        self.reported_errors = current - unrecorded
 
     def run_cycle(self) -> float:
         monotonic_now = self.clock.monotonic()
@@ -178,7 +203,10 @@ class WatchdogDaemon:
             )
         self._record_errors(cycle_errors, wall_now, check_modes)
         if monotonic_now >= self.next_prune:
-            self.store.prune_events(wall_now, retention_seconds=EVENT_RETENTION_SECONDS)
+            try:
+                self.store.prune_events(wall_now, retention_seconds=EVENT_RETENTION_SECONDS)
+            except Exception as exc:
+                self._note_storage_failure(exc)
             self.next_prune = monotonic_now + 60.0
         if self.next_due:
             return min(self.next_due.values())
@@ -192,7 +220,7 @@ class WatchdogDaemon:
             stop = True
 
         now = int(self.clock.wall())
-        self.store.record_event(WatchdogEvent(now, "watchdog_daemon_started"))
+        self._record_event(WatchdogEvent(now, "watchdog_daemon_started"))
         old_term = signal.signal(signal.SIGTERM, request_stop)
         old_int = signal.signal(signal.SIGINT, request_stop)
         try:
@@ -205,7 +233,7 @@ class WatchdogDaemon:
                 deadline = self.run_cycle()
             return 0
         finally:
-            self.store.record_event(
+            self._record_event(
                 WatchdogEvent(int(self.clock.wall()), "watchdog_daemon_stopped")
             )
             signal.signal(signal.SIGTERM, old_term)
